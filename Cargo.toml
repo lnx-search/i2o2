@@ -5,4 +5,13 @@ edition = "2024"
 
 [dependencies]
 thiserror = "2"
-io-uring = "0.7.7"
+io-uring = "0.7"
+slab = "0.4"
+flume = "0.11"
+tracing = "0.1"
+parking_lot = "0.12"
+smallvec = "1.15"
+
+[dev-dependencies]
+rstest = "0.25"
+tokio = { version = "1", features = ["macros", "time", "rt"] }
