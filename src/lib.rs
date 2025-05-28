@@ -8,6 +8,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use futures_util::TryFutureExt;
+pub use io_uring;
 use io_uring::IoUring;
 pub use io_uring::opcode;
 pub use io_uring::squeue::Entry;
