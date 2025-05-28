@@ -2,7 +2,7 @@
 //!
 //! This is a system very similar to a oneshot channel, but we pack the result
 //! in with the signalling atomic value.
-//! 
+//!
 //! This is because we only return the IO result code and don't need to worry about
 //! anything else that would require more atomic loads, allocations, etc...
 //!

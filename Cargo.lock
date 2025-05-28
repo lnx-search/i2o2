@@ -169,6 +169,7 @@ version = "0.1.0"
 dependencies = [
  "flume",
  "io-uring",
+ "libc",
  "parking_lot",
  "rstest",
  "slab",
