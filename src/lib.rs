@@ -5,6 +5,7 @@ use std::any::Any;
 use std::io;
 use std::pin::pin;
 use std::task::Poll;
+use std::time::Duration;
 
 use futures_util::TryFutureExt;
 use io_uring::IoUring;
@@ -16,12 +17,260 @@ use crate::wake::RingWaker;
 
 /// A guard type that can be any object.
 pub type DynamicGuard = Box<dyn Any>;
+/// A submission result for the scheduler.
 pub type SubmitResult<T> = Result<T, SchedulerClosed>;
 
 #[derive(Debug, thiserror::Error)]
 #[error("scheduler has closed")]
 /// The scheduler has shutdown and is no longer accepting events.
 pub struct SchedulerClosed;
+
+/// Create a new [I2o2Scheduler] and [I2o2Handle] pair backed by io_uring.
+///
+/// This will use the default settings for the scheduler, you can optionally
+/// use the [builder] to customise the ring behaviour.
+///
+/// ## Example
+///
+/// ```rust
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+///
+/// let (scheduler, handle) = i2o2::create()?;
+///
+/// # Ok(())
+/// # }
+/// ```
+pub fn create<G>() -> io::Result<(I2o2Scheduler<G>, I2o2Handle<G>)> {
+    I2o2Builder::default().try_create()
+}
+
+/// Create a new [I2o2Scheduler] and [I2o2Handle] pair backed by io_uring
+/// with a custom configuration.
+///
+/// ## Example
+///
+/// ```rust
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// use std::time::Duration;
+///
+/// let (scheduler, handle) = i2o2::builder()
+///     .with_defer_task_run(true)
+///     .with_io_polling(true)
+///     .with_sqe_polling(true)
+///     .with_sqe_polling_timeout(Duration::from_millis(100))
+///     .try_create()?;
+///
+/// # Ok(())
+/// # }
+/// ```
+pub fn builder<G>() -> I2o2Builder {
+    I2o2Builder::default()
+}
+
+/// A set of configuration options for customising the [I2o2Scheduler] scheduler.
+///
+/// ## Example
+///
+/// ```rust
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// use std::time::Duration;
+///
+/// let (scheduler, handle) = i2o2::I2o2Builder::default()
+///     .with_defer_task_run(true)
+///     .with_io_polling(true)
+///     .with_sqe_polling(true)
+///     .with_sqe_polling_timeout(Duration::from_millis(100))
+///     .try_create()?;
+///
+/// # Ok(())
+/// # }
+/// ```
+pub struct I2o2Builder {
+    queue_size: u32,
+    io_poll: bool,
+    sqe_poll: Option<Duration>,
+    sqe_poll_cpu: Option<u32>,
+    defer_task_run: bool,
+}
+
+impl Default for I2o2Builder {
+    fn default() -> Self {
+        Self {
+            queue_size: 128,
+            io_poll: false,
+            sqe_poll: None,
+            sqe_poll_cpu: None,
+            defer_task_run: false,
+        }
+    }
+}
+
+impl I2o2Builder {
+    /// Set the queue size of the ring and handler buffer.
+    ///
+    /// The provided value should be a power of `2`.
+    ///
+    /// By default, this is `128`.
+    pub fn with_queue_size(mut self, size: u32) -> Self {
+        assert!(
+            size != 0 && (size & (size - 1)) == 0,
+            "provided `size` value must be a power of 2"
+        );
+        self.queue_size = size;
+        self
+    }
+
+    /// Enable/disable IO polling.
+    ///
+    /// Sets `IORING_SETUP_IOPOLL`
+    ///
+    /// https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html
+    ///
+    /// > Perform busy-waiting for an I/O completion, as opposed to
+    /// > getting notifications via an asynchronous IRQ (Interrupt
+    /// > Request).
+    ///    
+    /// **WARNING: Enabling this option requires all file IO events to be O_DIRECT**
+    ///
+    /// By default, this is `disabled`.
+    pub fn with_io_polling(mut self, enable: bool) -> Self {
+        self.io_poll = enable;
+        self
+    }
+
+    /// Enables/disables submission queue polling by the kernel.
+    ///
+    /// Sets `IORING_SETUP_SQPOLL`
+    ///
+    /// https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html
+    ///
+    /// > When this flag is specified, a kernel thread is created to
+    /// > perform submission queue polling.  An io_uring instance
+    /// > configured in this way enables an application to issue I/O
+    /// > without ever context switching into the kernel.  By using
+    /// > the submission queue to fill in new submission queue
+    /// > entries and watching for completions on the completion
+    /// > queue, the application can submit and reap I/Os without
+    /// > doing a single system call.
+    ///
+    /// By default, the system will use a `10ms` idle timeout, you can configure
+    /// this value using [I2o2Builder::with_sqe_polling_timeout].
+    pub fn with_sqe_polling(mut self, enable: bool) -> Self {
+        if enable {
+            self.sqe_poll = Some(Duration::from_millis(10));
+        } else {
+            self.sqe_poll = None;
+        }
+        self
+    }
+
+    /// Set the submission queue polling idle timeout.
+    ///
+    /// https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html
+    ///
+    /// This overwrites the default timeout value I2o2 sets of `10ms`.
+    ///
+    /// NOTE: `with_sqe_polling` must be enabled first before calling this method.
+    pub fn with_sqe_polling_timeout(mut self, timeout: Duration) -> Self {
+        if self.sqe_poll.is_none() {
+            panic!(
+                "submission queue polling is not already enabled at the time of calling this method"
+            );
+        }
+        assert!(
+            timeout <= Duration::from_secs(10),
+            "timeout has gone beyond sane levels"
+        );
+
+        self.sqe_poll = Some(timeout);
+        self
+    }
+
+    /// Set cpu core the polling thread should be pinned to.
+    ///
+    /// Sets `IORING_SETUP_SQ_AFF`
+    ///
+    /// https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html
+    ///
+    /// NOTE: `with_sqe_polling` must be enabled first before calling this method.
+    pub fn with_sqe_polling_pinned_cpu(mut self, cpu: u32) -> Self {
+        if self.sqe_poll.is_none() {
+            panic!(
+                "submission queue polling is not already enabled at the time of calling this method"
+            );
+        }
+        self.sqe_poll_cpu = Some(cpu);
+        self
+    }
+
+    /// Enables/disables submission queue polling by the kernel.
+    ///
+    /// Sets `IORING_SETUP_DEFER_TASKRUN`
+    ///
+    /// https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html
+    ///
+    /// > By default, io_uring will process all outstanding work at
+    /// > the end of any system call or thread interrupt. This can
+    /// > delay the application from making other progress.  Setting
+    /// > this flag will hint to io_uring that it should defer work
+    /// > until an io_uring_enter(2) call with the
+    /// > IORING_ENTER_GETEVENTS flag set.
+    ///
+    /// By default, this is `disabled`.
+    pub fn with_defer_task_run(mut self, enable: bool) -> Self {
+        self.defer_task_run = enable;
+        self
+    }
+
+    /// Attempt to create the scheduler using the current configuration.
+    pub fn try_create<G>(self) -> io::Result<(I2o2Scheduler<G>, I2o2Handle<G>)> {
+        let (tx, rx) = flume::bounded(self.queue_size as usize);
+        let waker = RingWaker::new()?;
+
+        let ring = self.setup_io_ring()?;
+
+        let submitter = ring.submitter();
+        submitter.register_eventfd(waker.event_fd())?;
+
+        let scheduler = I2o2Scheduler {
+            ring,
+            state: TrackedState::default(),
+            self_waker: waker,
+            incoming: rx,
+            backlog: Vec::new(),
+            shutdown: false,
+        };
+
+        let handle = I2o2Handle { inner: tx };
+
+        Ok((scheduler, handle))
+    }
+
+    fn setup_io_ring(&self) -> io::Result<IoUring> {
+        let mut builder = IoUring::builder();
+        builder.setup_coop_taskrun();
+        builder.setup_single_issuer();
+        builder.dontfork();
+
+        if self.io_poll {
+            builder.setup_iopoll();
+        }
+
+        if let Some(idle) = self.sqe_poll {
+            builder.setup_sqpoll(idle.as_millis() as u32);
+
+            if let Some(cpu) = self.sqe_poll_cpu {
+                builder.setup_sqpoll_cpu(cpu);
+            }
+        }
+
+        if self.defer_task_run {
+            builder.setup_defer_taskrun();
+        }
+
+        builder.build(self.queue_size)
+    }
+}
 
 /// The [I2o2Handle] allows you to interact with the [I2o2Scheduler] and
 /// submit IO events to it.
@@ -209,28 +458,6 @@ pub struct I2o2Scheduler<G = DynamicGuard> {
 }
 
 impl<G> I2o2Scheduler<G> {
-    fn new() -> io::Result<(Self, flume::Sender<Message<G>>)> {
-        let (tx, rx) = flume::bounded(128);
-
-        let ring = IoUring::builder().setup_coop_taskrun().build(128)?;
-
-        let waker = RingWaker::new()?;
-
-        let submitter = ring.submitter();
-        submitter.register_eventfd(waker.event_fd())?;
-
-        let scheduler = Self {
-            ring,
-            state: TrackedState::default(),
-            self_waker: waker,
-            incoming: rx,
-            backlog: Vec::new(),
-            shutdown: false,
-        };
-
-        Ok((scheduler, tx))
-    }
-
     /// Run the scheduler in the current thread until it is shut down.
     ///
     /// This will wait for all remaining tasks to complete.
