@@ -6,14 +6,191 @@ use std::io;
 use std::pin::pin;
 use std::task::Poll;
 
+use futures_util::TryFutureExt;
 use io_uring::IoUring;
+pub use io_uring::opcode;
+pub use io_uring::squeue::Entry;
 use smallvec::SmallVec;
 
 use crate::wake::RingWaker;
 
 /// A guard type that can be any object.
 pub type DynamicGuard = Box<dyn Any>;
+pub type SubmitResult<T> = Result<T, SchedulerClosed>;
 
+#[derive(Debug, thiserror::Error)]
+#[error("scheduler has closed")]
+/// The scheduler has shutdown and is no longer accepting events.
+pub struct SchedulerClosed;
+
+/// The [I2o2Handle] allows you to interact with the [I2o2Scheduler] and
+/// submit IO events to it.
+pub struct I2o2Handle<G = DynamicGuard> {
+    inner: flume::Sender<Message<G>>,
+}
+
+impl<G> Clone for I2o2Handle<G> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<G> I2o2Handle<G>
+where
+    G: Send + 'static,
+{
+    /// Submit an op to the scheduler.
+    ///
+    /// This may block if th scheduler queue is currently full.
+    ///
+    /// A `guard` value can be passed, which can be used to ensure data required by the entry
+    /// lives at _least_ as long as necessary for the scheduler. It is your responsibility to
+    /// ensure that the `guard` actually impacts the dependencies of the entry, but the scheduler
+    /// will guarantee that the `guard` lives as long as io_uring requires.
+    ///
+    /// # Safety
+    ///
+    /// It is the callers responsibility to ensure that the op contained within the entry is:
+    /// - Safe to send across thread boundaries.
+    /// - Valid throughout the entire execution of the syscall until complete.
+    /// - Obeys any additional safety constraints specified by the [opcode].
+    pub unsafe fn submit<O>(
+        &self,
+        entry: Entry,
+        guard: Option<G>,
+    ) -> SubmitResult<reply::ReplyReceiver> {
+        let (reply, rx) = reply::new();
+        let message = Message::One(PackagedOp {
+            entry,
+            reply,
+            guard,
+        });
+
+        self.inner
+            .send(message)
+            .map_err(|_| SchedulerClosed)
+            .map(|_| rx)
+    }
+
+    /// Submit multiple ops to the scheduler.
+    ///
+    /// This may block if th scheduler queue is currently full.
+    ///
+    /// A `guard` value can be passed, which can be used to ensure data required by the entry
+    /// lives at _least_ as long as necessary for the scheduler. It is your responsibility to
+    /// ensure that the `guard` actually impacts the dependencies of the entry, but the scheduler
+    /// will guarantee that the `guard` lives as long as io_uring requires.
+    ///
+    /// # Safety
+    ///
+    /// It is the callers responsibility to ensure that the op contained within the entry is:
+    /// - Safe to send across thread boundaries.
+    /// - Valid throughout the entire execution of the syscall until complete.
+    /// - Obeys any additional safety constraints specified by the [opcode].
+    pub unsafe fn submit_many_entries<O>(
+        &self,
+        pairs: impl IntoIterator<Item = (Entry, Option<G>)>,
+    ) -> SubmitResult<impl IntoIterator<Item = reply::ReplyReceiver>> {
+        let (message, replies) = prepare_many_entries(pairs);
+
+        self.inner.send(message).map_err(|_| SchedulerClosed)?;
+
+        Ok(replies.into_iter())
+    }
+
+    /// Submit an op to the scheduler asynchronously waiting if the queue is currently
+    /// full.
+    ///
+    /// A `guard` value can be passed, which can be used to ensure data required by the entry
+    /// lives at _least_ as long as necessary for the scheduler. It is your responsibility to
+    /// ensure that the `guard` actually impacts the dependencies of the entry, but the scheduler
+    /// will guarantee that the `guard` lives as long as io_uring requires.
+    ///
+    /// # Safety
+    ///
+    /// It is the callers responsibility to ensure that the op contained within the entry is:
+    /// - Safe to send across thread boundaries.
+    /// - Valid throughout the entire execution of the syscall until complete.
+    /// - Obeys any additional safety constraints specified by the [opcode].
+    pub unsafe fn submit_async(
+        &self,
+        entry: Entry,
+        guard: Option<G>,
+    ) -> impl Future<Output = SubmitResult<reply::ReplyReceiver>> + '_ {
+        use futures_util::TryFutureExt;
+
+        let (reply, rx) = reply::new();
+        let message = Message::One(PackagedOp {
+            entry,
+            reply,
+            guard,
+        });
+
+        async {
+            self.inner
+                .send_async(message)
+                .map_err(|_| SchedulerClosed)
+                .await
+                .map(|_| rx)
+        }
+    }
+
+    /// Submit multiple ops to the scheduler asynchronously waiting if the queue is currently
+    /// full.
+    ///
+    /// A `guard` value can be passed, which can be used to ensure data required by the entry
+    /// lives at _least_ as long as necessary for the scheduler. It is your responsibility to
+    /// ensure that the `guard` actually impacts the dependencies of the entry, but the scheduler
+    /// will guarantee that the `guard` lives as long as io_uring requires.
+    ///
+    /// # Safety
+    ///
+    /// It is the callers responsibility to ensure that the op contained within the entry is:
+    /// - Safe to send across thread boundaries.
+    /// - Valid throughout the entire execution of the syscall until complete.
+    /// - Obeys any additional safety constraints specified by the [opcode].
+    pub unsafe fn submit_many_entries_async<O>(
+        &self,
+        pairs: impl IntoIterator<Item = (Entry, Option<G>)>,
+    ) -> impl Future<Output = SubmitResult<impl IntoIterator<Item = reply::ReplyReceiver>>>
+    {
+        let (message, replies) = prepare_many_entries(pairs);
+
+        async {
+            self.inner
+                .send_async(message)
+                .map_err(|_| SchedulerClosed)
+                .await?;
+            Ok(replies.into_iter())
+        }
+    }
+}
+
+fn prepare_many_entries<G>(
+    pairs: impl IntoIterator<Item = (Entry, Option<G>)>,
+) -> (Message<G>, SmallVec<[reply::ReplyReceiver; 4]>) {
+    let mut replies = SmallVec::<[reply::ReplyReceiver; 4]>::new();
+    let iter = pairs.into_iter().map(|(entry, guard)| {
+        let (reply, rx) = reply::new();
+        replies.push(rx);
+
+        PackagedOp {
+            entry,
+            reply,
+            guard,
+        }
+    });
+
+    (Message::Many(SmallVec::from_iter(iter)), replies)
+}
+
+/// The [I2o2Scheduler] runs an io_uring ring in the current thread and submits
+/// IO events from the handle into the ring.
+///
+/// Communication between the handles and the scheduler can be done both synchronously
+/// and asynchronously.
 pub struct I2o2Scheduler<G = DynamicGuard> {
     ring: IoUring,
     state: TrackedState<G>,
@@ -26,7 +203,7 @@ pub struct I2o2Scheduler<G = DynamicGuard> {
     ///
     /// The entries in this backlog have already had user data assigned to them
     /// and can be copied directly to the queue.
-    backlog: Vec<io_uring::squeue::Entry>,
+    backlog: Vec<Entry>,
     /// A shutdown signal flag to close the scheduler.
     shutdown: bool,
 }
@@ -193,7 +370,7 @@ impl<G> I2o2Scheduler<G> {
 fn handle_message<G>(
     submission: &mut io_uring::SubmissionQueue,
     state: &mut TrackedState<G>,
-    backlog: &mut Vec<io_uring::squeue::Entry>,
+    backlog: &mut Vec<Entry>,
     op: Message<G>,
 ) -> bool {
     match op {
@@ -243,7 +420,7 @@ impl<G> TrackedState<G> {
         self.replies.len()
     }
 
-    fn register(&mut self, op: PackagedOp<G>) -> io_uring::squeue::Entry {
+    fn register(&mut self, op: PackagedOp<G>) -> Entry {
         let PackagedOp {
             entry,
             reply,
@@ -286,7 +463,7 @@ enum Message<G = DynamicGuard> {
 }
 
 struct PackagedOp<G = DynamicGuard> {
-    entry: io_uring::squeue::Entry,
+    entry: Entry,
     reply: reply::ReplyNotify,
     guard: Option<G>,
 }

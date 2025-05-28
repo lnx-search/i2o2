@@ -86,6 +86,11 @@ impl ReplyReceiver {
 
         Ok(value as i32)
     }
+
+    /// Synchronously wait for the result to complete.
+    pub fn wait(self) -> Result<i32, Cancelled> {
+        futures_executor::block_on(self)
+    }
 }
 
 impl Future for ReplyReceiver {

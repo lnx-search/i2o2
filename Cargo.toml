@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 thiserror = "2"
 io-uring = "0.7"
+futures-executor = "0.3"
+futures-util = "0.3"
 libc = "0.2"
 slab = "0.4"
 flume = "0.11"
