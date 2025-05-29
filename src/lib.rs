@@ -1,4 +1,6 @@
 mod reply;
+#[cfg(test)]
+mod tests;
 mod wake;
 
 use std::any::Any;
@@ -16,6 +18,11 @@ use smallvec::SmallVec;
 
 use crate::wake::RingWaker;
 
+#[cfg(not(target_os = "linux"))]
+compiler_error!(
+    "I2o2 only supports linux based operating systems, and requires relatively new kernel versions"
+);
+
 /// A guard type that can be any object.
 pub type DynamicGuard = Box<dyn Any>;
 /// A submission result for the scheduler.
@@ -31,18 +38,51 @@ pub struct SchedulerClosed;
 /// This will use the default settings for the scheduler, you can optionally
 /// use the [builder] to customise the ring behaviour.
 ///
+/// NOTE: The scheduler cannot be sent across threads.
+///
 /// ## Example
 ///
 /// ```rust
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///
-/// let (scheduler, handle) = i2o2::create()?;
+/// let (scheduler, handle) = i2o2::create_for_current_thread()?;
+///
+/// // Run the IO ring, note that the scheduler is not `Send`.
+/// scheduler.run()?;
 ///
 /// # Ok(())
 /// # }
 /// ```
-pub fn create<G>() -> io::Result<(I2o2Scheduler<G>, I2o2Handle<G>)> {
+pub fn create_for_current_thread<G>() -> io::Result<(I2o2Scheduler<G>, I2o2Handle<G>)> {
     I2o2Builder::default().try_create()
+}
+
+/// Create a new [I2o2Scheduler] and [I2o2Handle] pair backed by io_uring and spawn the scheduler
+/// in a background worker thread.
+///
+/// This will use the default settings for the scheduler, you can optionally
+/// use the [builder] to customise the ring behaviour.
+///
+/// NOTE: The scheduler cannot be sent across threads.
+///
+/// ## Example
+///
+/// ```rust
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+///
+/// let (scheduler_handle, handle) = i2o2::create_and_spawn()?;
+///
+/// // ... do work
+///
+/// # Ok(())
+/// # }
+/// ```
+pub fn create_and_spawn<G>()
+-> io::Result<(std::thread::JoinHandle<io::Result<()>>, I2o2Handle<G>)>
+where
+    G: Send + 'static,
+{
+    I2o2Builder::default().try_spawn()
 }
 
 /// Create a new [I2o2Scheduler] and [I2o2Handle] pair backed by io_uring
@@ -61,10 +101,13 @@ pub fn create<G>() -> io::Result<(I2o2Scheduler<G>, I2o2Handle<G>)> {
 ///     .with_sqe_polling_timeout(Duration::from_millis(100))
 ///     .try_create()?;
 ///
+/// // Run the IO ring, note that the scheduler is not `Send`.
+/// scheduler.run()?;
+///
 /// # Ok(())
 /// # }
 /// ```
-pub fn builder<G>() -> I2o2Builder {
+pub fn builder() -> I2o2Builder {
     I2o2Builder::default()
 }
 
@@ -82,6 +125,9 @@ pub fn builder<G>() -> I2o2Builder {
 ///     .with_sqe_polling(true)
 ///     .with_sqe_polling_timeout(Duration::from_millis(100))
 ///     .try_create()?;
+///
+/// // Run the IO ring, note that the scheduler is not `Send`.
+/// scheduler.run()?;
 ///
 /// # Ok(())
 /// # }
@@ -158,7 +204,7 @@ impl I2o2Builder {
     /// this value using [I2o2Builder::with_sqe_polling_timeout].
     pub fn with_sqe_polling(mut self, enable: bool) -> Self {
         if enable {
-            self.sqe_poll = Some(Duration::from_millis(10));
+            self.sqe_poll = Some(Duration::from_millis(2000));
         } else {
             self.sqe_poll = None;
         }
@@ -194,7 +240,7 @@ impl I2o2Builder {
     /// https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html
     ///
     /// NOTE: `with_sqe_polling` must be enabled first before calling this method.
-    pub fn with_sqe_polling_pinned_cpu(mut self, cpu: u32) -> Self {
+    pub fn with_sqe_polling_pin_cpu(mut self, cpu: u32) -> Self {
         if self.sqe_poll.is_none() {
             panic!(
                 "submission queue polling is not already enabled at the time of calling this method"
@@ -240,6 +286,7 @@ impl I2o2Builder {
             incoming: rx,
             backlog: Vec::new(),
             shutdown: false,
+            _anti_send_ptr: std::ptr::null_mut(),
         };
 
         let handle = I2o2Handle { inner: tx };
@@ -247,9 +294,42 @@ impl I2o2Builder {
         Ok((scheduler, handle))
     }
 
+    /// Attempt to create the scheduler and run it in a background thread using the
+    /// current configuration.
+    pub fn try_spawn<G>(
+        self,
+    ) -> io::Result<(std::thread::JoinHandle<io::Result<()>>, I2o2Handle<G>)>
+    where
+        G: Send + 'static,
+    {
+        let (tx, rx) = flume::bounded(1);
+
+        let task = move || {
+            let (scheduler, handle) = self.try_create()?;
+            if tx.send(handle).is_err() {
+                return Ok(());
+            }
+            scheduler.run()?;
+            Ok::<_, io::Error>(())
+        };
+
+        let scheduler_thread_handle = std::thread::Builder::new()
+            .name("i2o2-scheduler-thread".to_string())
+            .spawn(task)
+            .expect("spawn background worker thread");
+
+        if let Ok(handle) = rx.recv() {
+            Ok((scheduler_thread_handle, handle))
+        } else {
+            let error = scheduler_thread_handle.join().unwrap().expect_err(
+                "thread aborted before sending handle back but still returns Ok(())",
+            );
+            Err(error)
+        }
+    }
+
     fn setup_io_ring(&self) -> io::Result<IoUring> {
         let mut builder = IoUring::builder();
-        builder.setup_coop_taskrun();
         builder.setup_single_issuer();
         builder.dontfork();
 
@@ -263,6 +343,10 @@ impl I2o2Builder {
             if let Some(cpu) = self.sqe_poll_cpu {
                 builder.setup_sqpoll_cpu(cpu);
             }
+        } else {
+            // This functionality effectively gets implicitly enabled by SQPOLL
+            // we should only enable this if SQPOLL is disabled.
+            builder.setup_coop_taskrun();
         }
 
         if self.defer_task_run {
@@ -306,7 +390,7 @@ where
     /// - Safe to send across thread boundaries.
     /// - Valid throughout the entire execution of the syscall until complete.
     /// - Obeys any additional safety constraints specified by the [opcode].
-    pub unsafe fn submit<O>(
+    pub unsafe fn submit(
         &self,
         entry: Entry,
         guard: Option<G>,
@@ -339,7 +423,7 @@ where
     /// - Safe to send across thread boundaries.
     /// - Valid throughout the entire execution of the syscall until complete.
     /// - Obeys any additional safety constraints specified by the [opcode].
-    pub unsafe fn submit_many_entries<O>(
+    pub unsafe fn submit_many_entries(
         &self,
         pairs: impl IntoIterator<Item = (Entry, Option<G>)>,
     ) -> SubmitResult<impl IntoIterator<Item = reply::ReplyReceiver>> {
@@ -401,7 +485,7 @@ where
     /// - Safe to send across thread boundaries.
     /// - Valid throughout the entire execution of the syscall until complete.
     /// - Obeys any additional safety constraints specified by the [opcode].
-    pub unsafe fn submit_many_entries_async<O>(
+    pub unsafe fn submit_many_entries_async(
         &self,
         pairs: impl IntoIterator<Item = (Entry, Option<G>)>,
     ) -> impl Future<Output = SubmitResult<impl IntoIterator<Item = reply::ReplyReceiver>>>
@@ -456,6 +540,8 @@ pub struct I2o2Scheduler<G = DynamicGuard> {
     backlog: Vec<Entry>,
     /// A shutdown signal flag to close the scheduler.
     shutdown: bool,
+    /// A null pointer used to prevent people from sending the scheduler across
+    _anti_send_ptr: *mut u8,
 }
 
 impl<G> I2o2Scheduler<G> {
@@ -466,6 +552,9 @@ impl<G> I2o2Scheduler<G> {
         tracing::debug!("scheduler is running");
 
         while !self.shutdown {
+            #[cfg(feature = "trace-hotpath")]
+            tracing::trace!("running ops cycle");
+
             if let Err(e) = self.run_ops_cycle() {
                 tracing::error!(error = ?e, "failed to complete io_uring cycle");
             }
@@ -475,7 +564,12 @@ impl<G> I2o2Scheduler<G> {
 
         // Submit any remaining events.
         self.ring.submit()?;
-        self.ring.submit_and_wait(self.state.remaining_tasks())?;
+
+        // Drain tasks
+        while self.state.remaining_tasks() > 0 {
+            self.ring.submit_and_wait(self.state.remaining_tasks())?;
+            self.drain_completion_events();
+        }
 
         let submitter = self.ring.submitter();
         submitter.unregister_eventfd()?;
@@ -489,8 +583,14 @@ impl<G> I2o2Scheduler<G> {
 
         let has_outstanding_writes = self.has_outstanding_ops();
         if !has_outstanding_writes {
+            #[cfg(feature = "trace-hotpath")]
+            tracing::debug!("submitting & waiting for completion events");
+
             self.ring.submit_and_wait(1)?;
         } else {
+            #[cfg(feature = "trace-hotpath")]
+            tracing::debug!("submitting");
+
             self.ring.submit()?;
         }
 
@@ -504,6 +604,12 @@ impl<G> I2o2Scheduler<G> {
     }
 
     fn drain_completion_events(&mut self) {
+        #[cfg(feature = "trace-hotpath")]
+        tracing::trace!(
+            num_tasks = self.state.remaining_tasks(),
+            "begin drain_completion_events"
+        );
+
         let mut completion = self.ring.completion();
         completion.sync();
 
@@ -512,6 +618,12 @@ impl<G> I2o2Scheduler<G> {
             self.state.acknowledge_reply(reply_idx, completion.result());
             self.state.drop_guard_if_exists(guard_idx);
         }
+
+        #[cfg(feature = "trace-hotpath")]
+        tracing::trace!(
+            num_tasks = self.state.remaining_tasks(),
+            "end drain_completion_events"
+        );
     }
 
     fn read_and_enqueue_events(&mut self) {
@@ -532,6 +644,12 @@ impl<G> I2o2Scheduler<G> {
     /// not be pushed onto the submission queue it will be added to the backlog and
     /// retried once the queue has space.
     fn drain_incoming(&mut self) {
+        #[cfg(feature = "trace-hotpath")]
+        tracing::trace!(
+            num_tasks = self.state.remaining_tasks(),
+            "begin drain_incoming"
+        );
+
         let mut submission = self.ring.submission();
 
         while let Ok(op) = self.incoming.try_recv() {
@@ -563,6 +681,12 @@ impl<G> I2o2Scheduler<G> {
             }
         }
 
+        #[cfg(feature = "trace-hotpath")]
+        tracing::trace!(
+            num_tasks = self.state.remaining_tasks(),
+            "end drain_incoming"
+        );
+
         submission.sync();
     }
 
@@ -575,6 +699,12 @@ impl<G> I2o2Scheduler<G> {
     /// Returns `Ok(())` if the backlog was cleared, otherwise `Err(())` is returned
     /// to signal entries still remain in the backlog and the submit queue is full.
     fn try_drain_backlog(&mut self) -> Result<(), ()> {
+        #[cfg(feature = "trace-hotpath")]
+        tracing::trace!(
+            num_tasks = self.state.remaining_tasks(),
+            "start try_drain_backlog"
+        );
+
         let mut submission = self.ring.submission();
 
         unsafe {
@@ -585,11 +715,24 @@ impl<G> I2o2Scheduler<G> {
                     if submission.push(&entry).is_err() {
                         self.backlog.push(entry);
                         submission.sync();
+
+                        #[cfg(feature = "trace-hotpath")]
+                        tracing::trace!(
+                            num_tasks = self.state.remaining_tasks(),
+                            "cannot finish training backlog as the submission queue is full",
+                        );
+
                         return Err(());
                     }
                 }
             }
         }
+
+        #[cfg(feature = "trace-hotpath")]
+        tracing::trace!(
+            num_tasks = self.state.remaining_tasks(),
+            "end try_drain_backlog"
+        );
 
         Ok(())
     }
@@ -608,6 +751,9 @@ fn handle_message<G>(
             while let Some(entry) = entries.next() {
                 let result = unsafe { submission.push(&entry) };
                 if result.is_err() {
+                    #[cfg(feature = "trace-hotpath")]
+                    tracing::trace!("submission queue is full, adding many to backlog");
+
                     backlog.extend(entries);
                     backlog.push(entry);
                     return false;
@@ -618,6 +764,9 @@ fn handle_message<G>(
             let entry = state.register(op);
             let result = unsafe { submission.push(&entry) };
             if result.is_err() {
+                #[cfg(feature = "trace-hotpath")]
+                tracing::trace!("submission queue is full, adding to backlog");
+
                 backlog.push(entry);
                 return false;
             }
@@ -708,7 +857,7 @@ fn unpack_indexes(packed: u64) -> (u32, u32) {
 }
 
 #[cfg(test)]
-mod tests {
+mod tests_packing {
     use super::*;
 
     #[rstest::rstest]
