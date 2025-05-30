@@ -7,6 +7,7 @@ use std::any::Any;
 use std::collections::VecDeque;
 use std::io;
 use std::pin::pin;
+use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
@@ -14,7 +15,7 @@ use futures_util::TryFutureExt;
 pub use io_uring;
 pub use io_uring::opcode;
 pub use io_uring::squeue::Entry;
-use io_uring::{CompletionQueue, IoUring, SubmissionQueue, Submitter, types};
+use io_uring::{CompletionQueue, IoUring, SubmissionQueue, Submitter};
 use smallvec::SmallVec;
 
 use crate::wake::RingWaker;
@@ -290,6 +291,11 @@ impl I2o2Builder {
 
         let ring = self.setup_io_ring()?;
 
+        let handle = I2o2Handle {
+            inner: tx,
+            wake_on_drop: Arc::new(WakeOnDrop(waker.task_waker())),
+        };
+
         let scheduler = I2o2Scheduler {
             ring,
             state: TrackedState::default(),
@@ -298,8 +304,6 @@ impl I2o2Builder {
             backlog: VecDeque::new(),
             _anti_send_ptr: std::ptr::null_mut(),
         };
-
-        let handle = I2o2Handle { inner: tx };
 
         Ok((scheduler, handle))
     }
@@ -372,12 +376,15 @@ impl I2o2Builder {
 /// submit IO events to it.
 pub struct I2o2Handle<G = DynamicGuard> {
     inner: flume::Sender<Message<G>>,
+    /// A guard that ensures the runtime is woken when the handle is dropped.
+    wake_on_drop: Arc<WakeOnDrop>,
 }
 
 impl<G> Clone for I2o2Handle<G> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
+            wake_on_drop: self.wake_on_drop.clone(),
         }
     }
 }
@@ -531,6 +538,14 @@ fn prepare_many_entries<G>(
     (Message::Many(SmallVec::from_iter(iter)), replies)
 }
 
+struct WakeOnDrop(std::task::Waker);
+
+impl Drop for WakeOnDrop {
+    fn drop(&mut self) {
+        self.0.wake_by_ref();
+    }
+}
+
 /// The [I2o2Scheduler] runs an io_uring ring in the current thread and submits
 /// IO events from the handle into the ring.
 ///
@@ -576,6 +591,7 @@ impl<G> I2o2Scheduler<G> {
             runner.run()?;
         }
 
+        runner.wait_for_remaining()?;
         tracing::debug!("scheduler shutting down");
 
         Ok(())
@@ -611,13 +627,35 @@ impl<'ring, G> RingRunner<'ring, G> {
 
         self.drain_backlog();
         self.ingest_from_incoming();
-
+        self.drain_completion_events();
         self.maybe_register_waker();
-        self.maybe_wait()?;
+
+        self.submit_and_maybe_wait()?;
 
         Ok(self.shutdown)
     }
 
+    fn wait_for_remaining(&mut self) -> io::Result<()> {
+        self.sq.sync();
+        self.cq.sync();
+
+        #[cfg(feature = "trace-hotpath")]
+        tracing::debug!("scheduler is draining remaining events");
+
+        while !self.backlog.is_empty() || self.state.remaining_tasks() > 0 {
+            self.drain_backlog();
+            self.ingest_from_incoming();
+            self.drain_completion_events();
+            self.submit_and_maybe_wait()?;
+        }
+
+        #[cfg(feature = "trace-hotpath")]
+        tracing::debug!("scheduler has drained all events");
+
+        Ok(())
+    }
+
+    /// Attempt to push outstanding backlog entries onto the submission queue.
     fn drain_backlog(&mut self) {
         if self.backlog.is_empty() {
             return;
@@ -634,6 +672,11 @@ impl<'ring, G> RingRunner<'ring, G> {
         self.sq.sync();
     }
 
+    /// Reads new entries from `incoming` until the submission queue is full.
+    ///
+    /// If multiple entries are included in a single message, the runner will
+    /// add the events unable to be pushed to the SQ to the backlog where
+    /// it will have priority when space is next available in the SQ.
     fn ingest_from_incoming(&mut self) {
         while !self.sq.is_full() {
             if let Ok(message) = self.incoming.try_recv() {
@@ -649,6 +692,7 @@ impl<'ring, G> RingRunner<'ring, G> {
                     #[cfg(feature = "trace-hotpath")]
                     tracing::debug!("scheduler handle has been disconnected");
                     self.shutdown = true;
+                    break;
                 },
                 Poll::Ready(Ok(message)) => self.handle_message(message),
             }
@@ -666,20 +710,58 @@ impl<'ring, G> RingRunner<'ring, G> {
                 let (reply_idx, guard_idx) = unpack_indexes(user_data);
                 self.state.acknowledge_reply(reply_idx, completion.result());
                 self.state.drop_guard_if_exists(guard_idx);
+
+                #[cfg(feature = "trace-hotpath")]
+                tracing::trace!(
+                    task_id = reply_idx,
+                    result = completion.result(),
+                    "got completion"
+                );
             }
         }
         self.cq.sync();
     }
 
+    /// Register the EventFD waker if it is not already registered with a `read(2)` event.
+    ///
+    /// This is used to wake the scheduler when new `incoming` operations are available
+    /// while waiting for completion events.
     fn maybe_register_waker(&mut self) {
-        let did_submit = self.self_waker.maybe_submit_self(&mut self.sq);
+        self.self_waker.maybe_submit_self(&mut self.sq);
         self.sq.sync();
+    }
 
-        #[cfg(feature = "trace-hotpath")]
-        if did_submit {
-            tracing::trace!("waker has been registered");
+    /// Submit all new submission events to the kernel and wait
+    /// for completion events to be ready if there is not anymore outstanding work.
+    fn submit_and_maybe_wait(&self) -> io::Result<()> {
+        if !self.has_outstanding_work() {
+            #[cfg(feature = "trace-hotpath")]
+            tracing::trace!("waiting for completion events");
+            self.submit_and_wait()
         } else {
-            tracing::trace!("waker was not registered as the SQ is full");
+            #[cfg(feature = "trace-hotpath")]
+            tracing::trace!("outstanding work ready, submitting without wait");
+            self.submit_no_wait()
+        }
+    }
+
+    fn submit_no_wait(&self) -> io::Result<()> {
+        match self.submitter.submit() {
+            Err(ref err) if err.raw_os_error() == Some(libc::EBUSY) => Ok(()),
+            Err(other) => Err(other),
+            Ok(_) => Ok(()),
+        }
+    }
+
+    fn submit_and_wait(&self) -> io::Result<()> {
+        match self.submitter.submit_and_wait(1) {
+            Err(ref err) if err.raw_os_error() == Some(libc::EBUSY) => Ok(()),
+            Err(other) => Err(other),
+            Ok(_) => {
+                #[cfg(feature = "trace-hotpath")]
+                tracing::debug!("scheduler was woken");
+                Ok(())
+            },
         }
     }
 
@@ -707,36 +789,11 @@ impl<'ring, G> RingRunner<'ring, G> {
         }
     }
 
-    fn maybe_wait(&self) -> io::Result<()> {
-        if !self.has_outstanding_work() {
-            self.submit_and_wait()
-        } else {
-            self.submit_no_wait()
-        }
-    }
-
-    fn submit_no_wait(&self) -> io::Result<()> {
-        match self.submitter.submit() {
-            Err(ref err) if err.raw_os_error() == Some(libc::EBUSY) => Ok(()),
-            Err(other) => Err(other),
-            Ok(_) => Ok(()),
-        }
-    }
-
-    fn submit_and_wait(&self) -> io::Result<()> {
-        match self.submitter.submit_and_wait(1) {
-            Err(ref err) if err.raw_os_error() == Some(libc::EBUSY) => Ok(()),
-            Err(other) => Err(other),
-            Ok(_) => {
-                #[cfg(feature = "trace-hotpath")]
-                tracing::debug!("scheduler was woken");
-                Ok(())
-            },
-        }
-    }
-
     fn has_outstanding_work(&self) -> bool {
-        !self.incoming.is_empty() || !self.backlog.is_empty() || !self.cq.is_empty()
+        !self.incoming.is_empty()
+            || self.incoming.is_disconnected()
+            || !self.backlog.is_empty()
+            || !self.cq.is_empty()
     }
 }
 
@@ -778,6 +835,9 @@ impl<G> TrackedState<G> {
                 idx as u32
             })
             .unwrap_or(u32::MAX);
+
+        #[cfg(feature = "trace-hotpath")]
+        tracing::trace!(task_id = reply_idx, "registered entry");
 
         let user_data = pack_indexes(reply_idx as u32, guard_idx);
         entry.user_data(user_data)

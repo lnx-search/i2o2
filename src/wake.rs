@@ -18,7 +18,7 @@ impl RingWaker {
     /// Creates a new waker for the ring.
     pub(super) fn new() -> io::Result<Self> {
         let event_fd = unsafe { libc::eventfd(0, 0) };
-        if event_fd == -1 {
+        if event_fd < 0 {
             return Err(io::Error::last_os_error());
         }
 
@@ -41,6 +41,9 @@ impl RingWaker {
     }
 
     pub(super) fn mark_unset(&mut self) {
+        #[cfg(feature = "trace-hotpath")]
+        tracing::trace!("waker has been unset");
+
         self.is_set = false;
     }
 
@@ -49,6 +52,8 @@ impl RingWaker {
         submission: &mut SubmissionQueue,
     ) -> bool {
         if self.is_set {
+            #[cfg(feature = "trace-hotpath")]
+            tracing::trace!("waker already registered");
             return true;
         }
 
@@ -65,6 +70,10 @@ impl RingWaker {
         tracing::trace!(is_set = self.is_set, "submitting self waker to queue");
 
         self.is_set
+    }
+
+    pub(super) fn task_waker(&self) -> std::task::Waker {
+        self.waker.clone()
     }
 
     /// Creates a new [std::task::Context] with a waker for the current ring.

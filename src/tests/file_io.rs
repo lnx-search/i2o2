@@ -139,7 +139,6 @@ async fn write_file_async(
     };
     eprintln!("completed submit");
 
-    eprintln!("hmmm?");
     let result = reply.await.expect("operation should complete");
     eprintln!("completed result: {result}");
     if result < 0 {
