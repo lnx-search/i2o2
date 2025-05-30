@@ -141,16 +141,6 @@ pub struct ReplyNotify {
     has_set_result: bool,
 }
 
-impl Debug for ReplyNotify {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "ReplyNotify(result={})",
-            self.inner.result.load(Ordering::Relaxed)
-        )
-    }
-}
-
 impl ReplyNotify {
     /// Set the result of the operation and notify the future.
     pub fn set_result(mut self, result: i32) {

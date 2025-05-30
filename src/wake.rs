@@ -2,7 +2,7 @@ use std::io;
 use std::os::fd::RawFd;
 use std::sync::Arc;
 
-use io_uring::{SubmissionQueue, Submitter, opcode, types};
+use io_uring::{SubmissionQueue, opcode, types};
 
 use crate::reserved_user_data;
 
@@ -34,10 +34,6 @@ impl RingWaker {
             waker,
             is_set: false,
         })
-    }
-
-    pub(super) fn prepare_shutdown(&self) {
-        self.waker.wake_by_ref();
     }
 
     pub(super) fn mark_unset(&mut self) {
@@ -113,5 +109,27 @@ impl Drop for EventFdWaker {
             let _ = unsafe { libc::close(self.event_fd) };
             self.is_closed = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_wake_behaviour() {
+        let ring_waker = RingWaker::new().expect("create eventfd");
+
+        let task_waker = ring_waker.task_waker();
+        task_waker.wake();
+        let mut result: u64 = 0;
+        unsafe { libc::eventfd_read(ring_waker.event_fd, (&mut result) as *mut _) };
+        assert_eq!(result, 1);
+
+        let task_waker = ring_waker.task_waker();
+        task_waker.wake_by_ref();
+        let mut result: u64 = 0;
+        unsafe { libc::eventfd_read(ring_waker.event_fd, (&mut result) as *mut _) };
+        assert_eq!(result, 1);
     }
 }

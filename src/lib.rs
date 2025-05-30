@@ -6,7 +6,6 @@ mod wake;
 use std::any::Any;
 use std::collections::VecDeque;
 use std::io;
-use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
