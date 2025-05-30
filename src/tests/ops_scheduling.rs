@@ -1,7 +1,6 @@
-use std::os::fd::AsRawFd;
-use std::{fs, io};
+use std::io;
 
-use io_uring::{IoUring, opcode, types};
+use io_uring::opcode;
 
 #[test]
 fn test_scheduler_noop() {

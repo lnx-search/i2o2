@@ -4,6 +4,7 @@ mod tests;
 mod wake;
 
 use std::any::Any;
+use std::collections::VecDeque;
 use std::io;
 use std::pin::pin;
 use std::task::Poll;
@@ -11,9 +12,9 @@ use std::time::Duration;
 
 use futures_util::TryFutureExt;
 pub use io_uring;
-use io_uring::IoUring;
 pub use io_uring::opcode;
 pub use io_uring::squeue::Entry;
+use io_uring::{CompletionQueue, IoUring, SubmissionQueue, Submitter, types};
 use smallvec::SmallVec;
 
 use crate::wake::RingWaker;
@@ -27,6 +28,19 @@ compiler_error!(
 pub type DynamicGuard = Box<dyn Any>;
 /// A submission result for the scheduler.
 pub type SubmitResult<T> = Result<T, SchedulerClosed>;
+
+const MAX_NUM_PENDING_TASKS: usize = u32::MAX as usize - 1000;
+mod reserved_user_data {
+    pub const EVENT_FD_WAKER: u64 = super::pack_indexes(u32::MAX, u32::MAX);
+}
+
+mod reserved_buffer_indexes {
+    pub const WAKER_BUFFER: u32 = 0;
+}
+
+mod reserved_file_indexes {
+    pub const WAKER_EVENT_FD: u32 = 0;
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("scheduler has closed")]
@@ -176,7 +190,7 @@ impl I2o2Builder {
     /// > Perform busy-waiting for an I/O completion, as opposed to
     /// > getting notifications via an asynchronous IRQ (Interrupt
     /// > Request).
-    ///    
+    ///
     /// **WARNING: Enabling this option requires all file IO events to be O_DIRECT**
     ///
     /// By default, this is `disabled`.
@@ -276,16 +290,12 @@ impl I2o2Builder {
 
         let ring = self.setup_io_ring()?;
 
-        let submitter = ring.submitter();
-        submitter.register_eventfd(waker.event_fd())?;
-
         let scheduler = I2o2Scheduler {
             ring,
             state: TrackedState::default(),
             self_waker: waker,
             incoming: rx,
-            backlog: Vec::new(),
-            shutdown: false,
+            backlog: VecDeque::new(),
             _anti_send_ptr: std::ptr::null_mut(),
         };
 
@@ -306,6 +316,7 @@ impl I2o2Builder {
 
         let task = move || {
             let (scheduler, handle) = self.try_create()?;
+
             if tx.send(handle).is_err() {
                 return Ok(());
             }
@@ -537,9 +548,7 @@ pub struct I2o2Scheduler<G = DynamicGuard> {
     ///
     /// The entries in this backlog have already had user data assigned to them
     /// and can be copied directly to the queue.
-    backlog: Vec<Entry>,
-    /// A shutdown signal flag to close the scheduler.
-    shutdown: bool,
+    backlog: VecDeque<Entry>,
     /// A null pointer used to prevent people from sending the scheduler across
     _anti_send_ptr: *mut u8,
 }
@@ -551,229 +560,184 @@ impl<G> I2o2Scheduler<G> {
     pub fn run(mut self) -> io::Result<()> {
         tracing::debug!("scheduler is running");
 
-        while !self.shutdown {
-            #[cfg(feature = "trace-hotpath")]
-            tracing::trace!("running ops cycle");
+        let (submitter, sq, cq) = self.ring.split();
+        let mut runner = RingRunner {
+            submitter,
+            sq,
+            cq,
+            state: &mut self.state,
+            self_waker: &mut self.self_waker,
+            backlog: &mut self.backlog,
+            incoming: &self.incoming,
+            shutdown: false,
+        };
 
-            if let Err(e) = self.run_ops_cycle() {
-                tracing::error!(error = ?e, "failed to complete io_uring cycle");
-            }
+        while !runner.shutdown {
+            runner.run()?;
         }
 
         tracing::debug!("scheduler shutting down");
-
-        // Submit any remaining events.
-        self.ring.submit()?;
-
-        // Drain tasks
-        while self.state.remaining_tasks() > 0 {
-            self.ring.submit_and_wait(self.state.remaining_tasks())?;
-            self.drain_completion_events();
-        }
-
-        let submitter = self.ring.submitter();
-        submitter.unregister_eventfd()?;
-
-        Ok(())
-    }
-
-    fn run_ops_cycle(&mut self) -> io::Result<()> {
-        self.drain_completion_events();
-        self.read_and_enqueue_events();
-
-        let has_outstanding_writes = self.has_outstanding_ops();
-        if !has_outstanding_writes {
-            #[cfg(feature = "trace-hotpath")]
-            tracing::debug!("submitting & waiting for completion events");
-
-            self.ring.submit_and_wait(1)?;
-        } else {
-            #[cfg(feature = "trace-hotpath")]
-            tracing::debug!("submitting");
-
-            self.ring.submit()?;
-        }
-
-        Ok(())
-    }
-
-    fn has_outstanding_ops(&mut self) -> bool {
-        !self.backlog.is_empty()
-            || !self.incoming.is_empty()
-            || !self.ring.completion().is_empty()
-    }
-
-    fn drain_completion_events(&mut self) {
-        #[cfg(feature = "trace-hotpath")]
-        tracing::trace!(
-            num_tasks = self.state.remaining_tasks(),
-            "begin drain_completion_events"
-        );
-
-        let mut completion = self.ring.completion();
-        completion.sync();
-
-        for completion in completion {
-            let (reply_idx, guard_idx) = unpack_indexes(completion.user_data());
-            self.state.acknowledge_reply(reply_idx, completion.result());
-            self.state.drop_guard_if_exists(guard_idx);
-        }
-
-        #[cfg(feature = "trace-hotpath")]
-        tracing::trace!(
-            num_tasks = self.state.remaining_tasks(),
-            "end drain_completion_events"
-        );
-    }
-
-    fn read_and_enqueue_events(&mut self) {
-        // Prioritise draining the backlog before new ops.
-        if self.try_drain_backlog().is_err() {
-            return;
-        }
-
-        self.drain_incoming();
-    }
-
-    /// Ingest new messages coming from the `incoming` message channel.
-    ///
-    /// If the channel becomes empty, the system will register a waker in order
-    /// to trigger ingestion again when new entries exist.
-    ///
-    /// A message can contain one or more operations to perform, if the operation could
-    /// not be pushed onto the submission queue it will be added to the backlog and
-    /// retried once the queue has space.
-    fn drain_incoming(&mut self) {
-        #[cfg(feature = "trace-hotpath")]
-        tracing::trace!(
-            num_tasks = self.state.remaining_tasks(),
-            "begin drain_incoming"
-        );
-
-        let mut submission = self.ring.submission();
-
-        while let Ok(op) = self.incoming.try_recv() {
-            let has_capacity =
-                handle_message(&mut submission, &mut self.state, &mut self.backlog, op);
-
-            if !has_capacity {
-                break;
-            }
-        }
-
-        if self.incoming.is_empty() {
-            let mut ctx = self.self_waker.context();
-            let mut future = pin!(self.incoming.recv_async());
-            match future.as_mut().poll(&mut ctx) {
-                Poll::Ready(Ok(op)) => {
-                    handle_message(
-                        &mut submission,
-                        &mut self.state,
-                        &mut self.backlog,
-                        op,
-                    );
-                },
-                // This only errors if all handles are dropped and the ring should shutdown.
-                Poll::Ready(Err(_)) => {
-                    self.shutdown = true;
-                },
-                Poll::Pending => {},
-            }
-        }
-
-        #[cfg(feature = "trace-hotpath")]
-        tracing::trace!(
-            num_tasks = self.state.remaining_tasks(),
-            "end drain_incoming"
-        );
-
-        submission.sync();
-    }
-
-    /// Attempts to submit all entries currently in the backlog queue.
-    ///
-    /// The queue is processed in a LIFO order to prioritise latency
-    /// in the event the backlog grows too much, although in theory that should
-    /// be minimal.
-    ///
-    /// Returns `Ok(())` if the backlog was cleared, otherwise `Err(())` is returned
-    /// to signal entries still remain in the backlog and the submit queue is full.
-    fn try_drain_backlog(&mut self) -> Result<(), ()> {
-        #[cfg(feature = "trace-hotpath")]
-        tracing::trace!(
-            num_tasks = self.state.remaining_tasks(),
-            "start try_drain_backlog"
-        );
-
-        let mut submission = self.ring.submission();
-
-        unsafe {
-            if submission.push_multiple(&self.backlog).is_ok() {
-                self.backlog.clear();
-            } else {
-                while let Some(entry) = self.backlog.pop() {
-                    if submission.push(&entry).is_err() {
-                        self.backlog.push(entry);
-                        submission.sync();
-
-                        #[cfg(feature = "trace-hotpath")]
-                        tracing::trace!(
-                            num_tasks = self.state.remaining_tasks(),
-                            "cannot finish training backlog as the submission queue is full",
-                        );
-
-                        return Err(());
-                    }
-                }
-            }
-        }
-
-        #[cfg(feature = "trace-hotpath")]
-        tracing::trace!(
-            num_tasks = self.state.remaining_tasks(),
-            "end try_drain_backlog"
-        );
 
         Ok(())
     }
 }
 
-fn handle_message<G>(
-    submission: &mut io_uring::SubmissionQueue,
-    state: &mut TrackedState<G>,
-    backlog: &mut Vec<Entry>,
-    op: Message<G>,
-) -> bool {
-    match op {
-        Message::Many(ops) => {
-            let mut entries = ops.into_iter().map(|op| state.register(op));
+struct RingRunner<'ring, G> {
+    submitter: Submitter<'ring>,
+    sq: SubmissionQueue<'ring>,
+    cq: CompletionQueue<'ring>,
+    state: &'ring mut TrackedState<G>,
+    self_waker: &'ring mut RingWaker,
+    backlog: &'ring mut VecDeque<Entry>,
+    incoming: &'ring flume::Receiver<Message<G>>,
+    shutdown: bool,
+}
 
-            while let Some(entry) = entries.next() {
-                let result = unsafe { submission.push(&entry) };
-                if result.is_err() {
-                    #[cfg(feature = "trace-hotpath")]
-                    tracing::trace!("submission queue is full, adding many to backlog");
+impl<'ring, G> RingRunner<'ring, G> {
+    /// Run a single cycle of the event loop.
+    ///
+    /// This executes steps in the order of:
+    ///
+    /// 1) Try and empty the backlog of submission events if applicable.
+    /// 2) Ingest new events from `incoming` until the SQ is full or `incoming` is empty.
+    /// 3) Process outstanding completion events.  
+    /// 4) Re-register the EventFD listener if the system needs.
+    /// 5) Submit outstanding submission events.
+    /// 6) Wait for completion events if there is no outstanding work left.
+    ///
+    fn run(&mut self) -> io::Result<bool> {
+        self.sq.sync();
+        self.cq.sync();
 
-                    backlog.extend(entries);
-                    backlog.push(entry);
-                    return false;
-                }
-            }
-        },
-        Message::One(op) => {
-            let entry = state.register(op);
-            let result = unsafe { submission.push(&entry) };
-            if result.is_err() {
-                #[cfg(feature = "trace-hotpath")]
-                tracing::trace!("submission queue is full, adding to backlog");
+        self.drain_backlog();
+        self.ingest_from_incoming();
 
-                backlog.push(entry);
-                return false;
-            }
-        },
+        self.maybe_register_waker();
+        self.maybe_wait()?;
+
+        Ok(self.shutdown)
     }
 
-    true
+    fn drain_backlog(&mut self) {
+        if self.backlog.is_empty() {
+            return;
+        }
+
+        while !self.sq.is_full() {
+            // This cannot loop infinitely, because the entry is only added back to
+            // the backlog if the `sq` is full, which will intern cause the loop to break.
+            let Some(entry) = self.backlog.pop_front() else {
+                break;
+            };
+            self.push_entry(entry);
+        }
+        self.sq.sync();
+    }
+
+    fn ingest_from_incoming(&mut self) {
+        while !self.sq.is_full() {
+            if let Ok(message) = self.incoming.try_recv() {
+                self.handle_message(message);
+                continue;
+            }
+
+            let mut context = self.self_waker.context();
+            let mut future = pin!(self.incoming.recv_async());
+            match future.as_mut().poll(&mut context) {
+                Poll::Pending => break,
+                Poll::Ready(Err(_)) => {
+                    #[cfg(feature = "trace-hotpath")]
+                    tracing::debug!("scheduler handle has been disconnected");
+                    self.shutdown = true;
+                },
+                Poll::Ready(Ok(message)) => self.handle_message(message),
+            }
+        }
+        self.sq.sync();
+    }
+
+    fn drain_completion_events(&mut self) {
+        for completion in &mut self.cq {
+            let user_data = completion.user_data();
+
+            if user_data == reserved_user_data::EVENT_FD_WAKER {
+                self.self_waker.mark_unset();
+            } else {
+                let (reply_idx, guard_idx) = unpack_indexes(user_data);
+                self.state.acknowledge_reply(reply_idx, completion.result());
+                self.state.drop_guard_if_exists(guard_idx);
+            }
+        }
+        self.cq.sync();
+    }
+
+    fn maybe_register_waker(&mut self) {
+        let did_submit = self.self_waker.maybe_submit_self(&mut self.sq);
+        self.sq.sync();
+
+        #[cfg(feature = "trace-hotpath")]
+        if did_submit {
+            tracing::trace!("waker has been registered");
+        } else {
+            tracing::trace!("waker was not registered as the SQ is full");
+        }
+    }
+
+    fn handle_message(&mut self, message: Message<G>) {
+        match message {
+            Message::Many(ops) => {
+                for op in ops {
+                    self.handle_op(op);
+                }
+            },
+            Message::One(op) => self.handle_op(op),
+        }
+    }
+
+    fn handle_op(&mut self, op: PackagedOp<G>) {
+        let entry = self.state.register(op);
+        self.push_entry(entry);
+    }
+
+    fn push_entry(&mut self, entry: Entry) {
+        // SAFETY: Responsibility about ensuring entry validity is pushed to the caller
+        //         on the handle side.
+        if unsafe { self.sq.push(&entry).is_err() } {
+            self.backlog.push_back(entry);
+        }
+    }
+
+    fn maybe_wait(&self) -> io::Result<()> {
+        if !self.has_outstanding_work() {
+            self.submit_and_wait()
+        } else {
+            self.submit_no_wait()
+        }
+    }
+
+    fn submit_no_wait(&self) -> io::Result<()> {
+        match self.submitter.submit() {
+            Err(ref err) if err.raw_os_error() == Some(libc::EBUSY) => Ok(()),
+            Err(other) => Err(other),
+            Ok(_) => Ok(()),
+        }
+    }
+
+    fn submit_and_wait(&self) -> io::Result<()> {
+        match self.submitter.submit_and_wait(1) {
+            Err(ref err) if err.raw_os_error() == Some(libc::EBUSY) => Ok(()),
+            Err(other) => Err(other),
+            Ok(_) => {
+                #[cfg(feature = "trace-hotpath")]
+                tracing::debug!("scheduler was woken");
+                Ok(())
+            },
+        }
+    }
+
+    fn has_outstanding_work(&self) -> bool {
+        !self.incoming.is_empty() || !self.backlog.is_empty() || !self.cq.is_empty()
+    }
 }
 
 struct TrackedState<G> {
@@ -845,7 +809,7 @@ struct PackagedOp<G = DynamicGuard> {
     guard: Option<G>,
 }
 
-fn pack_indexes(reply_idx: u32, guard_idx: u32) -> u64 {
+const fn pack_indexes(reply_idx: u32, guard_idx: u32) -> u64 {
     ((reply_idx as u64) << 32) | (guard_idx as u64)
 }
 
