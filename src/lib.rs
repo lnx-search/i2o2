@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 mod reply;
 #[cfg(test)]
 mod tests;
@@ -176,7 +178,7 @@ impl I2o2Builder {
     ///
     /// Sets `IORING_SETUP_IOPOLL`
     ///
-    /// https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html
+    /// <https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html>
     ///
     /// > Perform busy-waiting for an I/O completion, as opposed to
     /// > getting notifications via an asynchronous IRQ (Interrupt
@@ -194,7 +196,7 @@ impl I2o2Builder {
     ///
     /// Sets `IORING_SETUP_SQPOLL`
     ///
-    /// https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html
+    /// <https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html>
     ///
     /// > When this flag is specified, a kernel thread is created to
     /// > perform submission queue polling.  An io_uring instance
@@ -218,7 +220,7 @@ impl I2o2Builder {
 
     /// Set the submission queue polling idle timeout.
     ///
-    /// https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html
+    /// <https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html>
     ///
     /// This overwrites the default timeout value I2o2 sets of `10ms`.
     ///
@@ -242,7 +244,7 @@ impl I2o2Builder {
     ///
     /// Sets `IORING_SETUP_SQ_AFF`
     ///
-    /// https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html
+    /// <https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html>
     ///
     /// NOTE: `with_sqe_polling` must be enabled first before calling this method.
     pub fn with_sqe_polling_pin_cpu(mut self, cpu: u32) -> Self {
@@ -259,7 +261,7 @@ impl I2o2Builder {
     ///
     /// Sets `IORING_SETUP_DEFER_TASKRUN`
     ///
-    /// https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html
+    /// <https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html>
     ///
     /// > By default, io_uring will process all outstanding work at
     /// > the end of any system call or thread interrupt. This can
@@ -397,7 +399,7 @@ where
     /// It is the callers responsibility to ensure that the op contained within the entry is:
     /// - Safe to send across thread boundaries.
     /// - Valid throughout the entire execution of the syscall until complete.
-    /// - Obeys any additional safety constraints specified by the [i2o2::opcode].
+    /// - Obeys any additional safety constraints specified by the [i2o2::opcode](opcode).
     ///
     /// # Example
     ///
@@ -455,7 +457,7 @@ where
     /// It is the callers responsibility to ensure that the op contained within the entry is:
     /// - Safe to send across thread boundaries.
     /// - Valid throughout the entire execution of the syscall until complete.
-    /// - Obeys any additional safety constraints specified by the [i2o2::opcode].
+    /// - Obeys any additional safety constraints specified by the [i2o2::opcode](opcode).
     ///
     /// # Example
     ///
@@ -508,7 +510,7 @@ where
     /// It is the callers responsibility to ensure that the op contained within the entry is:
     /// - Safe to send across thread boundaries.
     /// - Valid throughout the entire execution of the syscall until complete.
-    /// - Obeys any additional safety constraints specified by the [i2o2::opcode].
+    /// - Obeys any additional safety constraints specified by the [i2o2::opcode](opcode).
     ///
     /// # Example
     ///
@@ -572,7 +574,7 @@ where
     /// It is the callers responsibility to ensure that the op contained within the entry is:
     /// - Safe to send across thread boundaries.
     /// - Valid throughout the entire execution of the syscall until complete.
-    /// - Obeys any additional safety constraints specified by the [i2o2::opcode].
+    /// - Obeys any additional safety constraints specified by the [i2o2::opcode](opcode).
     ///
     /// # Example
     ///
