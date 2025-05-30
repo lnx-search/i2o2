@@ -89,7 +89,6 @@ struct EventFdWaker {
 
 impl EventFdWaker {
     fn wake_inner(&self) {
-        eprintln!("waking");
         let result = unsafe { libc::eventfd_write(self.event_fd, 1) };
         assert_ne!(result, -1);
     }

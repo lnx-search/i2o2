@@ -6,12 +6,13 @@ mod wake;
 use std::any::Any;
 use std::collections::VecDeque;
 use std::io;
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
-use futures_util::TryFutureExt;
+use flume::r#async::RecvFut;
+use futures_util::{FutureExt, TryFutureExt};
 pub use io_uring;
 pub use io_uring::opcode;
 pub use io_uring::squeue::Entry;
@@ -584,6 +585,7 @@ impl<G> I2o2Scheduler<G> {
             self_waker: &mut self.self_waker,
             backlog: &mut self.backlog,
             incoming: &self.incoming,
+            pending_future: None,
             shutdown: false,
         };
 
@@ -606,6 +608,7 @@ struct RingRunner<'ring, G> {
     self_waker: &'ring mut RingWaker,
     backlog: &'ring mut VecDeque<Entry>,
     incoming: &'ring flume::Receiver<Message<G>>,
+    pending_future: Option<RecvFut<'ring, Message<G>>>,
     shutdown: bool,
 }
 
@@ -661,13 +664,23 @@ impl<'ring, G> RingRunner<'ring, G> {
             return;
         }
 
+        #[cfg(feature = "trace-hotpath")]
+        tracing::trace!(
+            backlog_size = self.backlog.len(),
+            "attempting to draining backlog"
+        );
+
         while !self.sq.is_full() {
-            // This cannot loop infinitely, because the entry is only added back to
-            // the backlog if the `sq` is full, which will intern cause the loop to break.
             let Some(entry) = self.backlog.pop_front() else {
                 break;
             };
-            self.push_entry(entry);
+
+            // SAFETY: Responsibility about ensuring entry validity is pushed to the caller
+            //         on the handle side.
+            if unsafe { self.sq.push(&entry).is_err() } {
+                self.backlog.push_front(entry);
+                break;
+            }
         }
         self.sq.sync();
     }
@@ -678,23 +691,41 @@ impl<'ring, G> RingRunner<'ring, G> {
     /// add the events unable to be pushed to the SQ to the backlog where
     /// it will have priority when space is next available in the SQ.
     fn ingest_from_incoming(&mut self) {
-        while !self.sq.is_full() {
+        #[cfg(feature = "trace-hotpath")]
+        tracing::trace!(
+            incoming_len = self.incoming.len(),
+            sq_len = self.sq.len(),
+            sq_capacity = self.sq.capacity(),
+            "ingesting new entries from incoming"
+        );
+
+        'ingest: while !self.sq.is_full() {
             if let Ok(message) = self.incoming.try_recv() {
                 self.handle_message(message);
                 continue;
             }
 
-            let mut context = self.self_waker.context();
-            let mut future = pin!(self.incoming.recv_async());
-            match future.as_mut().poll(&mut context) {
-                Poll::Pending => break,
-                Poll::Ready(Err(_)) => {
-                    #[cfg(feature = "trace-hotpath")]
-                    tracing::debug!("scheduler handle has been disconnected");
-                    self.shutdown = true;
-                    break;
-                },
-                Poll::Ready(Ok(message)) => self.handle_message(message),
+            // We must continue until we get either a disconnect or `pending` state
+            // so we can be sure the waker is registered.
+            loop {
+                let mut context = self.self_waker.context();
+                let future = self
+                    .pending_future
+                    .get_or_insert_with(|| self.incoming.recv_async());
+                match future.poll_unpin(&mut context) {
+                    Poll::Pending => break 'ingest,
+                    Poll::Ready(Err(_)) => {
+                        #[cfg(feature = "trace-hotpath")]
+                        tracing::debug!("scheduler handle has been disconnected");
+                        self.pending_future = None;
+                        self.shutdown = true;
+                        break 'ingest;
+                    },
+                    Poll::Ready(Ok(message)) => {
+                        self.pending_future = None;
+                        self.handle_message(message)
+                    },
+                }
             }
         }
         self.sq.sync();

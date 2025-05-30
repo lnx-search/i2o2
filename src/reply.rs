@@ -97,7 +97,9 @@ impl Future for ReplyReceiver {
     type Output = Result<i32, Cancelled>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        eprintln!("polled");
+        #[cfg(feature = "trace-hotpath")]
+        tracing::debug!("reply recv polled");
+
         let inner = self.inner.as_ref();
 
         let value = inner.result.load(Ordering::SeqCst);
@@ -106,7 +108,9 @@ impl Future for ReplyReceiver {
         // Note that the acquisition of the `waker` lock should never fail while the
         // `value` is in the `FLAG_PENDING` state.
         let done = if value == FLAG_PENDING {
-            eprintln!("pending");
+            #[cfg(feature = "trace-hotpath")]
+            tracing::debug!("reply is pending");
+
             let task = cx.waker().clone();
             let mut lock = inner
                 .waker
@@ -115,7 +119,9 @@ impl Future for ReplyReceiver {
             *lock = Some(task);
             false
         } else {
-            eprintln!("result");
+            #[cfg(feature = "trace-hotpath")]
+            tracing::debug!("reply is ready");
+
             true
         };
 
@@ -148,7 +154,6 @@ impl Debug for ReplyNotify {
 impl ReplyNotify {
     /// Set the result of the operation and notify the future.
     pub fn set_result(mut self, result: i32) {
-        eprintln!("result: {result}");
         let inner = self.inner.as_ref();
         inner.result.store(result as i64, Ordering::SeqCst);
         self.has_set_result = true;
