@@ -1,22 +1,7 @@
-# I2o2
-
-A tiny scheduler for executing IO calls with an io_uring executor.
-
-This project is designed for [lnx](https://github.com/lnx-search/lnx) as a replacement to glommio's file system API
-and is a relatively low-level API.
-
-In particular, the system only lightly attempts to prevent you messing stuff up, hence why almost all calls
-are unsafe. The only thing it really protects against buffers being dropped early.
-
-
-### Example
-
-```rust
 use std::io;
 use std::sync::Arc;
 
-#[tokio::main]
-async fn main() -> io::Result<()> {
+fn main() -> io::Result<()> {
     println!("creating our scheduler worker");
 
     // For most cases you can use `create_and_spawn` which uses a set of sane defaults.
@@ -34,12 +19,9 @@ async fn main() -> io::Result<()> {
     let guard = Arc::new(());
 
     println!("submitting {op:?} to the scheduler");
-
-    // We send the message to the scheduler asynchronously!
     let reply = unsafe {
         scheduler_handle
-            .submit_async(op, Some(guard.clone()))
-            .await
+            .submit(op, Some(guard.clone()))
             .expect("submit op to scheduler")
     };
     println!("reply future created: {reply:?}");
@@ -50,7 +32,7 @@ async fn main() -> io::Result<()> {
     // We can synchronously or asynchronously wait for the reply, which will give us
     // back the result that the syscall equivalent of the operation would return.
     // I.e. `opcode::Write` would return the same value as `pwrite(2)`.
-    let reply = reply.await;
+    let reply = reply.wait();
     println!("our task completed with reply: {reply:?}");
     assert_eq!(reply, Ok(0));
 
@@ -67,6 +49,3 @@ async fn main() -> io::Result<()> {
 
     Ok(())
 }
-```
-
-You can see more examples in the [example directory](/examples)

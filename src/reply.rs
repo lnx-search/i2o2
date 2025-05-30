@@ -56,11 +56,14 @@ pub struct ReplyReceiver {
 
 impl Debug for ReplyReceiver {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "ReplyFuture(result={})",
-            self.inner.result.load(Ordering::Relaxed)
-        )
+        let value = self.inner.result.load(Ordering::Relaxed);
+        if value == FLAG_PENDING {
+            write!(f, "ReplyFuture(state=PENDING, result=<unknown>)")
+        } else if value == FLAG_CANCELLED {
+            write!(f, "ReplyFuture(state=CANCELLED, result=<unknown>)")
+        } else {
+            write!(f, "ReplyFuture(state=READY, result={value})")
+        }
     }
 }
 

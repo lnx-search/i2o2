@@ -12,10 +12,9 @@ use std::time::Duration;
 
 use flume::r#async::RecvFut;
 use futures_util::{FutureExt, TryFutureExt};
-pub use io_uring;
-pub use io_uring::opcode;
-pub use io_uring::squeue::Entry;
+use io_uring::squeue::Entry;
 use io_uring::{CompletionQueue, IoUring, SubmissionQueue, Submitter};
+pub use io_uring::{opcode, types};
 use smallvec::SmallVec;
 
 use crate::wake::RingWaker;
@@ -398,7 +397,32 @@ where
     /// It is the callers responsibility to ensure that the op contained within the entry is:
     /// - Safe to send across thread boundaries.
     /// - Valid throughout the entire execution of the syscall until complete.
-    /// - Obeys any additional safety constraints specified by the [opcode].
+    /// - Obeys any additional safety constraints specified by the [i2o2::opcode].
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::io;   
+    ///
+    /// fn main() -> io::Result<()> {
+    ///     let (scheduler, scheduler_handle) = i2o2::create_for_current_thread::<()>()?;
+    ///     let op = i2o2::opcode::Nop::new().build();
+    ///     
+    ///     let reply = unsafe {
+    ///         scheduler_handle
+    ///             .submit(op, None)
+    ///             .expect("submit op to scheduler")
+    ///     };    
+    ///     
+    ///     drop(scheduler_handle);
+    ///     scheduler.run()?;
+    ///     
+    ///     let result = reply.wait();
+    ///     assert_eq!(result, Ok(0));
+    ///     
+    ///     Ok(())
+    /// }
+    /// ```
     pub unsafe fn submit(
         &self,
         entry: Entry,
@@ -431,7 +455,35 @@ where
     /// It is the callers responsibility to ensure that the op contained within the entry is:
     /// - Safe to send across thread boundaries.
     /// - Valid throughout the entire execution of the syscall until complete.
-    /// - Obeys any additional safety constraints specified by the [opcode].
+    /// - Obeys any additional safety constraints specified by the [i2o2::opcode].
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::io;   
+    ///
+    /// fn main() -> io::Result<()> {
+    ///     let (scheduler, scheduler_handle) = i2o2::create_for_current_thread::<()>()?;
+    ///     
+    ///     let ops = std::iter::repeat_with(|| i2o2::opcode::Nop::new()).take(5);
+    ///     
+    ///     let replies = unsafe {
+    ///         scheduler_handle
+    ///             .submit_many_entries(ops)
+    ///             .expect("submit ops to scheduler")
+    ///     };    
+    ///     
+    ///     drop(scheduler_handle);
+    ///     scheduler.run()?;
+    ///     
+    ///     for reply in replies {
+    ///         let result = reply.wait();
+    ///         assert_eq!(result, Ok(0));
+    ///     }
+    ///     
+    ///     Ok(())
+    /// }
+    /// ```
     pub unsafe fn submit_many_entries(
         &self,
         pairs: impl IntoIterator<Item = (Entry, Option<G>)>,
@@ -456,7 +508,34 @@ where
     /// It is the callers responsibility to ensure that the op contained within the entry is:
     /// - Safe to send across thread boundaries.
     /// - Valid throughout the entire execution of the syscall until complete.
-    /// - Obeys any additional safety constraints specified by the [opcode].
+    /// - Obeys any additional safety constraints specified by the [i2o2::opcode].
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::io;   
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> io::Result<()> {
+    ///     let (thread_handle, scheduler_handle) = i2o2::create_and_spawn::<()>()?;
+    ///     let op = i2o2::opcode::Nop::new().build();
+    ///     
+    ///     let reply = unsafe {
+    ///         scheduler_handle
+    ///             .submit_async(op, None)
+    ///             .await
+    ///             .expect("submit op to scheduler")
+    ///     };    
+    ///     
+    ///     let result = reply.wait();
+    ///     assert_eq!(result, Ok(0));
+    ///
+    ///     drop(scheduler_handle);
+    ///     thread_handle.join().unwrap()?;
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
     pub unsafe fn submit_async(
         &self,
         entry: Entry,
@@ -493,7 +572,35 @@ where
     /// It is the callers responsibility to ensure that the op contained within the entry is:
     /// - Safe to send across thread boundaries.
     /// - Valid throughout the entire execution of the syscall until complete.
-    /// - Obeys any additional safety constraints specified by the [opcode].
+    /// - Obeys any additional safety constraints specified by the [i2o2::opcode].
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::io;   
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> io::Result<()> {
+    ///     let (thread_handle, scheduler_handle) = i2o2::create_and_spawn::<()>()?;
+    ///     let ops = std::iter::repeat_with(|| i2o2::opcode::Nop::new()).take(5);
+    ///     
+    ///     let replies = unsafe {
+    ///         scheduler_handle
+    ///             .submit_many_entries(ops)
+    ///             .expect("submit ops to scheduler")
+    ///     };    
+    ///  
+    ///     for reply in replies {
+    ///         let result = reply.wait();
+    ///         assert_eq!(result, Ok(0));
+    ///     }
+    ///
+    ///     drop(scheduler_handle);
+    ///     thread_handle.join().unwrap()?;
+    ///     
+    ///     Ok(())
+    /// }
+    /// ```
     pub unsafe fn submit_many_entries_async(
         &self,
         pairs: impl IntoIterator<Item = (Entry, Option<G>)>,

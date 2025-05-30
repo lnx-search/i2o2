@@ -1,17 +1,3 @@
-# I2o2
-
-A tiny scheduler for executing IO calls with an io_uring executor.
-
-This project is designed for [lnx](https://github.com/lnx-search/lnx) as a replacement to glommio's file system API
-and is a relatively low-level API.
-
-In particular, the system only lightly attempts to prevent you messing stuff up, hence why almost all calls
-are unsafe. The only thing it really protects against buffers being dropped early.
-
-
-### Example
-
-```rust
 use std::io;
 use std::sync::Arc;
 
@@ -67,6 +53,3 @@ async fn main() -> io::Result<()> {
 
     Ok(())
 }
-```
-
-You can see more examples in the [example directory](/examples)
