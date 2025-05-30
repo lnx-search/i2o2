@@ -31,17 +31,8 @@ pub type DynamicGuard = Box<dyn Any>;
 /// A submission result for the scheduler.
 pub type SubmitResult<T> = Result<T, SchedulerClosed>;
 
-const MAX_NUM_PENDING_TASKS: usize = u32::MAX as usize - 1000;
 mod reserved_user_data {
     pub const EVENT_FD_WAKER: u64 = super::pack_indexes(u32::MAX, u32::MAX);
-}
-
-mod reserved_buffer_indexes {
-    pub const WAKER_BUFFER: u32 = 0;
-}
-
-mod reserved_file_indexes {
-    pub const WAKER_EVENT_FD: u32 = 0;
 }
 
 #[derive(Debug, thiserror::Error)]
