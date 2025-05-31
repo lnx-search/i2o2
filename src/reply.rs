@@ -145,6 +145,7 @@ impl ReplyNotify {
 
     fn complete_waker(&mut self) {
         let inner = self.inner.as_ref();
+        #[allow(clippy::collapsible_if)]
         if let Some(mut slot) = inner.waker.try_lock() {
             if let Some(waker) = slot.take() {
                 drop(slot);
