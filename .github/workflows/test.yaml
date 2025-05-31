@@ -1,0 +1,59 @@
+name: Run Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - ".idea/**"
+
+jobs:
+  coverage_all:
+    name: Generate Code Coverage
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+      - name: Generate code coverage
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.number }}
+        run: |
+          cargo llvm-cov nextest --all-features --workspace
+          
+          echo "# Coverage Summary" >> report.md
+          echo "\`\`\`" >> report.md
+          cargo llvm-cov report --summary-only >> report.md
+          echo "\`\`\`" >> report.md
+          
+          gh pr comment $PR_NUMBER --create-if-none --edit-last --body-file ./report.md
+
+  test_all:
+    name: Test All Features
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+      - name: Test all features
+        run: cargo nextest run --all-features --workspace
+
+  tests_misc:
+    name: Run Misc Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+      - name: Run doc tests
+        run: cargo test --doc
+      - name: Run no feature tests
+        run: cargo nextest run --workspace

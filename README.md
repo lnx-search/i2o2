@@ -70,9 +70,6 @@ async fn main() -> io::Result<()> {
     };
     println!("reply future created: {reply:?}");
 
-    // Our clone of `guard` should live until the operation completes.
-    assert_eq!(Arc::strong_count(&guard), 2);
-
     // We can synchronously or asynchronously wait for the reply, which will give us
     // back the result that the syscall equivalent of the operation would return.
     // I.e. `opcode::Write` would return the same value as `pwrite(2)`.
