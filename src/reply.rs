@@ -100,9 +100,6 @@ impl Future for ReplyReceiver {
     type Output = Result<i32, Cancelled>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        #[cfg(feature = "trace-hotpath")]
-        tracing::debug!("reply recv polled");
-
         let inner = self.inner.as_ref();
 
         let value = inner.result.load(Ordering::SeqCst);
@@ -110,30 +107,23 @@ impl Future for ReplyReceiver {
         //
         // Note that the acquisition of the `waker` lock should never fail while the
         // `value` is in the `FLAG_PENDING` state.
-        let done = if value == FLAG_PENDING {
+        if value == FLAG_PENDING {
             #[cfg(feature = "trace-hotpath")]
-            tracing::debug!("reply is pending");
+            tracing::trace!("reply is pending");
 
             let task = cx.waker().clone();
-            let mut lock = inner
-                .waker
-                .try_lock()
-                .expect("waker lock is currently held but result in state FLAG_PENDING");
-            *lock = Some(task);
-            false
-        } else {
-            #[cfg(feature = "trace-hotpath")]
-            tracing::debug!("reply is ready");
+            if let Some(mut lock) = inner.waker.try_lock() {
+                *lock = Some(task);
+            }
+        }
 
-            true
-        };
-
-        if done && value == FLAG_CANCELLED {
+        let value = inner.result.load(Ordering::SeqCst);
+        if value == FLAG_CANCELLED {
             Poll::Ready(Err(Cancelled))
-        } else if done {
-            Poll::Ready(Ok(value as i32))
-        } else {
+        } else if value == FLAG_PENDING {
             Poll::Pending
+        } else {
+            Poll::Ready(Ok(value as i32))
         }
     }
 }

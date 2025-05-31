@@ -118,6 +118,7 @@ pub fn builder() -> I2o2Builder {
     I2o2Builder::default()
 }
 
+#[derive(Debug, Clone)]
 /// A set of configuration options for customising the [I2o2Scheduler] scheduler.
 ///
 /// ## Example
@@ -866,11 +867,11 @@ impl<'ring, G> RingRunner<'ring, G> {
     fn submit_and_maybe_wait(&self) -> io::Result<()> {
         if !self.has_outstanding_work() {
             #[cfg(feature = "trace-hotpath")]
-            tracing::trace!("waiting for completion events");
+            tracing::debug!("waiting for completion events");
             self.submit_and_wait()
         } else {
             #[cfg(feature = "trace-hotpath")]
-            tracing::trace!("outstanding work ready, submitting without wait");
+            tracing::debug!("outstanding work ready, submitting without wait");
             self.submit_no_wait()
         }
     }

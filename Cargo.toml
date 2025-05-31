@@ -8,6 +8,10 @@ exclude = ["/.idea"]
 categories = ["asynchronous", "concurrency"]
 keywords = ["io_uring", "scheduler"]
 
+[features]
+# Enable tracing in the hotpath of the scheduler
+trace-hotpath = []
+
 [dependencies]
 thiserror = "2"
 io-uring = "0.7"
@@ -19,10 +23,6 @@ flume = "0.11"
 tracing = "0.1"
 parking_lot = "0.12"
 smallvec = "1.15"
-
-[features]
-# Enable tracing in the hotpath of the scheduler
-trace-hotpath = []
 
 [dev-dependencies]
 rstest = "0.25"
@@ -38,3 +38,7 @@ test = true
 [[example]]
 name = "async_no_op"
 test = true
+
+[[bench]]
+name = "no_op_throughput_sync"
+harness = false
