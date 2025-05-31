@@ -32,7 +32,7 @@ jobs:
           echo "```" >> report.md
           cargo llvm-cov report --summary-only >> report.md 
           echo "```" >> report.md          
-          cat ./report.md | gh pr comment $PR_NUMBER --create-if-none --edit-last
+          gh pr comment $PR_NUMBER --create-if-none --edit-last --body-file ./report.md
 
   test_all:
     name: Test All Features
