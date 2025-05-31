@@ -8,8 +8,34 @@ and is a relatively low-level API.
 In particular, the system only lightly attempts to prevent you messing stuff up, hence why almost all calls
 are unsafe. The only thing it really protects against buffers being dropped early.
 
+## FAQ
 
-### Example
+#### Should I use this in my own project?
+
+Probably not unless you are sure you need the performance and are willing to invest the time into ensuring your
+system is implemented safely.
+
+#### Why not use glommio or tokio-uring?
+
+In our use case, our main runtime is the [tokio](https://tokio.rs/) multithreaded scheduler, the only thing we
+need a separate scheduler for is performing heavy file IO calls, which is why we reached for io_uring.
+
+However, we do not need any of the task scheduling these other libraries provide and just adds another 
+layer of complexity to an already complex storage system. 
+
+So we have effectively stripped out all task scheduling logic and in effect, are left with just an actor for
+completing IO calls without blocking our main runtime.
+
+#### Do I need multiple schedulers to handle my load?
+
+Probably not, at least I haven't had a situation where that is the case. In the no-op benchmarks which effectively
+just tests the overhead of the scheduler and io_uring, we can reach upto 3 million ops per second with 16 concurrent 
+workers all pushing data to the scheduler.
+
+In theory, you can increase this number even higher by using the `submit_many*` API for sending multiple IO ops
+in a single channel message.
+
+## Example
 
 ```rust
 use std::io;
