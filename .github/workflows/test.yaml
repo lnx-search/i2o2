@@ -27,7 +27,7 @@ jobs:
           PR_NUMBER: ${{ github.event.number }}
         run: |
           cargo llvm-cov nextest --all-features --workspace
-          echo "# Coverage Summary" >> report.md          
+          echo "# Coverage Summary" >> report.md
           echo "```" >> report.md
           cargo llvm-cov report --summary-only >> report.md
           echo "```" >> report.md
