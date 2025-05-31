@@ -33,8 +33,82 @@ pub type DynamicGuard = Box<dyn Any>;
 /// A submission result for the scheduler.
 pub type SubmitResult<T> = Result<T, SchedulerClosed>;
 
-mod reserved_user_data {
-    pub const EVENT_FD_WAKER: u64 = super::pack_indexes(u32::MAX, u32::MAX);
+mod flags {
+    use std::process::abort;
+
+    const FLAGS_MASK: u64 = 0xF000_0000_0000_0000;
+    const NOT_SET: u64 = 0x0000_0000_0000_0000;
+    pub const MAX_SAFE_IDX: u32 = 0x3FFF_FFFF;
+    pub const EVENT_FD_WAKER: u64 = 0x1000_0000_0000_0000;
+    pub const REGISTER_BUFFER: u64 = 0x2000_0000_0000_0000;
+    pub const UNREGISTER_BUFFER: u64 = 0x3000_0000_0000_0000;
+    pub const REGISTER_FILE: u64 = 0x4000_0000_0000_0000;
+    pub const UNREGISTER_FILE: u64 = 0x5000_0000_0000_0000;
+    pub const WITHOUT_GUARD: u64 = 0x6000_0000_0000_0000;
+
+    #[repr(u64)]
+    #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+    /// The possible flags that can be set.
+    pub enum Flag {
+        /// The event is coming from the event FD waker.
+        EventFdWaker = EVENT_FD_WAKER,
+        /// The event is coming from the register buffer event.
+        RegisterBuffer = REGISTER_BUFFER,
+        /// The event is coming from the unregister buffer event.
+        UnregisterBuffer = UNREGISTER_BUFFER,
+        /// The event is coming from the register file event.
+        RegisterFile = REGISTER_FILE,
+        /// The event is coming from the unregister file event.
+        UnregisterFile = UNREGISTER_FILE,
+        /// The entry has no guard value.
+        WithoutGuard = WITHOUT_GUARD,
+        /// No flag set, normally should never exist.
+        NotSet = NOT_SET,
+    }
+
+    /// Packs the 4 bit `flag` with the 30 bit `reply_idx` and `guard_idx`.
+    pub fn pack(flag: Flag, reply_idx: u32, guard_idx: u32) -> u64 {
+        // If a program has *somehow* managed to enqueue 1,073,741,823
+        // they are doing something *very* wrong, if the system is even still alive
+        // we don't care to support that sort of behaviour so will abort to prevent
+        // wraps or corrupting of the packed value.
+        if reply_idx > MAX_SAFE_IDX || guard_idx > MAX_SAFE_IDX {
+            abort_insane_program();
+        }
+
+        let reply_idx = (reply_idx as u64) << 30;
+        let guard_idx = guard_idx as u64;
+        let flag = flag as u64;
+        flag | reply_idx | guard_idx
+    }
+
+    /// Unpacks the 4 bit `flag` and 30 bit `reply_idx` and `guard_idx` from
+    /// the provided value.
+    pub fn unpack(packed_value: u64) -> (Flag, u32, u32) {
+        const REPLY_IDX_MASK: u64 = 0x0FFF_FFFF_C000_0000;
+        const GUARD_IDX_MASK: u64 = 0x0000_0000_3FFF_FFFF;
+
+        let guard_idx = (packed_value & GUARD_IDX_MASK) as u32;
+        let reply_idx = ((packed_value & REPLY_IDX_MASK) >> 30) as u32;
+        let flag = match packed_value & FLAGS_MASK {
+            EVENT_FD_WAKER => Flag::EventFdWaker,
+            REGISTER_BUFFER => Flag::RegisterBuffer,
+            UNREGISTER_BUFFER => Flag::UnregisterBuffer,
+            REGISTER_FILE => Flag::RegisterFile,
+            UNREGISTER_FILE => Flag::UnregisterFile,
+            _ => Flag::NotSet,
+        };
+
+        (flag, reply_idx, guard_idx)
+    }
+
+    #[inline(never)]
+    fn abort_insane_program() {
+        eprintln!(
+            "billions of operations have been enqueued and not completed, program should abort"
+        );
+        abort();
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -304,21 +378,27 @@ impl<'ring, G> RingRunner<'ring, G> {
 
     fn drain_completion_events(&mut self) {
         for completion in &mut self.cq {
+            let result = completion.result();
             let user_data = completion.user_data();
 
-            if user_data == reserved_user_data::EVENT_FD_WAKER {
-                self.self_waker.mark_unset();
-            } else {
-                let (reply_idx, guard_idx) = unpack_indexes(user_data);
-                self.state.acknowledge_reply(reply_idx, completion.result());
-                self.state.drop_guard_if_exists(guard_idx);
+            let (flag, reply_idx, guard_idx) = flags::unpack(user_data);
 
-                #[cfg(feature = "trace-hotpath")]
-                tracing::trace!(
-                    task_id = reply_idx,
-                    result = completion.result(),
-                    "got completion"
-                );
+            #[cfg(feature = "trace-hotpath")]
+            tracing::trace!(flag = ?flag, task_id = reply_idx, result = result, "completion");
+
+            match flag {
+                flags::Flag::EventFdWaker => self.self_waker.mark_unset(),
+                flags::Flag::RegisterBuffer => {},
+                flags::Flag::UnregisterBuffer => {},
+                flags::Flag::RegisterFile => {},
+                flags::Flag::UnregisterFile => {},
+                flags::Flag::WithoutGuard => {
+                    self.state.acknowledge_reply(reply_idx, result);
+                },
+                flags::Flag::NotSet => {
+                    self.state.acknowledge_reply(reply_idx, result);
+                    self.state.drop_guard_if_exists(guard_idx);
+                },
             }
         }
         self.cq.sync();
@@ -428,20 +508,19 @@ impl<G> TrackedState<G> {
         } = op;
 
         let reply_idx = self.replies.insert(reply);
-        debug_assert!(reply_idx < u32::MAX as usize);
 
-        let guard_idx = guard
-            .map(|g| {
-                let idx = self.guards.insert(g);
-                debug_assert!(idx < u32::MAX as usize);
-                idx as u32
-            })
-            .unwrap_or(u32::MAX);
+        let flag = if guard.is_none() {
+            flags::Flag::WithoutGuard
+        } else {
+            flags::Flag::NotSet
+        };
+
+        let guard_idx = guard.map(|g| self.guards.insert(g) as u32).unwrap_or(0);
 
         #[cfg(feature = "trace-hotpath")]
         tracing::trace!(task_id = reply_idx, "registered entry");
 
-        let user_data = pack_indexes(reply_idx as u32, guard_idx);
+        let user_data = flags::pack(flag, reply_idx as u32, guard_idx);
         entry.user_data(user_data)
     }
 
@@ -471,38 +550,29 @@ struct PackagedOp<G = DynamicGuard> {
     guard: Option<G>,
 }
 
-const fn pack_indexes(reply_idx: u32, guard_idx: u32) -> u64 {
-    ((reply_idx as u64) << 32) | (guard_idx as u64)
-}
-
-fn unpack_indexes(packed: u64) -> (u32, u32) {
-    const MASK: u64 = 0xFFFF_FFFF;
-    let reply_idx = (packed >> 32) as u32;
-    let guard_idx = (packed & MASK) as u32;
-    (reply_idx, guard_idx)
-}
-
 #[cfg(test)]
 mod tests_packing {
     use super::*;
 
     #[rstest::rstest]
-    #[case(0, 0)]
-    #[case(1, 1)]
-    #[case(4, 0)]
-    #[case(0, 5)]
-    #[case(9999, 12345)]
-    #[case(u32::MAX, u32::MIN)]
-    #[case(u32::MIN, u32::MAX)]
-    #[case(u32::MIN, u32::MAX)]
-    #[case(u32::MAX, 1234)]
-    #[case(1234, u32::MAX)]
+    #[case(flags::Flag::NotSet, 0, 0)]
+    #[case(flags::Flag::NotSet, 1, 1)]
+    #[case(flags::Flag::NotSet, 4, 0)]
+    #[case(flags::Flag::NotSet, 0, 5)]
+    #[case(flags::Flag::NotSet, 9999, 12345)]
+    #[case(flags::Flag::NotSet, 0x3FFF_FFFF, u32::MIN)]
+    #[case(flags::Flag::NotSet, u32::MIN, 0x3FFF_FFFF)]
+    #[case(flags::Flag::NotSet, u32::MIN, 0x3FFF_FFFF)]
+    #[case(flags::Flag::NotSet, 0x3FFF_FFFF, 1234)]
+    #[case(flags::Flag::NotSet, 1234, 0x3FFF_FFFF)]
     fn test_pack_and_unpack_indexes(
+        #[case] flag: flags::Flag,
         #[case] input_reply_idx: u32,
         #[case] guard_idx: u32,
     ) {
-        let packed = pack_indexes(input_reply_idx, guard_idx);
-        let (unpacked_reply, unpacked_guard) = unpack_indexes(packed);
+        let packed = flags::pack(flag, input_reply_idx, guard_idx);
+        let (unpacked_flag, unpacked_reply, unpacked_guard) = flags::unpack(packed);
+        assert_eq!(unpacked_flag, flag);
         assert_eq!(unpacked_reply, input_reply_idx);
         assert_eq!(unpacked_guard, guard_idx);
     }
