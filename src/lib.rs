@@ -114,8 +114,8 @@ where
 /// # Ok(())
 /// # }
 /// ```
-pub fn builder() -> I2o2Builder {
-    I2o2Builder::default()
+pub const fn builder() -> I2o2Builder {
+    I2o2Builder::const_default()
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +150,12 @@ pub struct I2o2Builder {
 
 impl Default for I2o2Builder {
     fn default() -> Self {
+        Self::const_default()
+    }
+}
+
+impl I2o2Builder {
+    const fn const_default() -> Self {
         Self {
             queue_size: 128,
             io_poll: false,
@@ -158,15 +164,13 @@ impl Default for I2o2Builder {
             defer_task_run: false,
         }
     }
-}
 
-impl I2o2Builder {
     /// Set the queue size of the ring and handler buffer.
     ///
     /// The provided value should be a power of `2`.
     ///
     /// By default, this is `128`.
-    pub fn with_queue_size(mut self, size: u32) -> Self {
+    pub const fn with_queue_size(mut self, size: u32) -> Self {
         assert!(
             size != 0 && (size & (size - 1)) == 0,
             "provided `size` value must be a power of 2"
@@ -188,7 +192,7 @@ impl I2o2Builder {
     /// **WARNING: Enabling this option requires all file IO events to be O_DIRECT**
     ///
     /// By default, this is `disabled`.
-    pub fn with_io_polling(mut self, enable: bool) -> Self {
+    pub const fn with_io_polling(mut self, enable: bool) -> Self {
         self.io_poll = enable;
         self
     }
@@ -210,7 +214,7 @@ impl I2o2Builder {
     ///
     /// By default, the system will use a `10ms` idle timeout, you can configure
     /// this value using [I2o2Builder::with_sqe_polling_timeout].
-    pub fn with_sqe_polling(mut self, enable: bool) -> Self {
+    pub const fn with_sqe_polling(mut self, enable: bool) -> Self {
         if enable {
             self.sqe_poll = Some(Duration::from_millis(2000));
         } else {
@@ -226,14 +230,14 @@ impl I2o2Builder {
     /// This overwrites the default timeout value I2o2 sets of `10ms`.
     ///
     /// NOTE: `with_sqe_polling` must be enabled first before calling this method.
-    pub fn with_sqe_polling_timeout(mut self, timeout: Duration) -> Self {
+    pub const fn with_sqe_polling_timeout(mut self, timeout: Duration) -> Self {
         if self.sqe_poll.is_none() {
             panic!(
                 "submission queue polling is not already enabled at the time of calling this method"
             );
         }
         assert!(
-            timeout <= Duration::from_secs(10),
+            timeout.as_secs_f32() <= 10.0,
             "timeout has gone beyond sane levels"
         );
 
@@ -248,7 +252,7 @@ impl I2o2Builder {
     /// <https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html>
     ///
     /// NOTE: `with_sqe_polling` must be enabled first before calling this method.
-    pub fn with_sqe_polling_pin_cpu(mut self, cpu: u32) -> Self {
+    pub const fn with_sqe_polling_pin_cpu(mut self, cpu: u32) -> Self {
         if self.sqe_poll.is_none() {
             panic!(
                 "submission queue polling is not already enabled at the time of calling this method"
@@ -272,7 +276,7 @@ impl I2o2Builder {
     /// > IORING_ENTER_GETEVENTS flag set.
     ///
     /// By default, this is `disabled`.
-    pub fn with_defer_task_run(mut self, enable: bool) -> Self {
+    pub const fn with_defer_task_run(mut self, enable: bool) -> Self {
         self.defer_task_run = enable;
         self
     }

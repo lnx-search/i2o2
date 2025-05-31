@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Barrier;
 
-const NUM_OPS_PER_WORKER: usize = 10_000;
+mod shared;
+
+const NUM_OPS_PER_WORKER: usize = 250_000;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -15,20 +17,32 @@ async fn main() -> io::Result<()> {
     let concurrency_levels = [1, 2, 4, 8, 16];
 
     let configs = [
-        i2o2::builder(),
-        i2o2::builder().with_sqe_polling(true),
-        i2o2::builder()
-            .with_sqe_polling(true)
-            .with_sqe_polling_timeout(Duration::from_millis(100)),
+        ("default config", i2o2::builder()),
+        (
+            "IO polling w/default timeout",
+            i2o2::builder().with_sqe_polling(true),
+        ),
+        (
+            "IO polling w/100ms timeout",
+            i2o2::builder()
+                .with_sqe_polling(true)
+                .with_sqe_polling_timeout(Duration::from_millis(100)),
+        ),
     ];
 
-    for config in configs {
+    let mut results = shared::BenchmarkResults::default();
+
+    for (name, config) in configs {
         eprintln!("running benchmark for config: {config:?}");
         for (run_id, num_workers) in concurrency_levels.iter().enumerate() {
             eprintln!("  {run_id} - run with {num_workers} concurrent tasks");
-            bench_with_config(config.clone(), *num_workers).await?;
+            let (elapsed, total_ops, ops_per_sec) =
+                bench_with_config(config.clone(), *num_workers).await?;
+            results.push(name, *num_workers, elapsed, total_ops, ops_per_sec);
         }
     }
+
+    println!("{results}");
 
     Ok(())
 }
@@ -36,7 +50,7 @@ async fn main() -> io::Result<()> {
 async fn bench_with_config(
     builder: i2o2::I2o2Builder,
     num_workers: usize,
-) -> io::Result<()> {
+) -> io::Result<(Duration, usize, f32)> {
     let (thread_handle, scheduler_handle) = builder.try_spawn::<()>()?;
 
     let barrier = Arc::new(Barrier::new(num_workers + 1));
@@ -63,7 +77,6 @@ async fn bench_with_config(
     }
 
     barrier.wait().await;
-    eprintln!("    > run begin");
 
     let start = Instant::now();
     for worker in worker_handles {
@@ -72,13 +85,9 @@ async fn bench_with_config(
     let elapsed = start.elapsed();
     let total_ops = num_workers * NUM_OPS_PER_WORKER;
     let ops_per_sec = total_ops as f32 / elapsed.as_secs_f32();
-    eprintln!(
-        "    > completed run, {elapsed:?}, {total_ops} op/total, {ops_per_sec:.2} op/sec"
-    );
-
     drop(scheduler_handle);
 
     thread_handle.join().expect("executor panicked")?;
 
-    Ok(())
+    Ok((elapsed, total_ops, ops_per_sec))
 }
