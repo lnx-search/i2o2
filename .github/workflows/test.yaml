@@ -55,4 +55,4 @@ jobs:
       - name: Run doc tests
         run: cargo test --doc
       - name: Run no feature tests
-        run: cargo nextest --workspace
+        run: cargo nextest run --workspace
