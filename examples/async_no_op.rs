@@ -1,7 +1,8 @@
 use std::io;
 use std::sync::Arc;
 
-#[tokio::main]
+#[cfg_attr(not(test), tokio::main)]
+#[cfg_attr(test, tokio::test)]
 async fn main() -> io::Result<()> {
     println!("creating our scheduler worker");
 

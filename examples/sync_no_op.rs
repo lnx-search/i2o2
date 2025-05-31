@@ -1,6 +1,7 @@
 use std::io;
 use std::sync::Arc;
 
+#[cfg_attr(test, test)]
 fn main() -> io::Result<()> {
     println!("creating our scheduler worker");
 
