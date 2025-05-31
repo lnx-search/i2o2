@@ -52,10 +52,9 @@ pub struct SchedulerClosed;
 /// ```rust
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///
-/// let (scheduler, handle) = i2o2::create_for_current_thread()?;
+/// let (scheduler, handle) = i2o2::create_for_current_thread::<()>()?;
 ///
-/// // Run the IO ring, note that the scheduler is not `Send`.
-/// scheduler.run()?;
+/// // ... do work
 ///
 /// # Ok(())
 /// # }
@@ -77,7 +76,7 @@ pub fn create_for_current_thread<G>() -> io::Result<(I2o2Scheduler<G>, I2o2Handl
 /// ```rust
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///
-/// let (scheduler_handle, handle) = i2o2::create_and_spawn()?;
+/// let (scheduler_handle, handle) = i2o2::create_and_spawn::<()>()?;
 ///
 /// // ... do work
 ///
@@ -102,14 +101,13 @@ where
 /// use std::time::Duration;
 ///
 /// let (scheduler, handle) = i2o2::builder()
-///     .with_defer_task_run(true)
+///     .with_defer_task_run(false)
 ///     .with_io_polling(true)
 ///     .with_sqe_polling(true)
 ///     .with_sqe_polling_timeout(Duration::from_millis(100))
-///     .try_create()?;
+///     .try_create::<()>()?;
 ///
-/// // Run the IO ring, note that the scheduler is not `Send`.
-/// scheduler.run()?;
+/// // ... do work
 ///
 /// # Ok(())
 /// # }
@@ -128,14 +126,13 @@ pub const fn builder() -> I2o2Builder {
 /// use std::time::Duration;
 ///
 /// let (scheduler, handle) = i2o2::I2o2Builder::default()
-///     .with_defer_task_run(true)
+///     .with_defer_task_run(false)
 ///     .with_io_polling(true)
 ///     .with_sqe_polling(true)
 ///     .with_sqe_polling_timeout(Duration::from_millis(100))
-///     .try_create()?;
+///     .try_create::<()>()?;
 ///
-/// // Run the IO ring, note that the scheduler is not `Send`.
-/// scheduler.run()?;
+/// // ... do work
 ///
 /// # Ok(())
 /// # }
@@ -470,9 +467,9 @@ where
     /// use std::io;   
     ///
     /// fn main() -> io::Result<()> {
-    ///     let (scheduler, scheduler_handle) = i2o2::create_for_current_thread::<()>()?;
+    ///     let (thread_handle, scheduler_handle) = i2o2::create_and_spawn::<()>()?;
     ///     
-    ///     let ops = std::iter::repeat_with(|| i2o2::opcode::Nop::new()).take(5);
+    ///     let ops = std::iter::repeat_with(|| (i2o2::opcode::Nop::new().build(), None)).take(5);
     ///     
     ///     let replies = unsafe {
     ///         scheduler_handle
@@ -480,13 +477,13 @@ where
     ///             .expect("submit ops to scheduler")
     ///     };    
     ///     
-    ///     drop(scheduler_handle);
-    ///     scheduler.run()?;
-    ///     
     ///     for reply in replies {
     ///         let result = reply.wait();
     ///         assert_eq!(result, Ok(0));
     ///     }
+    ///
+    ///     drop(scheduler_handle);
+    ///     thread_handle.join().unwrap()?;
     ///     
     ///     Ok(())
     /// }
@@ -589,7 +586,7 @@ where
     /// #[tokio::main]
     /// async fn main() -> io::Result<()> {
     ///     let (thread_handle, scheduler_handle) = i2o2::create_and_spawn::<()>()?;
-    ///     let ops = std::iter::repeat_with(|| i2o2::opcode::Nop::new()).take(5);
+    ///     let ops = std::iter::repeat_with(|| (i2o2::opcode::Nop::new().build(), None)).take(5);
     ///     
     ///     let replies = unsafe {
     ///         scheduler_handle
