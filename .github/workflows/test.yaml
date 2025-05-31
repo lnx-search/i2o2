@@ -27,10 +27,12 @@ jobs:
           PR_NUMBER: ${{ github.event.number }}
         run: |
           cargo llvm-cov nextest --all-features --workspace
+          
           echo "# Coverage Summary" >> report.md
-          echo "```" >> report.md
+          echo "\`\`\`" >> report.md
           cargo llvm-cov report --summary-only >> report.md
-          echo "```" >> report.md
+          echo "\`\`\`" >> report.md
+          
           gh pr comment $PR_NUMBER --create-if-none --edit-last --body-file ./report.md
 
   test_all:
