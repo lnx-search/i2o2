@@ -21,27 +21,15 @@ macro_rules! impl_ring_op {
     ($t:ty) => {
         impl sealed::Sealed for $t {}
 
-        impl RingOp<mode::EntrySize64> for $t {
+        impl<M: mode::RingMode> RingOp<M> for $t {
             #[inline]
-            fn into_entry(self) -> <mode::EntrySize64 as mode::RingMode>::SQEntry {
+            fn into_entry(self) -> M::SQEntry {
                 self.build().into()
             }
 
             #[inline]
-            fn into_any_opcode(self) -> AnyOpcode<mode::EntrySize64> {
-                AnyOpcode(<Self as RingOp<mode::EntrySize64>>::into_entry(self))
-            }
-        }
-
-        impl RingOp<mode::EntrySize128> for $t {
-            #[inline]
-            fn into_entry(self) -> <mode::EntrySize128 as mode::RingMode>::SQEntry {
-                self.build().into()
-            }
-
-            #[inline]
-            fn into_any_opcode(self) -> AnyOpcode<mode::EntrySize128> {
-                AnyOpcode(<Self as RingOp<mode::EntrySize128>>::into_entry(self))
+            fn into_any_opcode(self) -> AnyOpcode<M> {
+                AnyOpcode(<Self as RingOp<M>>::into_entry(self))
             }
         }
     };

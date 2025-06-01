@@ -1,18 +1,23 @@
 use std::io;
 use std::io::ErrorKind;
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use fail::FailScenario;
 use io_uring::opcode;
 
-use crate::SchedulerClosed;
+use crate::{I2o2Handle, I2o2Scheduler, SchedulerClosed, mode};
 
-#[test]
-fn test_scheduler_noop() {
+#[rstest::rstest]
+#[case::size64(crate::create_for_current_thread::<Arc<()>>().unwrap())]
+#[case::size128(crate::builder().try_create_size128::<Arc<()>>().unwrap())]
+fn test_scheduler_noop<M: mode::RingMode>(
+    #[case] pair: (I2o2Scheduler<Arc<()>, M>, I2o2Handle<Arc<()>, M>),
+) {
     super::try_init_logging();
 
-    let (scheduler, handle) = crate::create_for_current_thread::<()>().unwrap();
+    let (scheduler, handle) = pair;
     let handle2 = handle.clone();
 
     let op = opcode::Nop::new();
@@ -39,11 +44,15 @@ fn test_scheduler_noop() {
     }
 }
 
-#[test]
-fn test_scheduler_noop_with_guard() {
+#[rstest::rstest]
+#[case::size64(crate::create_for_current_thread::<Arc<()>>().unwrap())]
+#[case::size128(crate::builder().try_create_size128::<Arc<()>>().unwrap())]
+fn test_scheduler_noop_with_guard<M: mode::RingMode>(
+    #[case] pair: (I2o2Scheduler<Arc<()>, M>, I2o2Handle<Arc<()>, M>),
+) {
     super::try_init_logging();
 
-    let (scheduler, handle) = crate::create_for_current_thread().unwrap();
+    let (scheduler, handle) = pair;
     let guard = Arc::new(());
 
     let op = opcode::Nop::new();
@@ -74,11 +83,15 @@ fn test_scheduler_noop_with_guard() {
     assert_eq!(Arc::strong_count(&guard), 1);
 }
 
-#[test]
-fn test_submit_many_sync() {
+#[rstest::rstest]
+#[case::size64(crate::create_and_spawn::<()>().unwrap())]
+#[case::size128(crate::builder().try_spawn_size128::<()>().unwrap())]
+fn test_submit_many_sync<M: mode::RingMode>(
+    #[case] pair: (JoinHandle<io::Result<()>>, I2o2Handle<(), M>),
+) {
     super::try_init_logging();
 
-    let (scheduler, handle) = crate::create_and_spawn::<()>().unwrap();
+    let (scheduler, handle) = pair;
 
     eprintln!("built op");
 
