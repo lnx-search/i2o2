@@ -1,5 +1,7 @@
 #![doc = include_str!("../README.md")]
 
+mod builder;
+mod handle;
 mod reply;
 #[cfg(test)]
 mod tests;
@@ -8,17 +10,17 @@ mod wake;
 use std::any::Any;
 use std::collections::VecDeque;
 use std::io;
-use std::sync::Arc;
 use std::task::Poll;
-use std::time::Duration;
 
 use flume::r#async::RecvFut;
-use futures_util::{FutureExt, TryFutureExt};
+use futures_util::FutureExt;
 use io_uring::squeue::Entry;
 use io_uring::{CompletionQueue, IoUring, SubmissionQueue, Submitter};
 pub use io_uring::{opcode, types};
 use smallvec::SmallVec;
 
+pub use crate::builder::I2o2Builder;
+pub use crate::handle::{I2o2Handle, RegisterError, SchedulerClosed, SubmitResult};
 use crate::wake::RingWaker;
 
 #[cfg(not(target_os = "linux"))]
@@ -28,17 +30,101 @@ compiler_error!(
 
 /// A guard type that can be any object.
 pub type DynamicGuard = Box<dyn Any>;
-/// A submission result for the scheduler.
-pub type SubmitResult<T> = Result<T, SchedulerClosed>;
 
-mod reserved_user_data {
-    pub const EVENT_FD_WAKER: u64 = super::pack_indexes(u32::MAX, u32::MAX);
+pub(crate) const MAGIC_ERRNO_NO_CAPACITY: i32 = -999;
+
+mod flags {
+    use std::process::abort;
+
+    pub const MAX_SAFE_IDX: u32 = 0x3FFF_FFFF;
+    const FLAGS_MASK: u64 = 0xF000_0000_0000_0000;
+    pub const UNGUARDED: u64 = 0x0000_0000_0000_0000;
+    pub const EVENT_FD_WAKER: u64 = 0x1000_0000_0000_0000;
+    pub const GUARDED: u64 = 0x2000_0000_0000_0000;
+    pub const GUARDED_RESOURCE_BUFFER: u64 = 0x3000_0000_0000_0000;
+    pub const GUARDED_RESOURCE_FILE: u64 = 0x4000_0000_0000_0000;
+
+    #[repr(u64)]
+    #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+    /// The possible flags that can be set.
+    pub enum Flag {
+        /// The event is coming from the event FD waker.
+        EventFdWaker = EVENT_FD_WAKER,
+        /// The event has a guard value.
+        Guarded = GUARDED,
+        /// The event has no special properties and has no guard value.
+        Unguarded = UNGUARDED,
+        /// The event is tied to a registered resource buffer which is now unregistered
+        /// _and_ no longer used by any operation in the ring.
+        GuardedResourceBuffer = GUARDED_RESOURCE_BUFFER,
+        /// The event is tied to a registered resource file which is now unregistered
+        /// _and_ no longer used by any operation in the ring.
+        GuardedResourceFile = GUARDED_RESOURCE_FILE,
+    }
+
+    /// Packs the 4 bit `flag` with the 30 bit `reply_idx` and `guard_idx`.
+    pub fn pack(flag: Flag, reply_idx: u32, guard_idx: u32) -> u64 {
+        // If a program has *somehow* managed to enqueue 1,073,741,823
+        // they are doing something *very* wrong, if the system is even still alive
+        // we don't care to support that sort of behaviour so will abort to prevent
+        // wraps or corrupting of the packed value.
+        if reply_idx > MAX_SAFE_IDX || guard_idx > MAX_SAFE_IDX {
+            abort_insane_program();
+        }
+
+        let reply_idx = (reply_idx as u64) << 30;
+        let guard_idx = guard_idx as u64;
+        let flag = flag as u64;
+        flag | reply_idx | guard_idx
+    }
+
+    /// Unpacks the 4 bit `flag` and 30 bit `reply_idx` and `guard_idx` from
+    /// the provided value.
+    pub fn unpack(packed_value: u64) -> (Flag, u32, u32) {
+        const REPLY_IDX_MASK: u64 = 0x0FFF_FFFF_C000_0000;
+        const GUARD_IDX_MASK: u64 = 0x0000_0000_3FFF_FFFF;
+
+        let guard_idx = (packed_value & GUARD_IDX_MASK) as u32;
+        let reply_idx = ((packed_value & REPLY_IDX_MASK) >> 30) as u32;
+        let flag = match packed_value & FLAGS_MASK {
+            EVENT_FD_WAKER => Flag::EventFdWaker,
+            GUARDED => Flag::Guarded,
+            UNGUARDED => Flag::Unguarded,
+            GUARDED_RESOURCE_BUFFER => Flag::GuardedResourceBuffer,
+            GUARDED_RESOURCE_FILE => Flag::GuardedResourceFile,
+            // This should **never** happen, if this occurs the system has
+            // already entered a UB state since we have to assume that any or all of
+            // our prior event reads and unpacking are invalid; which means we have
+            // wrongly freed guards we shouldn't have and all guarantees are now gone.
+            #[cfg(debug_assertions)]
+            _ => unreachable!(
+                "retrieved completion flag should never be unknown without being UB!"
+            ),
+            #[cfg(not(debug_assertions))]
+            _ => abort_system_fail(),
+        };
+
+        (flag, reply_idx, guard_idx)
+    }
+
+    #[inline(never)]
+    fn abort_insane_program() {
+        eprintln!(
+            "billions of operations have been enqueued and not completed, program should abort"
+        );
+        abort();
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[inline(never)]
+    fn abort_system_fail() -> ! {
+        eprintln!(
+            "the system is aborting due to I2o2 witnessing a unknown flag in the IO ring completion \
+            events, either this is a bug or you have done something _very_ wrong."
+        );
+        abort()
+    }
 }
-
-#[derive(Debug, thiserror::Error)]
-#[error("scheduler has closed")]
-/// The scheduler has shutdown and is no longer accepting events.
-pub struct SchedulerClosed;
 
 /// Create a new [I2o2Scheduler] and [I2o2Handle] pair backed by io_uring.
 ///
@@ -116,538 +202,6 @@ pub const fn builder() -> I2o2Builder {
     I2o2Builder::const_default()
 }
 
-#[derive(Debug, Clone)]
-/// A set of configuration options for customising the [I2o2Scheduler] scheduler.
-///
-/// ## Example
-///
-/// ```rust
-/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// use std::time::Duration;
-///
-/// let (scheduler, handle) = i2o2::I2o2Builder::default()
-///     .with_defer_task_run(false)
-///     .with_io_polling(true)
-///     .with_sqe_polling(true)
-///     .with_sqe_polling_timeout(Duration::from_millis(100))
-///     .try_create::<()>()?;
-///
-/// // ... do work
-///
-/// # Ok(())
-/// # }
-/// ```
-pub struct I2o2Builder {
-    queue_size: u32,
-    io_poll: bool,
-    sqe_poll: Option<Duration>,
-    sqe_poll_cpu: Option<u32>,
-    defer_task_run: bool,
-}
-
-impl Default for I2o2Builder {
-    fn default() -> Self {
-        Self::const_default()
-    }
-}
-
-impl I2o2Builder {
-    const fn const_default() -> Self {
-        Self {
-            queue_size: 128,
-            io_poll: false,
-            sqe_poll: None,
-            sqe_poll_cpu: None,
-            defer_task_run: false,
-        }
-    }
-
-    /// Set the queue size of the ring and handler buffer.
-    ///
-    /// The provided value should be a power of `2`.
-    ///
-    /// By default, this is `128`.
-    pub const fn with_queue_size(mut self, size: u32) -> Self {
-        assert!(
-            size != 0 && (size & (size - 1)) == 0,
-            "provided `size` value must be a power of 2"
-        );
-        self.queue_size = size;
-        self
-    }
-
-    /// Enable/disable IO polling.
-    ///
-    /// Sets `IORING_SETUP_IOPOLL`
-    ///
-    /// <https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html>
-    ///
-    /// > Perform busy-waiting for an I/O completion, as opposed to
-    /// > getting notifications via an asynchronous IRQ (Interrupt
-    /// > Request).
-    ///
-    /// **WARNING: Enabling this option requires all file IO events to be O_DIRECT**
-    ///
-    /// By default, this is `disabled`.
-    pub const fn with_io_polling(mut self, enable: bool) -> Self {
-        self.io_poll = enable;
-        self
-    }
-
-    /// Enables/disables submission queue polling by the kernel.
-    ///
-    /// Sets `IORING_SETUP_SQPOLL`
-    ///
-    /// <https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html>
-    ///
-    /// > When this flag is specified, a kernel thread is created to
-    /// > perform submission queue polling.  An io_uring instance
-    /// > configured in this way enables an application to issue I/O
-    /// > without ever context switching into the kernel.  By using
-    /// > the submission queue to fill in new submission queue
-    /// > entries and watching for completions on the completion
-    /// > queue, the application can submit and reap I/Os without
-    /// > doing a single system call.
-    ///
-    /// By default, the system will use a `10ms` idle timeout, you can configure
-    /// this value using [I2o2Builder::with_sqe_polling_timeout].
-    pub const fn with_sqe_polling(mut self, enable: bool) -> Self {
-        if enable {
-            self.sqe_poll = Some(Duration::from_millis(2000));
-        } else {
-            self.sqe_poll = None;
-        }
-        self
-    }
-
-    /// Set the submission queue polling idle timeout.
-    ///
-    /// <https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html>
-    ///
-    /// This overwrites the default timeout value I2o2 sets of `10ms`.
-    ///
-    /// NOTE: `with_sqe_polling` must be enabled first before calling this method.
-    pub const fn with_sqe_polling_timeout(mut self, timeout: Duration) -> Self {
-        if self.sqe_poll.is_none() {
-            panic!(
-                "submission queue polling is not already enabled at the time of calling this method"
-            );
-        }
-        assert!(
-            timeout.as_secs_f32() <= 10.0,
-            "timeout has gone beyond sane levels"
-        );
-
-        self.sqe_poll = Some(timeout);
-        self
-    }
-
-    /// Set cpu core the polling thread should be pinned to.
-    ///
-    /// Sets `IORING_SETUP_SQ_AFF`
-    ///
-    /// <https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html>
-    ///
-    /// NOTE: `with_sqe_polling` must be enabled first before calling this method.
-    pub const fn with_sqe_polling_pin_cpu(mut self, cpu: u32) -> Self {
-        if self.sqe_poll.is_none() {
-            panic!(
-                "submission queue polling is not already enabled at the time of calling this method"
-            );
-        }
-        self.sqe_poll_cpu = Some(cpu);
-        self
-    }
-
-    /// Enables/disables submission queue polling by the kernel.
-    ///
-    /// Sets `IORING_SETUP_DEFER_TASKRUN`
-    ///
-    /// <https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html>
-    ///
-    /// > By default, io_uring will process all outstanding work at
-    /// > the end of any system call or thread interrupt. This can
-    /// > delay the application from making other progress.  Setting
-    /// > this flag will hint to io_uring that it should defer work
-    /// > until an io_uring_enter(2) call with the
-    /// > IORING_ENTER_GETEVENTS flag set.
-    ///
-    /// By default, this is `disabled`.
-    pub const fn with_defer_task_run(mut self, enable: bool) -> Self {
-        self.defer_task_run = enable;
-        self
-    }
-
-    /// Attempt to create the scheduler using the current configuration.
-    pub fn try_create<G>(self) -> io::Result<(I2o2Scheduler<G>, I2o2Handle<G>)> {
-        let (tx, rx) = flume::bounded(self.queue_size as usize);
-        let waker = RingWaker::new()?;
-
-        let ring = self.setup_io_ring()?;
-
-        let handle = I2o2Handle {
-            inner: tx,
-            wake_on_drop: Arc::new(WakeOnDrop(waker.task_waker())),
-        };
-
-        let scheduler = I2o2Scheduler {
-            ring,
-            state: TrackedState::default(),
-            self_waker: waker,
-            incoming: rx,
-            backlog: VecDeque::new(),
-            _anti_send_ptr: std::ptr::null_mut(),
-        };
-
-        Ok((scheduler, handle))
-    }
-
-    /// Attempt to create the scheduler and run it in a background thread using the
-    /// current configuration.
-    pub fn try_spawn<G>(
-        self,
-    ) -> io::Result<(std::thread::JoinHandle<io::Result<()>>, I2o2Handle<G>)>
-    where
-        G: Send + 'static,
-    {
-        let (tx, rx) = flume::bounded(1);
-
-        let task = move || {
-            let (scheduler, handle) = self.try_create()?;
-
-            if tx.send(handle).is_err() {
-                return Ok(());
-            }
-            scheduler.run()?;
-            Ok::<_, io::Error>(())
-        };
-
-        let scheduler_thread_handle = std::thread::Builder::new()
-            .name("i2o2-scheduler-thread".to_string())
-            .spawn(task)
-            .expect("spawn background worker thread");
-
-        if let Ok(handle) = rx.recv() {
-            Ok((scheduler_thread_handle, handle))
-        } else {
-            let error = scheduler_thread_handle.join().unwrap().expect_err(
-                "thread aborted before sending handle back but still returns Ok(())",
-            );
-            Err(error)
-        }
-    }
-
-    fn setup_io_ring(&self) -> io::Result<IoUring> {
-        let mut builder = IoUring::builder();
-        builder.setup_single_issuer();
-        builder.dontfork();
-
-        if self.io_poll {
-            builder.setup_iopoll();
-        }
-
-        if let Some(idle) = self.sqe_poll {
-            builder.setup_sqpoll(idle.as_millis() as u32);
-
-            if let Some(cpu) = self.sqe_poll_cpu {
-                builder.setup_sqpoll_cpu(cpu);
-            }
-        } else {
-            // This functionality effectively gets implicitly enabled by SQPOLL
-            // we should only enable this if SQPOLL is disabled.
-            builder.setup_coop_taskrun();
-        }
-
-        if self.defer_task_run {
-            builder.setup_defer_taskrun();
-        }
-
-        builder.build(self.queue_size)
-    }
-}
-
-/// The [I2o2Handle] allows you to interact with the [I2o2Scheduler] and
-/// submit IO events to it.
-pub struct I2o2Handle<G = DynamicGuard> {
-    inner: flume::Sender<Message<G>>,
-    /// A guard that ensures the runtime is woken when the handle is dropped.
-    wake_on_drop: Arc<WakeOnDrop>,
-}
-
-impl<G> Clone for I2o2Handle<G> {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-            wake_on_drop: self.wake_on_drop.clone(),
-        }
-    }
-}
-
-impl<G> I2o2Handle<G>
-where
-    G: Send + 'static,
-{
-    /// Submit an op to the scheduler.
-    ///
-    /// This may block if th scheduler queue is currently full.
-    ///
-    /// A `guard` value can be passed, which can be used to ensure data required by the entry
-    /// lives at _least_ as long as necessary for the scheduler. It is your responsibility to
-    /// ensure that the `guard` actually impacts the dependencies of the entry, but the scheduler
-    /// will guarantee that the `guard` lives as long as io_uring requires.
-    ///
-    /// # Safety
-    ///
-    /// It is the callers responsibility to ensure that the op contained within the entry is:
-    /// - Safe to send across thread boundaries.
-    /// - Valid throughout the entire execution of the syscall until complete.
-    /// - Obeys any additional safety constraints specified by the [i2o2::opcode](opcode).
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use std::io;   
-    ///
-    /// fn main() -> io::Result<()> {
-    ///     let (scheduler, scheduler_handle) = i2o2::create_for_current_thread::<()>()?;
-    ///     let op = i2o2::opcode::Nop::new().build();
-    ///     
-    ///     let reply = unsafe {
-    ///         scheduler_handle
-    ///             .submit(op, None)
-    ///             .expect("submit op to scheduler")
-    ///     };    
-    ///     
-    ///     drop(scheduler_handle);
-    ///     scheduler.run()?;
-    ///     
-    ///     let result = reply.wait();
-    ///     assert_eq!(result, Ok(0));
-    ///     
-    ///     Ok(())
-    /// }
-    /// ```
-    pub unsafe fn submit(
-        &self,
-        entry: Entry,
-        guard: Option<G>,
-    ) -> SubmitResult<reply::ReplyReceiver> {
-        let (reply, rx) = reply::new();
-        let message = Message::One(PackagedOp {
-            entry,
-            reply,
-            guard,
-        });
-
-        self.inner
-            .send(message)
-            .map_err(|_| SchedulerClosed)
-            .map(|_| rx)
-    }
-
-    /// Submit multiple ops to the scheduler.
-    ///
-    /// This may block if th scheduler queue is currently full.
-    ///
-    /// A `guard` value can be passed, which can be used to ensure data required by the entry
-    /// lives at _least_ as long as necessary for the scheduler. It is your responsibility to
-    /// ensure that the `guard` actually impacts the dependencies of the entry, but the scheduler
-    /// will guarantee that the `guard` lives as long as io_uring requires.
-    ///
-    /// # Safety
-    ///
-    /// It is the callers responsibility to ensure that the op contained within the entry is:
-    /// - Safe to send across thread boundaries.
-    /// - Valid throughout the entire execution of the syscall until complete.
-    /// - Obeys any additional safety constraints specified by the [i2o2::opcode](opcode).
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use std::io;   
-    ///
-    /// fn main() -> io::Result<()> {
-    ///     let (thread_handle, scheduler_handle) = i2o2::create_and_spawn::<()>()?;
-    ///     
-    ///     let ops = std::iter::repeat_with(|| (i2o2::opcode::Nop::new().build(), None)).take(5);
-    ///     
-    ///     let replies = unsafe {
-    ///         scheduler_handle
-    ///             .submit_many_entries(ops)
-    ///             .expect("submit ops to scheduler")
-    ///     };    
-    ///     
-    ///     for reply in replies {
-    ///         let result = reply.wait();
-    ///         assert_eq!(result, Ok(0));
-    ///     }
-    ///
-    ///     drop(scheduler_handle);
-    ///     thread_handle.join().unwrap()?;
-    ///     
-    ///     Ok(())
-    /// }
-    /// ```
-    pub unsafe fn submit_many_entries(
-        &self,
-        pairs: impl IntoIterator<Item = (Entry, Option<G>)>,
-    ) -> SubmitResult<impl IntoIterator<Item = reply::ReplyReceiver>> {
-        let (message, replies) = prepare_many_entries(pairs);
-
-        self.inner.send(message).map_err(|_| SchedulerClosed)?;
-
-        Ok(replies.into_iter())
-    }
-
-    /// Submit an op to the scheduler asynchronously waiting if the queue is currently
-    /// full.
-    ///
-    /// A `guard` value can be passed, which can be used to ensure data required by the entry
-    /// lives at _least_ as long as necessary for the scheduler. It is your responsibility to
-    /// ensure that the `guard` actually impacts the dependencies of the entry, but the scheduler
-    /// will guarantee that the `guard` lives as long as io_uring requires.
-    ///
-    /// # Safety
-    ///
-    /// It is the callers responsibility to ensure that the op contained within the entry is:
-    /// - Safe to send across thread boundaries.
-    /// - Valid throughout the entire execution of the syscall until complete.
-    /// - Obeys any additional safety constraints specified by the [i2o2::opcode](opcode).
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use std::io;   
-    ///
-    /// #[tokio::main]
-    /// async fn main() -> io::Result<()> {
-    ///     let (thread_handle, scheduler_handle) = i2o2::create_and_spawn::<()>()?;
-    ///     let op = i2o2::opcode::Nop::new().build();
-    ///     
-    ///     let reply = unsafe {
-    ///         scheduler_handle
-    ///             .submit_async(op, None)
-    ///             .await
-    ///             .expect("submit op to scheduler")
-    ///     };    
-    ///     
-    ///     let result = reply.wait();
-    ///     assert_eq!(result, Ok(0));
-    ///
-    ///     drop(scheduler_handle);
-    ///     thread_handle.join().unwrap()?;
-    ///
-    ///     Ok(())
-    /// }
-    /// ```
-    pub unsafe fn submit_async(
-        &self,
-        entry: Entry,
-        guard: Option<G>,
-    ) -> impl Future<Output = SubmitResult<reply::ReplyReceiver>> + '_ {
-        use futures_util::TryFutureExt;
-
-        let (reply, rx) = reply::new();
-        let message = Message::One(PackagedOp {
-            entry,
-            reply,
-            guard,
-        });
-
-        async {
-            self.inner
-                .send_async(message)
-                .map_err(|_| SchedulerClosed)
-                .await
-                .map(|_| rx)
-        }
-    }
-
-    /// Submit multiple ops to the scheduler asynchronously waiting if the queue is currently
-    /// full.
-    ///
-    /// A `guard` value can be passed, which can be used to ensure data required by the entry
-    /// lives at _least_ as long as necessary for the scheduler. It is your responsibility to
-    /// ensure that the `guard` actually impacts the dependencies of the entry, but the scheduler
-    /// will guarantee that the `guard` lives as long as io_uring requires.
-    ///
-    /// # Safety
-    ///
-    /// It is the callers responsibility to ensure that the op contained within the entry is:
-    /// - Safe to send across thread boundaries.
-    /// - Valid throughout the entire execution of the syscall until complete.
-    /// - Obeys any additional safety constraints specified by the [i2o2::opcode](opcode).
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use std::io;   
-    ///
-    /// #[tokio::main]
-    /// async fn main() -> io::Result<()> {
-    ///     let (thread_handle, scheduler_handle) = i2o2::create_and_spawn::<()>()?;
-    ///     let ops = std::iter::repeat_with(|| (i2o2::opcode::Nop::new().build(), None)).take(5);
-    ///     
-    ///     let replies = unsafe {
-    ///         scheduler_handle
-    ///             .submit_many_entries(ops)
-    ///             .expect("submit ops to scheduler")
-    ///     };    
-    ///  
-    ///     for reply in replies {
-    ///         let result = reply.wait();
-    ///         assert_eq!(result, Ok(0));
-    ///     }
-    ///
-    ///     drop(scheduler_handle);
-    ///     thread_handle.join().unwrap()?;
-    ///     
-    ///     Ok(())
-    /// }
-    /// ```
-    pub unsafe fn submit_many_entries_async(
-        &self,
-        pairs: impl IntoIterator<Item = (Entry, Option<G>)>,
-    ) -> impl Future<Output = SubmitResult<impl IntoIterator<Item = reply::ReplyReceiver>>>
-    {
-        let (message, replies) = prepare_many_entries(pairs);
-
-        async {
-            self.inner
-                .send_async(message)
-                .map_err(|_| SchedulerClosed)
-                .await?;
-            Ok(replies.into_iter())
-        }
-    }
-}
-
-fn prepare_many_entries<G>(
-    pairs: impl IntoIterator<Item = (Entry, Option<G>)>,
-) -> (Message<G>, SmallVec<[reply::ReplyReceiver; 4]>) {
-    let mut replies = SmallVec::<[reply::ReplyReceiver; 4]>::new();
-    let iter = pairs.into_iter().map(|(entry, guard)| {
-        let (reply, rx) = reply::new();
-        replies.push(rx);
-
-        PackagedOp {
-            entry,
-            reply,
-            guard,
-        }
-    });
-
-    (Message::Many(SmallVec::from_iter(iter)), replies)
-}
-
-struct WakeOnDrop(std::task::Waker);
-
-impl Drop for WakeOnDrop {
-    fn drop(&mut self) {
-        self.0.wake_by_ref();
-    }
-}
-
 /// The [I2o2Scheduler] runs an io_uring ring in the current thread and submits
 /// IO events from the handle into the ring.
 ///
@@ -677,6 +231,12 @@ impl<G> I2o2Scheduler<G> {
     pub fn run(mut self) -> io::Result<()> {
         tracing::debug!("scheduler is running");
 
+        #[cfg(test)]
+        fail::fail_point!("scheduler_run_fail", |_| {
+            eprintln!("called??");
+            Err(io::Error::other("test error triggered by failpoints"))
+        });
+
         let (submitter, sq, cq) = self.ring.split();
         let mut runner = RingRunner {
             submitter,
@@ -692,6 +252,10 @@ impl<G> I2o2Scheduler<G> {
 
         while !runner.shutdown {
             runner.run()?;
+        }
+
+        if let Err(e) = runner.unregister_resources() {
+            tracing::warn!(error = ?e, "scheduler failed to gracefully unregister resources");
         }
 
         runner.wait_for_remaining()?;
@@ -756,6 +320,13 @@ impl<'ring, G> RingRunner<'ring, G> {
         #[cfg(feature = "trace-hotpath")]
         tracing::debug!("scheduler has drained all events");
 
+        Ok(())
+    }
+
+    /// Unregisters all resources from the ring.
+    fn unregister_resources(&mut self) -> io::Result<()> {
+        self.submitter.unregister_buffers()?;
+        self.submitter.unregister_files()?;
         Ok(())
     }
 
@@ -834,21 +405,29 @@ impl<'ring, G> RingRunner<'ring, G> {
 
     fn drain_completion_events(&mut self) {
         for completion in &mut self.cq {
+            let result = completion.result();
             let user_data = completion.user_data();
 
-            if user_data == reserved_user_data::EVENT_FD_WAKER {
-                self.self_waker.mark_unset();
-            } else {
-                let (reply_idx, guard_idx) = unpack_indexes(user_data);
-                self.state.acknowledge_reply(reply_idx, completion.result());
-                self.state.drop_guard_if_exists(guard_idx);
+            let (flag, reply_idx, guard_idx) = flags::unpack(user_data);
 
-                #[cfg(feature = "trace-hotpath")]
-                tracing::trace!(
-                    task_id = reply_idx,
-                    result = completion.result(),
-                    "got completion"
-                );
+            #[cfg(feature = "trace-hotpath")]
+            tracing::trace!(flag = ?flag, task_id = reply_idx, result = result, "completion");
+
+            match flag {
+                flags::Flag::EventFdWaker => self.self_waker.mark_unset(),
+                flags::Flag::Guarded => {
+                    self.state.acknowledge_reply(reply_idx, result);
+                    self.state.drop_guard_if_exists(guard_idx);
+                },
+                flags::Flag::Unguarded => {
+                    self.state.acknowledge_reply(reply_idx, result);
+                },
+                flags::Flag::GuardedResourceBuffer => {
+                    self.state.drop_buffer_guard(guard_idx);
+                },
+                flags::Flag::GuardedResourceFile => {
+                    self.state.drop_file_guard(guard_idx);
+                },
             }
         }
         self.cq.sync();
@@ -899,18 +478,86 @@ impl<'ring, G> RingRunner<'ring, G> {
 
     fn handle_message(&mut self, message: Message<G>) {
         match message {
-            Message::Many(ops) => {
+            Message::OpMany(ops) => {
                 for op in ops {
-                    self.handle_op(op);
+                    self.handle_io_op(op);
                 }
             },
-            Message::One(op) => self.handle_op(op),
+            Message::OpOne(op) => self.handle_io_op(op),
+            Message::RegisterResource(op) => self.handle_resource_register_op(op),
+            Message::UnregisterResource(op) => self.handle_resource_unregister_op(op),
         }
     }
 
-    fn handle_op(&mut self, op: PackagedOp<G>) {
+    fn handle_io_op(&mut self, op: Packaged<Entry, G>) {
         let entry = self.state.register(op);
         self.push_entry(entry);
+    }
+
+    fn handle_resource_register_op(&mut self, op: Packaged<Resource, G>) {
+        let Packaged { data, reply, guard } = op;
+
+        let result = if data.is_buffer() {
+            self.state.register_buffer_guard(guard)
+        } else {
+            self.state.register_file_guard(guard)
+        };
+
+        let (tag, offset) = match result {
+            None => {
+                reply.set_result(MAGIC_ERRNO_NO_CAPACITY);
+                return;
+            },
+            Some(offset) if data.is_buffer() => {
+                let packed = flags::pack(flags::Flag::GuardedResourceBuffer, 0, offset);
+                (packed, offset)
+            },
+            Some(offset) => {
+                let packed = flags::pack(flags::Flag::GuardedResourceFile, 0, offset);
+                (packed, offset)
+            },
+        };
+
+        let result = match data {
+            Resource::Buffer(iovec) => unsafe {
+                self.submitter
+                    .register_buffers_update(offset, &[iovec], Some(&[tag]))
+            },
+            Resource::File(fd) => {
+                self.submitter
+                    .register_files_update_tag(offset, &[fd], &[tag])
+            },
+        };
+
+        if result.is_ok() {
+            // This can never wrap because `offset` is only ever 32 bits.
+            reply.set_result(offset as i32);
+            return;
+        }
+
+        // We have to ensure we don't leak mem if there is an error.
+        if data.is_buffer() {
+            self.state.drop_buffer_guard(offset);
+        } else {
+            self.state.drop_file_guard(offset);
+        };
+
+        let err = result.unwrap_err();
+        reply.set_result(err.raw_os_error().unwrap());
+    }
+
+    fn handle_resource_unregister_op(&mut self, op: Packaged<ResourceIndex, G>) {
+        let Packaged { data, reply, .. } = op;
+
+        let result = match data {
+            ResourceIndex::File(id) => self.submitter.register_files_update(id, &[-1]),
+        };
+
+        if let Err(err) = result {
+            reply.set_result(err.raw_os_error().unwrap());
+        } else {
+            reply.set_result(0);
+        }
     }
 
     fn push_entry(&mut self, entry: Entry) {
@@ -930,49 +577,60 @@ impl<'ring, G> RingRunner<'ring, G> {
 }
 
 struct TrackedState<G> {
+    free_registered_files: u32,
+    free_registered_buffers: u32,
+    /// Guards for allocated registered files.
+    resource_file_guards: slab::Slab<Option<G>>,
+    /// Guards for allocated registered buffers.
+    resource_buffer_guards: slab::Slab<Option<G>>,
     /// A set of guards that should be kept alive as long as the ring requires.
     guards: slab::Slab<G>,
     /// A slab of reply handles for scheduled tasks.
     replies: slab::Slab<reply::ReplyNotify>,
 }
 
-impl<G> Default for TrackedState<G> {
-    fn default() -> Self {
+impl<G> TrackedState<G> {
+    fn new(free_registered_files: u32, free_registered_buffers: u32) -> Self {
         Self {
+            free_registered_files,
+            free_registered_buffers,
+            resource_file_guards: slab::Slab::with_capacity(
+                free_registered_files as usize,
+            ),
+            resource_buffer_guards: slab::Slab::with_capacity(
+                free_registered_buffers as usize,
+            ),
             guards: slab::Slab::default(),
             replies: slab::Slab::default(),
         }
     }
-}
 
-impl<G> TrackedState<G> {
     fn remaining_tasks(&self) -> usize {
         self.replies.len()
     }
 
-    fn register(&mut self, op: PackagedOp<G>) -> Entry {
-        let PackagedOp {
-            entry,
-            reply,
-            guard,
-        } = op;
+    fn register(&mut self, op: Packaged<Entry, G>) -> Entry {
+        let Packaged { data, reply, guard } = op;
 
         let reply_idx = self.replies.insert(reply);
-        debug_assert!(reply_idx < u32::MAX as usize);
 
-        let guard_idx = guard
-            .map(|g| {
-                let idx = self.guards.insert(g);
-                debug_assert!(idx < u32::MAX as usize);
-                idx as u32
-            })
-            .unwrap_or(u32::MAX);
+        let flag = if guard.is_none() {
+            flags::Flag::Unguarded
+        } else {
+            flags::Flag::Guarded
+        };
+
+        let guard_idx = guard.map(|g| self.register_guard(g)).unwrap_or(0);
 
         #[cfg(feature = "trace-hotpath")]
         tracing::trace!(task_id = reply_idx, "registered entry");
 
-        let user_data = pack_indexes(reply_idx as u32, guard_idx);
-        entry.user_data(user_data)
+        let user_data = flags::pack(flag, reply_idx as u32, guard_idx);
+        data.user_data(user_data)
+    }
+
+    fn register_guard(&mut self, guard: G) -> u32 {
+        self.guards.insert(guard) as u32
     }
 
     fn acknowledge_reply(&mut self, reply_idx: u32, result: i32) {
@@ -983,6 +641,38 @@ impl<G> TrackedState<G> {
     fn drop_guard_if_exists(&mut self, guard_idx: u32) {
         drop(self.guards.try_remove(guard_idx as usize));
     }
+
+    fn register_buffer_guard(&mut self, guard: Option<G>) -> Option<u32> {
+        if self.free_registered_buffers > 0 {
+            self.free_registered_buffers -= 1;
+            Some(self.resource_buffer_guards.insert(guard) as u32)
+        } else {
+            None
+        }
+    }
+
+    fn drop_buffer_guard(&mut self, guard_idx: u32) {
+        let value = self.resource_buffer_guards.try_remove(guard_idx as usize);
+        if value.is_some() {
+            self.free_registered_buffers += 1;
+        }
+    }
+
+    fn register_file_guard(&mut self, guard: Option<G>) -> Option<u32> {
+        if self.free_registered_files > 0 {
+            self.free_registered_files -= 1;
+            Some(self.resource_file_guards.insert(guard) as u32)
+        } else {
+            None
+        }
+    }
+
+    fn drop_file_guard(&mut self, guard_idx: u32) {
+        let value = self.resource_file_guards.try_remove(guard_idx as usize);
+        if value.is_some() {
+            self.free_registered_files += 1;
+        }
+    }
 }
 
 /// An operation to for the scheduler to process.
@@ -990,26 +680,37 @@ enum Message<G = DynamicGuard> {
     /// Submit many IO operations to the kernel.
     ///
     /// This can help avoid overhead with the channel communication.
-    Many(SmallVec<[PackagedOp<G>; 3]>),
+    OpMany(SmallVec<[Packaged<Entry, G>; 3]>),
     /// Submit one IO operation to the kernel.
-    One(PackagedOp<G>),
+    OpOne(Packaged<Entry, G>),
+    /// Register a new resource to the ring.
+    RegisterResource(Packaged<Resource, G>),
+    /// Unregister an existing resource on the ring.
+    UnregisterResource(Packaged<ResourceIndex, G>),
 }
 
-struct PackagedOp<G = DynamicGuard> {
-    entry: Entry,
+struct Packaged<D, G = DynamicGuard> {
+    data: D,
     reply: reply::ReplyNotify,
     guard: Option<G>,
 }
 
-const fn pack_indexes(reply_idx: u32, guard_idx: u32) -> u64 {
-    ((reply_idx as u64) << 32) | (guard_idx as u64)
+enum Resource {
+    Buffer(libc::iovec),
+    File(std::os::fd::RawFd),
 }
 
-fn unpack_indexes(packed: u64) -> (u32, u32) {
-    const MASK: u64 = 0xFFFF_FFFF;
-    let reply_idx = (packed >> 32) as u32;
-    let guard_idx = (packed & MASK) as u32;
-    (reply_idx, guard_idx)
+impl Resource {
+    fn is_buffer(&self) -> bool {
+        matches!(self, Resource::Buffer { .. })
+    }
+}
+
+// SAFETY: The handle ensures the buffers are safe to send across a thread boundary.
+unsafe impl Send for Resource {}
+
+enum ResourceIndex {
+    File(u32),
 }
 
 #[cfg(test)]
@@ -1017,22 +718,24 @@ mod tests_packing {
     use super::*;
 
     #[rstest::rstest]
-    #[case(0, 0)]
-    #[case(1, 1)]
-    #[case(4, 0)]
-    #[case(0, 5)]
-    #[case(9999, 12345)]
-    #[case(u32::MAX, u32::MIN)]
-    #[case(u32::MIN, u32::MAX)]
-    #[case(u32::MIN, u32::MAX)]
-    #[case(u32::MAX, 1234)]
-    #[case(1234, u32::MAX)]
+    #[case(flags::Flag::Unguarded, 0, 0)]
+    #[case(flags::Flag::Unguarded, 1, 1)]
+    #[case(flags::Flag::Unguarded, 4, 0)]
+    #[case(flags::Flag::Unguarded, 0, 5)]
+    #[case(flags::Flag::Unguarded, 9999, 12345)]
+    #[case(flags::Flag::Unguarded, 0x3FFF_FFFF, u32::MIN)]
+    #[case(flags::Flag::Unguarded, u32::MIN, 0x3FFF_FFFF)]
+    #[case(flags::Flag::Unguarded, u32::MIN, 0x3FFF_FFFF)]
+    #[case(flags::Flag::Unguarded, 0x3FFF_FFFF, 1234)]
+    #[case(flags::Flag::Unguarded, 1234, 0x3FFF_FFFF)]
     fn test_pack_and_unpack_indexes(
+        #[case] flag: flags::Flag,
         #[case] input_reply_idx: u32,
         #[case] guard_idx: u32,
     ) {
-        let packed = pack_indexes(input_reply_idx, guard_idx);
-        let (unpacked_reply, unpacked_guard) = unpack_indexes(packed);
+        let packed = flags::pack(flag, input_reply_idx, guard_idx);
+        let (unpacked_flag, unpacked_reply, unpacked_guard) = flags::unpack(packed);
+        assert_eq!(unpacked_flag, flag);
         assert_eq!(unpacked_reply, input_reply_idx);
         assert_eq!(unpacked_guard, guard_idx);
     }

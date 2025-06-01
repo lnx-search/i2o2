@@ -10,6 +10,12 @@ are unsafe. The only thing it really protects against buffers being dropped earl
 
 ## FAQ
 
+#### What is the minimum supported kernel version
+
+Version `5.15`+ is supported by I2o2, we may advance this requirement in future releases.
+It is recommended to use kernel version `5.19`+ in order to support most features, but realistically,
+the newer, the better (and faster :))
+
 #### Should I use this in my own project?
 
 Probably not unless you are sure you need the performance and are willing to invest the time into ensuring your
@@ -93,3 +99,11 @@ async fn main() -> io::Result<()> {
 ```
 
 You can see more examples in the [example directory](/examples)
+
+
+## Development
+
+Anyone is welcome to contribute, just be aware I2o2 only wants to act as a slightly higher wrapper around io_uring
+and just provide the async wrapper on top. We don't plan any support for making it more like a traditional runtime.
+
+We also assume you have a very new kernel version for running tests, and by new I mean 6.1+ at least.

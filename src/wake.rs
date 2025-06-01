@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use io_uring::{SubmissionQueue, opcode, types};
 
-use crate::reserved_user_data;
+use super::flags;
 
 /// An EventFD based waker for the io_uring ring.
 pub(super) struct RingWaker {
@@ -39,7 +39,6 @@ impl RingWaker {
     pub(super) fn mark_unset(&mut self) {
         #[cfg(feature = "trace-hotpath")]
         tracing::trace!("waker has been unset");
-
         self.is_set = false;
     }
 
@@ -59,7 +58,7 @@ impl RingWaker {
             size_of::<u64>() as u32,
         )
         .build()
-        .user_data(reserved_user_data::EVENT_FD_WAKER);
+        .user_data(flags::pack(flags::Flag::EventFdWaker, 0, 0));
         self.is_set = unsafe { submission.push(&entry).is_ok() };
 
         #[cfg(feature = "trace-hotpath")]
