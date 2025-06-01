@@ -36,15 +36,16 @@ pub type SubmitResult<T> = Result<T, SchedulerClosed>;
 mod flags {
     use std::process::abort;
 
-    const FLAGS_MASK: u64 = 0xF000_0000_0000_0000;
-    const NOT_SET: u64 = 0x0000_0000_0000_0000;
     pub const MAX_SAFE_IDX: u32 = 0x3FFF_FFFF;
+    const FLAGS_MASK: u64 = 0xF000_0000_0000_0000;
+    pub const UNGUARDED: u64 = 0x0000_0000_0000_0000;
     pub const EVENT_FD_WAKER: u64 = 0x1000_0000_0000_0000;
     pub const REGISTER_BUFFER: u64 = 0x2000_0000_0000_0000;
     pub const UNREGISTER_BUFFER: u64 = 0x3000_0000_0000_0000;
     pub const REGISTER_FILE: u64 = 0x4000_0000_0000_0000;
     pub const UNREGISTER_FILE: u64 = 0x5000_0000_0000_0000;
-    pub const WITHOUT_GUARD: u64 = 0x6000_0000_0000_0000;
+    pub const GUARDED: u64 = 0x6000_0000_0000_0000;
+    pub const GUARDED_RESOURCE: u64 = 0x7000_0000_0000_0000;
 
     #[repr(u64)]
     #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -60,10 +61,13 @@ mod flags {
         RegisterFile = REGISTER_FILE,
         /// The event is coming from the unregister file event.
         UnregisterFile = UNREGISTER_FILE,
-        /// The entry has no guard value.
-        WithoutGuard = WITHOUT_GUARD,
-        /// No flag set, normally should never exist.
-        NotSet = NOT_SET,
+        /// The event has a guard value.
+        Guarded = GUARDED,
+        /// The event has no special properties and has no guard value.
+        Unguarded = UNGUARDED,
+        /// The event is tied to a registered resource which is now unregistered
+        /// _and_ no longer used by any operation in the ring.
+        GuardedResource = GUARDED_RESOURCE,
     }
 
     /// Packs the 4 bit `flag` with the 30 bit `reply_idx` and `guard_idx`.
@@ -96,7 +100,19 @@ mod flags {
             UNREGISTER_BUFFER => Flag::UnregisterBuffer,
             REGISTER_FILE => Flag::RegisterFile,
             UNREGISTER_FILE => Flag::UnregisterFile,
-            _ => Flag::NotSet,
+            GUARDED => Flag::Guarded,
+            UNGUARDED => Flag::Unguarded,
+            GUARDED_RESOURCE => Flag::GuardedResource,
+            // This should **never** happen, if this occurs the system has
+            // already entered a UB state since we have to assume that any or all of
+            // our prior event reads and unpacking are invalid; which means we have
+            // wrongly freed guards we shouldn't have and all guarantees are now gone.
+            #[cfg(debug_assertions)]
+            _ => unreachable!(
+                "retrieved completion flag should never be unknown without being UB!"
+            ),
+            #[cfg(not(debug_assertions))]
+            _ => abort_system_fail(),
         };
 
         (flag, reply_idx, guard_idx)
@@ -108,6 +124,16 @@ mod flags {
             "billions of operations have been enqueued and not completed, program should abort"
         );
         abort();
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[inline(never)]
+    fn abort_system_fail() -> ! {
+        eprintln!(
+            "the system is aborting due to I2o2 witnessing a unknown flag in the IO ring completion \
+            events, either this is a bug or you have done something _very_ wrong."
+        );
+        abort()
     }
 }
 
@@ -388,15 +414,17 @@ impl<'ring, G> RingRunner<'ring, G> {
 
             match flag {
                 flags::Flag::EventFdWaker => self.self_waker.mark_unset(),
+                flags::Flag::UnregisterBuffer | flags::Flag::UnregisterFile => (),
                 flags::Flag::RegisterBuffer => {},
-                flags::Flag::UnregisterBuffer => {},
                 flags::Flag::RegisterFile => {},
-                flags::Flag::UnregisterFile => {},
-                flags::Flag::WithoutGuard => {
+                flags::Flag::Guarded => {
+                    self.state.acknowledge_reply(reply_idx, result);
+                    self.state.drop_guard_if_exists(guard_idx);
+                },
+                flags::Flag::Unguarded => {
                     self.state.acknowledge_reply(reply_idx, result);
                 },
-                flags::Flag::NotSet => {
-                    self.state.acknowledge_reply(reply_idx, result);
+                flags::Flag::GuardedResource => {
                     self.state.drop_guard_if_exists(guard_idx);
                 },
             }
@@ -449,19 +477,48 @@ impl<'ring, G> RingRunner<'ring, G> {
 
     fn handle_message(&mut self, message: Message<G>) {
         match message {
-            Message::Many(ops) => {
+            Message::OpMany(ops) => {
                 for op in ops {
-                    self.handle_op(op);
+                    self.handle_io_op(op);
                 }
             },
-            Message::One(op) => self.handle_op(op),
+            Message::OpOne(op) => self.handle_io_op(op),
+            Message::RegisterResource(_op) => {},
+            Message::UnregisterResource(_op) => {},
         }
     }
 
-    fn handle_op(&mut self, op: PackagedOp<G>) {
+    fn handle_io_op(&mut self, op: Packaged<Entry, G>) {
         let entry = self.state.register(op);
         self.push_entry(entry);
     }
+
+    // fn handle_resource_register_op(&mut self, op: Packaged<Resource, G>) {
+    //     let Packaged { data, reply, guard } = op;
+    //
+    //     let tag = if let Some(guard) = guard {
+    //         let guard_idx = self.state.register_guard(guard);
+    //         flags::pack(flags::Flag::GuardedResource, 0, guard_idx)
+    //     } else {
+    //         0
+    //     };
+    //
+    //     // match data {
+    //     //     Resource::Buffer { .. } => {
+    //     //         self.submitter
+    //     //             .register_buffers_update();
+    //     //     },
+    //     //     Resource::File { .. } => {
+    //     //         self.submitter
+    //     //             .register_files_update_tag();
+    //     //     },
+    //     // }
+    //
+    // }
+    //
+    // fn handle_resource_unregister_op(&mut self, op: Packaged<u32, G>) {
+    //     let Packaged { data, reply, .. } = op;
+    // }
 
     fn push_entry(&mut self, entry: Entry) {
         // SAFETY: Responsibility about ensuring entry validity is pushed to the caller
@@ -500,28 +557,28 @@ impl<G> TrackedState<G> {
         self.replies.len()
     }
 
-    fn register(&mut self, op: PackagedOp<G>) -> Entry {
-        let PackagedOp {
-            entry,
-            reply,
-            guard,
-        } = op;
+    fn register(&mut self, op: Packaged<Entry, G>) -> Entry {
+        let Packaged { data, reply, guard } = op;
 
         let reply_idx = self.replies.insert(reply);
 
         let flag = if guard.is_none() {
-            flags::Flag::WithoutGuard
+            flags::Flag::Unguarded
         } else {
-            flags::Flag::NotSet
+            flags::Flag::Guarded
         };
 
-        let guard_idx = guard.map(|g| self.guards.insert(g) as u32).unwrap_or(0);
+        let guard_idx = guard.map(|g| self.register_guard(g)).unwrap_or(0);
 
         #[cfg(feature = "trace-hotpath")]
         tracing::trace!(task_id = reply_idx, "registered entry");
 
         let user_data = flags::pack(flag, reply_idx as u32, guard_idx);
-        entry.user_data(user_data)
+        data.user_data(user_data)
+    }
+
+    fn register_guard(&mut self, guard: G) -> u32 {
+        self.guards.insert(guard) as u32
     }
 
     fn acknowledge_reply(&mut self, reply_idx: u32, result: i32) {
@@ -539,15 +596,29 @@ enum Message<G = DynamicGuard> {
     /// Submit many IO operations to the kernel.
     ///
     /// This can help avoid overhead with the channel communication.
-    Many(SmallVec<[PackagedOp<G>; 3]>),
+    OpMany(SmallVec<[Packaged<Entry, G>; 3]>),
     /// Submit one IO operation to the kernel.
-    One(PackagedOp<G>),
+    OpOne(Packaged<Entry, G>),
+    /// Register a new resource to the ring.
+    RegisterResource(Packaged<Resource, G>),
+    /// Unregister an existing resource on the ring.
+    UnregisterResource(Packaged<ResourceIndex, G>),
 }
 
-struct PackagedOp<G = DynamicGuard> {
-    entry: Entry,
+struct Packaged<D, G = DynamicGuard> {
+    data: D,
     reply: reply::ReplyNotify,
     guard: Option<G>,
+}
+
+enum Resource {
+    Buffer {},
+    File { fd: std::os::fd::RawFd },
+}
+
+enum ResourceIndex {
+    Buffer(u32),
+    File(u32),
 }
 
 #[cfg(test)]
@@ -555,16 +626,16 @@ mod tests_packing {
     use super::*;
 
     #[rstest::rstest]
-    #[case(flags::Flag::NotSet, 0, 0)]
-    #[case(flags::Flag::NotSet, 1, 1)]
-    #[case(flags::Flag::NotSet, 4, 0)]
-    #[case(flags::Flag::NotSet, 0, 5)]
-    #[case(flags::Flag::NotSet, 9999, 12345)]
-    #[case(flags::Flag::NotSet, 0x3FFF_FFFF, u32::MIN)]
-    #[case(flags::Flag::NotSet, u32::MIN, 0x3FFF_FFFF)]
-    #[case(flags::Flag::NotSet, u32::MIN, 0x3FFF_FFFF)]
-    #[case(flags::Flag::NotSet, 0x3FFF_FFFF, 1234)]
-    #[case(flags::Flag::NotSet, 1234, 0x3FFF_FFFF)]
+    #[case(flags::Flag::Unguarded, 0, 0)]
+    #[case(flags::Flag::Unguarded, 1, 1)]
+    #[case(flags::Flag::Unguarded, 4, 0)]
+    #[case(flags::Flag::Unguarded, 0, 5)]
+    #[case(flags::Flag::Unguarded, 9999, 12345)]
+    #[case(flags::Flag::Unguarded, 0x3FFF_FFFF, u32::MIN)]
+    #[case(flags::Flag::Unguarded, u32::MIN, 0x3FFF_FFFF)]
+    #[case(flags::Flag::Unguarded, u32::MIN, 0x3FFF_FFFF)]
+    #[case(flags::Flag::Unguarded, 0x3FFF_FFFF, 1234)]
+    #[case(flags::Flag::Unguarded, 1234, 0x3FFF_FFFF)]
     fn test_pack_and_unpack_indexes(
         #[case] flag: flags::Flag,
         #[case] input_reply_idx: u32,

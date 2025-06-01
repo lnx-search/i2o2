@@ -3,7 +3,7 @@ use std::sync::Arc;
 use io_uring::squeue::Entry;
 use smallvec::SmallVec;
 
-use crate::{DynamicGuard, Message, PackagedOp, SchedulerClosed, SubmitResult, reply};
+use crate::{DynamicGuard, Message, Packaged, SchedulerClosed, SubmitResult, reply};
 
 /// The [I2o2Handle] allows you to interact with the [I2o2Scheduler](crate::I2o2Scheduler) and
 /// submit IO events to it.
@@ -81,8 +81,8 @@ where
         guard: Option<G>,
     ) -> SubmitResult<reply::ReplyReceiver> {
         let (reply, rx) = reply::new();
-        let message = Message::One(PackagedOp {
-            entry,
+        let message = Message::OpOne(Packaged {
+            data: entry,
             reply,
             guard,
         });
@@ -196,8 +196,8 @@ where
         use futures_util::TryFutureExt;
 
         let (reply, rx) = reply::new();
-        let message = Message::One(PackagedOp {
-            entry,
+        let message = Message::OpOne(Packaged {
+            data: entry,
             reply,
             guard,
         });
@@ -278,14 +278,14 @@ fn prepare_many_entries<G>(
         let (reply, rx) = reply::new();
         replies.push(rx);
 
-        PackagedOp {
-            entry,
+        Packaged {
+            data: entry,
             reply,
             guard,
         }
     });
 
-    (Message::Many(SmallVec::from_iter(iter)), replies)
+    (Message::OpMany(SmallVec::from_iter(iter)), replies)
 }
 
 struct WakeOnDrop(std::task::Waker);

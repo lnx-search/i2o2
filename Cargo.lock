@@ -261,8 +261,7 @@ dependencies = [
 [[package]]
 name = "io-uring"
 version = "0.7.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ebb93303c65a11753dd0e45cd6bfa5c65ee1f0b9f8e2178b6998ddc8b284f04"
+source = "git+https://github.com/ChillFish8/io-uring.git?branch=chillfish8%2Fadd-remaining-register-calls#de46479ee4c065eb214c37af9be75b07df72f284"
 dependencies = [
  "bitflags",
  "cfg-if",

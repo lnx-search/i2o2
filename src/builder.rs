@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
+use std::fmt::{Display, Formatter};
 use std::io;
+use std::io::ErrorKind;
 use std::time::Duration;
 
 use io_uring::IoUring;
@@ -35,6 +37,8 @@ pub struct I2o2Builder {
     sqe_poll: Option<Duration>,
     sqe_poll_cpu: Option<u32>,
     defer_task_run: bool,
+    num_registered_files: u32,
+    num_registered_buffers: u32,
 }
 
 impl Default for I2o2Builder {
@@ -51,6 +55,8 @@ impl I2o2Builder {
             sqe_poll: None,
             sqe_poll_cpu: None,
             defer_task_run: false,
+            num_registered_buffers: 0,
+            num_registered_files: 0,
         }
     }
 
@@ -65,6 +71,47 @@ impl I2o2Builder {
             "provided `size` value must be a power of 2"
         );
         self.queue_size = size;
+        self
+    }
+
+    /// Set the maximum number of registered buffers that might be
+    /// registered with the ring.
+    ///
+    /// This is value cannot be updated once the ring in created
+    /// and is used to allocate the necessary structures for the ring.
+    ///
+    /// WARNING: You must have a kernel version **5.19+** in order
+    /// for this API to not error on creation.
+    ///
+    /// By default, this is `0`.
+    pub const fn with_num_registered_buffers(mut self, size: u32) -> Self {
+        self.num_registered_buffers = size;
+
+        assert!(
+            self.num_registered_buffers + self.num_registered_files
+                >= super::flags::MAX_SAFE_IDX,
+            "total number of registered buffers and files exceeds maximum allowance"
+        );
+
+        self
+    }
+
+    /// Set the maximum number of registered files that might be
+    /// registered with the ring.
+    ///
+    /// This is value cannot be updated once the ring in created
+    /// and is used to allocate the necessary structures for the ring.
+    ///
+    /// By default, this is `0`.
+    pub const fn with_num_registered_files(mut self, size: u32) -> Self {
+        self.num_registered_files = size;
+
+        assert!(
+            self.num_registered_buffers + self.num_registered_files
+                >= super::flags::MAX_SAFE_IDX,
+            "total number of registered buffers and files exceeds maximum allowance"
+        );
+
         self
     }
 
@@ -164,6 +211,9 @@ impl I2o2Builder {
     /// > until an io_uring_enter(2) call with the
     /// > IORING_ENTER_GETEVENTS flag set.
     ///
+    /// WARNING: You must have a kernel version **6.1+** in order
+    /// for this API to not error on creation.
+    ///
     /// By default, this is `disabled`.
     pub const fn with_defer_task_run(mut self, enable: bool) -> Self {
         self.defer_task_run = enable;
@@ -175,7 +225,16 @@ impl I2o2Builder {
         let (tx, rx) = flume::bounded(self.queue_size as usize);
         let waker = RingWaker::new()?;
 
-        let ring = self.setup_io_ring()?;
+        let probe = load_kernel_uring_probe()?;
+        if !kernel_is_at_least(&probe, VersionInterest::V5_15) {
+            return Err(kernel_too_old(VersionInterest::V5_15));
+        }
+
+        let ring = self.setup_io_ring(&probe)?;
+        tracing::debug!(features = ?ring.params(), "ring created with features");
+
+        self.setup_registered_resources(&probe, &ring)?;
+        tracing::debug!("successfully registered resources with ring");
 
         let handle = I2o2Handle::new(tx, waker.task_waker());
 
@@ -226,9 +285,14 @@ impl I2o2Builder {
         }
     }
 
-    fn setup_io_ring(&self) -> io::Result<IoUring> {
+    fn setup_io_ring(&self, probe: &io_uring::Probe) -> io::Result<IoUring> {
         let mut builder = IoUring::builder();
-        builder.setup_single_issuer();
+
+        if kernel_is_at_least(probe, VersionInterest::V6_0) {
+            tracing::debug!("kernel has single issuer feature enabled, using...");
+            builder.setup_single_issuer();
+        }
+
         builder.dontfork();
 
         if self.io_poll {
@@ -241,16 +305,114 @@ impl I2o2Builder {
             if let Some(cpu) = self.sqe_poll_cpu {
                 builder.setup_sqpoll_cpu(cpu);
             }
-        } else {
+        } else if kernel_is_at_least(probe, VersionInterest::V5_19) {
+            tracing::debug!("kernel has coop task run feature enabled, using...");
             // This functionality effectively gets implicitly enabled by SQPOLL
             // we should only enable this if SQPOLL is disabled.
             builder.setup_coop_taskrun();
         }
 
         if self.defer_task_run {
-            builder.setup_defer_taskrun();
+            if kernel_is_at_least(probe, VersionInterest::V6_1) {
+                builder.setup_defer_taskrun();
+            } else {
+                return Err(unsupported_version(VersionInterest::V6_1));
+            }
         }
 
         builder.build(self.queue_size)
     }
+
+    fn setup_registered_resources(
+        &self,
+        probe: &io_uring::Probe,
+        ring: &IoUring,
+    ) -> io::Result<()> {
+        let submitter = ring.submitter();
+
+        if self.num_registered_files > 0 {
+            tracing::debug!(
+                num_registered_files = self.num_registered_files,
+                "registering files with ring",
+            );
+
+            // Setting up the registered files API.
+            if kernel_is_at_least(probe, VersionInterest::V5_19) {
+                submitter.register_files_sparse(self.num_registered_files)?;
+            } else {
+                let descriptors = vec![-1; self.num_registered_files as usize];
+                let flags = vec![0; self.num_registered_files as usize];
+                submitter.register_files_tags(&descriptors, &flags)?;
+            }
+        }
+
+        if self.num_registered_buffers > 0 {
+            tracing::debug!(
+                num_registered_buffers = self.num_registered_buffers,
+                "registering buffers with ring",
+            );
+
+            // Check if we have kernel 5.19+, IORING_OP_SOCKET was added in this version
+            // so we can check the version using the probe.
+            if kernel_is_at_least(probe, VersionInterest::V5_19) {
+                submitter.register_buffers_sparse(self.num_registered_buffers)?;
+            } else {
+                return Err(unsupported_version(VersionInterest::V5_19));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Create a default ring to load a set of probe options.
+fn load_kernel_uring_probe() -> io::Result<io_uring::Probe> {
+    let ring = IoUring::new(8)?;
+    let mut probe = io_uring::Probe::new();
+    let submitter = ring.submitter();
+    submitter.register_probe(&mut probe)?;
+
+    tracing::debug!(supported = ?probe, "loaded ring probe");
+
+    Ok(probe)
+}
+
+fn kernel_is_at_least(probe: &io_uring::Probe, interest: VersionInterest) -> bool {
+    probe.is_supported(interest as u8)
+}
+
+#[repr(u8)]
+enum VersionInterest {
+    V5_15 = io_uring::opcode::OpenAt::CODE,
+    V5_19 = io_uring::opcode::Socket::CODE,
+    V6_0 = io_uring::opcode::SendZc::CODE,
+    V6_1 = io_uring::opcode::SendMsgZc::CODE,
+}
+
+impl Display for VersionInterest {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VersionInterest::V5_15 => write!(f, "v5.15"),
+            VersionInterest::V5_19 => write!(f, "v5.19"),
+            VersionInterest::V6_0 => write!(f, "v6.0"),
+            VersionInterest::V6_1 => write!(f, "v6.1"),
+        }
+    }
+}
+
+fn unsupported_version(required: VersionInterest) -> io::Error {
+    io::Error::new(
+        ErrorKind::Unsupported,
+        format!(
+            "feature not available, kernel version {required}+ \
+        is required to use this feature"
+        ),
+    )
+}
+
+fn kernel_too_old(required: VersionInterest) -> io::Error {
+    io::Error::new(
+        ErrorKind::Unsupported,
+        format!("I2o2 requires a kernel version of {required} or newer"),
+    )
 }
