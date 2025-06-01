@@ -20,7 +20,7 @@ pub use io_uring::{opcode, types};
 use smallvec::SmallVec;
 
 pub use crate::builder::I2o2Builder;
-pub use crate::handle::I2o2Handle;
+pub use crate::handle::{I2o2Handle, RegisterError, SchedulerClosed, SubmitResult};
 use crate::wake::RingWaker;
 
 #[cfg(not(target_os = "linux"))]
@@ -30,8 +30,8 @@ compiler_error!(
 
 /// A guard type that can be any object.
 pub type DynamicGuard = Box<dyn Any>;
-/// A submission result for the scheduler.
-pub type SubmitResult<T> = Result<T, SchedulerClosed>;
+
+static BLANK_MEM: &[u8] = &[];
 
 pub(crate) const MAGIC_ERRNO_NO_CAPACITY: i32 = -999;
 
@@ -143,11 +143,6 @@ mod flags {
         abort()
     }
 }
-
-#[derive(Debug, thiserror::Error)]
-#[error("scheduler has closed")]
-/// The scheduler has shutdown and is no longer accepting events.
-pub struct SchedulerClosed;
 
 /// Create a new [I2o2Scheduler] and [I2o2Handle] pair backed by io_uring.
 ///
@@ -539,7 +534,8 @@ impl<'ring, G> RingRunner<'ring, G> {
         };
 
         if result.is_ok() {
-            reply.set_result(0);
+            // This can never wrap because `offset` is only ever 32 bits.
+            reply.set_result(offset as i32);
             return;
         }
 
@@ -559,6 +555,21 @@ impl<'ring, G> RingRunner<'ring, G> {
 
         let result = match data {
             ResourceIndex::File(id) => self.submitter.register_files_update(id, &[-1]),
+            ResourceIndex::Buffer(id) => {
+                // SAFETY: Our replacement buffer is static.
+                unsafe {
+                    self.submitter
+                        .register_buffers_update(
+                            id,
+                            &[libc::iovec {
+                                iov_base: BLANK_MEM.as_ptr() as *mut _,
+                                iov_len: 0,
+                            }],
+                            Some(&[0]),
+                        )
+                        .map(|_| 1)
+                }
+            },
         };
 
         if let Err(err) = result {
@@ -719,6 +730,7 @@ unsafe impl Send for Resource {}
 
 enum ResourceIndex {
     File(u32),
+    Buffer(u32),
 }
 
 #[cfg(test)]

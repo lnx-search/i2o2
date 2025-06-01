@@ -1,9 +1,36 @@
+use std::io;
 use std::sync::Arc;
 
 use io_uring::squeue::Entry;
 use smallvec::SmallVec;
 
-use crate::{DynamicGuard, Message, Packaged, SchedulerClosed, SubmitResult, reply};
+use crate::reply::Cancelled;
+use crate::{DynamicGuard, Message, Packaged, Resource, ResourceIndex, reply};
+
+/// A submission result for the scheduler.
+pub type SubmitResult<T> = Result<T, SchedulerClosed>;
+
+#[derive(Debug, thiserror::Error)]
+#[error("scheduler has closed")]
+/// The scheduler has shutdown and is no longer accepting events.
+pub struct SchedulerClosed;
+
+#[derive(Debug, thiserror::Error)]
+/// An error that prevent reregistration of a resource.
+pub enum RegisterError {
+    #[error("{0}")]
+    /// The scheduler has shutdown and is no longer accepting events.
+    SchedulerClosed(SchedulerClosed),
+    #[error("{0}")]
+    /// The scheduler cancelled the operation, this normally means the scheduler
+    /// panicked in this situation.
+    Cancelled(Cancelled),
+    #[error("out of capacity")]
+    /// The ring has no capacity left in order to register the resource.
+    OutOfCapacity,
+    #[error("{0}")]
+    Io(io::Error),
+}
 
 /// The [I2o2Handle] allows you to interact with the [I2o2Scheduler](crate::I2o2Scheduler) and
 /// submit IO events to it.
@@ -268,6 +295,268 @@ where
             Ok(replies.into_iter())
         }
     }
+
+    /// Register a file with the ring returning a file index that is used
+    /// to unregister the file at a later stage.
+    ///
+    /// Registering a file with the ring reduces the overhead of calls interacting
+    /// with the target file by reducing the amount of work the kernel needs to do
+    /// on every IO op.
+    ///
+    /// A `guard` value can be passed, which can be used to track when the registered
+    /// file is free/unused after unregistering.
+    ///
+    /// You need to tell the scheduler up front how many files you plan on registering up
+    /// front at creation time using the [I2o2Builder::with_num_registered_files](crate::I2o2Builder::with_num_registered_files)
+    /// parameter.
+    ///
+    /// This method can error when attempting to register a file that is already registered
+    /// or there are no free slots available on the ring.
+    pub fn register_file(
+        &self,
+        fd: std::os::fd::RawFd,
+        guard: Option<G>,
+    ) -> Result<u32, RegisterError> {
+        let (reply, rx) = reply::new();
+
+        let message = Message::RegisterResource(Packaged {
+            data: Resource::File(fd),
+            reply,
+            guard,
+        });
+
+        self.inner
+            .send(message)
+            .map_err(|_| RegisterError::SchedulerClosed(SchedulerClosed))?;
+        let result = rx.wait().map_err(RegisterError::Cancelled)?;
+        handle_register_resource_result(result)
+    }
+
+    /// Unregister a previously registered file with the ring using the `file_index`.
+    ///
+    /// If a guard was provided when registering, the guard will be dropped once all
+    /// inflight operations using the registered file are complete.
+    ///
+    /// This method can error when attempting to unregister a file that does not exist.
+    pub fn unregister_file(&self, file_index: u32) -> Result<(), RegisterError> {
+        let (reply, rx) = reply::new();
+
+        let message = Message::UnregisterResource(Packaged {
+            data: ResourceIndex::File(file_index),
+            reply,
+            guard: None,
+        });
+
+        self.inner
+            .send(message)
+            .map_err(|_| RegisterError::SchedulerClosed(SchedulerClosed))?;
+        let result = rx.wait().map_err(RegisterError::Cancelled)?;
+        handle_unregister_resource_result(result)
+    }
+
+    /// Register a file with the ring asynchronously returning a file index that is used
+    /// to unregister the file at a later stage.
+    ///
+    /// Registering a file with the ring reduces the overhead of calls interacting
+    /// with the target file by reducing the amount of work the kernel needs to do
+    /// on every IO op.
+    ///
+    /// A `guard` value can be passed, which can be used to track when the registered
+    /// file is free/unused after unregistering.
+    ///
+    /// You need to tell the scheduler up front how many files you plan on registering up
+    /// front at creation time using the [I2o2Builder::with_num_registered_files](crate::I2o2Builder::with_num_registered_files)
+    /// parameter.
+    ///
+    /// This method can error when attempting to register a file that is already registered
+    /// or there are no free slots available on the ring.
+    pub async fn register_file_async(
+        &self,
+        fd: std::os::fd::RawFd,
+        guard: Option<G>,
+    ) -> Result<u32, RegisterError> {
+        let (reply, rx) = reply::new();
+
+        let message = Message::RegisterResource(Packaged {
+            data: Resource::File(fd),
+            reply,
+            guard,
+        });
+
+        self.inner
+            .send_async(message)
+            .await
+            .map_err(|_| RegisterError::SchedulerClosed(SchedulerClosed))?;
+        let result = rx.await.map_err(RegisterError::Cancelled)?;
+        handle_register_resource_result(result)
+    }
+
+    /// Unregister a previously registered file with the ring using the `file_index` asynchronously.
+    ///
+    /// If a guard was provided when registering, the guard will be dropped once all
+    /// inflight operations using the registered file are complete.
+    ///
+    /// This method can error when attempting to unregister a file that does not exist.
+    pub async fn unregister_file_async(
+        &self,
+        file_index: u32,
+    ) -> Result<(), RegisterError> {
+        let (reply, rx) = reply::new();
+
+        let message = Message::UnregisterResource(Packaged {
+            data: ResourceIndex::File(file_index),
+            reply,
+            guard: None,
+        });
+
+        self.inner
+            .send_async(message)
+            .await
+            .map_err(|_| RegisterError::SchedulerClosed(SchedulerClosed))?;
+        let result = rx.await.map_err(RegisterError::Cancelled)?;
+        handle_unregister_resource_result(result)
+    }
+
+    /// Register a buffer with the ring returning a buffer index that can be
+    /// used with `Fixed` operations.
+    ///
+    /// Registering a buffer with the ring reduces the overhead of calls interacting
+    /// with the target buffer by reducing the amount of work the kernel needs to do
+    /// on every IO op.
+    ///
+    /// A `guard` value can be passed, which can be used to ensure the buffer remains alive
+    /// and valid for as long as the ring requires it.
+    ///
+    /// You need to tell the scheduler up front how many buffers you plan on registering up
+    /// front at creation time using the [I2o2Builder::with_num_registered_buffers](crate::I2o2Builder::with_num_registered_buffers)
+    /// parameter.
+    ///
+    /// This method can error when there are no free slots available on the ring.
+    ///
+    /// # Safety
+    ///
+    /// It is the callers responsibility to ensure that the buffer is:
+    /// - Safe to send across thread boundaries.
+    /// - Is correctly aligned for any ops that use the buffer afterward.
+    /// - Valid throughout the entire time the buffer is registered and in use by the scheduler.
+    pub unsafe fn register_buffer(
+        &self,
+        ptr: *mut u8,
+        len: usize,
+        guard: Option<G>,
+    ) -> Result<u32, RegisterError> {
+        let (reply, rx) = reply::new();
+
+        let message = Message::RegisterResource(Packaged {
+            data: Resource::Buffer(libc::iovec {
+                iov_base: ptr as *mut _,
+                iov_len: len,
+            }),
+            reply,
+            guard,
+        });
+
+        self.inner
+            .send(message)
+            .map_err(|_| RegisterError::SchedulerClosed(SchedulerClosed))?;
+        let result = rx.wait().map_err(RegisterError::Cancelled)?;
+        handle_register_resource_result(result)
+    }
+
+    /// Unregister a previously registered buffer with the ring using the `buffer_index`.
+    ///
+    /// If a guard was provided when registering, the guard will be dropped once all
+    /// inflight operations using the registered buffer are complete.
+    ///
+    /// This method can error when attempting to unregister a buffer that does not exist.
+    pub fn unregister_buffer(&self, buffer_index: u32) -> Result<(), RegisterError> {
+        let (reply, rx) = reply::new();
+
+        let message = Message::UnregisterResource(Packaged {
+            data: ResourceIndex::Buffer(buffer_index),
+            reply,
+            guard: None,
+        });
+
+        self.inner
+            .send(message)
+            .map_err(|_| RegisterError::SchedulerClosed(SchedulerClosed))?;
+        let result = rx.wait().map_err(RegisterError::Cancelled)?;
+        handle_unregister_resource_result(result)
+    }
+
+    /// Register a buffer with the ring asynchronously returning a buffer index that can be
+    /// used with `Fixed` operations.
+    ///
+    /// Registering a buffer with the ring reduces the overhead of calls interacting
+    /// with the target buffer by reducing the amount of work the kernel needs to do
+    /// on every IO op.
+    ///
+    /// A `guard` value can be passed, which can be used to ensure the buffer remains alive
+    /// and valid for as long as the ring requires it.
+    ///
+    /// You need to tell the scheduler up front how many buffers you plan on registering up
+    /// front at creation time using the [I2o2Builder::with_num_registered_buffers](crate::I2o2Builder::with_num_registered_buffers)
+    /// parameter.
+    ///
+    /// This method can error when there are no free slots available on the ring.
+    ///
+    /// # Safety
+    ///
+    /// It is the callers responsibility to ensure that the buffer is:
+    /// - Safe to send across thread boundaries.
+    /// - Is correctly aligned for any ops that use the buffer afterward.
+    /// - Valid throughout the entire time the buffer is registered and in use by the scheduler.
+    pub async unsafe fn register_buffer_async(
+        &self,
+        ptr: *mut u8,
+        len: usize,
+        guard: Option<G>,
+    ) -> Result<u32, RegisterError> {
+        let (reply, rx) = reply::new();
+
+        let message = Message::RegisterResource(Packaged {
+            data: Resource::Buffer(libc::iovec {
+                iov_base: ptr as *mut _,
+                iov_len: len,
+            }),
+            reply,
+            guard,
+        });
+
+        self.inner
+            .send_async(message)
+            .await
+            .map_err(|_| RegisterError::SchedulerClosed(SchedulerClosed))?;
+        let result = rx.await.map_err(RegisterError::Cancelled)?;
+        handle_register_resource_result(result)
+    }
+
+    /// Unregister a previously registered buffer with the ring using the `buffer_index` asynchronously.
+    ///
+    /// If a guard was provided when registering, the guard will be dropped once all
+    /// inflight operations using the registered buffer are complete.
+    ///
+    /// This method can error when attempting to unregister a buffer that does not exist.
+    pub async fn unregister_buffer_async(
+        &self,
+        buffer_index: u32,
+    ) -> Result<(), RegisterError> {
+        let (reply, rx) = reply::new();
+
+        let message = Message::UnregisterResource(Packaged {
+            data: ResourceIndex::Buffer(buffer_index),
+            reply,
+            guard: None,
+        });
+
+        self.inner
+            .send_async(message)
+            .await
+            .map_err(|_| RegisterError::SchedulerClosed(SchedulerClosed))?;
+        let result = rx.await.map_err(RegisterError::Cancelled)?;
+        handle_unregister_resource_result(result)
+    }
 }
 
 fn prepare_many_entries<G>(
@@ -293,5 +582,25 @@ struct WakeOnDrop(std::task::Waker);
 impl Drop for WakeOnDrop {
     fn drop(&mut self) {
         self.0.wake_by_ref();
+    }
+}
+
+fn handle_register_resource_result(result: i32) -> Result<u32, RegisterError> {
+    if result < 0 && result == crate::MAGIC_ERRNO_NO_CAPACITY {
+        Err(RegisterError::OutOfCapacity)
+    } else if result < 0 {
+        Err(RegisterError::Io(io::Error::from_raw_os_error(-result)))
+    } else {
+        Ok(result as u32)
+    }
+}
+
+fn handle_unregister_resource_result(result: i32) -> Result<(), RegisterError> {
+    if result < 0 && result == crate::MAGIC_ERRNO_NO_CAPACITY {
+        Err(RegisterError::OutOfCapacity)
+    } else if result < 0 {
+        Err(RegisterError::Io(io::Error::from_raw_os_error(-result)))
+    } else {
+        Ok(())
     }
 }
