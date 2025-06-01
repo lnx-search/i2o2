@@ -42,9 +42,9 @@ impl RingWaker {
         self.is_set = false;
     }
 
-    pub(super) fn maybe_submit_self(
+    pub(super) fn maybe_submit_self<E: io_uring::squeue::EntryMarker>(
         &mut self,
-        submission: &mut SubmissionQueue,
+        submission: &mut SubmissionQueue<'_, E>,
     ) -> bool {
         if self.is_set {
             #[cfg(feature = "trace-hotpath")]
@@ -58,7 +58,8 @@ impl RingWaker {
             size_of::<u64>() as u32,
         )
         .build()
-        .user_data(flags::pack(flags::Flag::EventFdWaker, 0, 0));
+        .user_data(flags::pack(flags::Flag::EventFdWaker, 0, 0))
+        .into();
         self.is_set = unsafe { submission.push(&entry).is_ok() };
 
         #[cfg(feature = "trace-hotpath")]

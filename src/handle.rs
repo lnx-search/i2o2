@@ -5,7 +5,7 @@ use smallvec::SmallVec;
 
 use crate::ops::RingOp;
 use crate::reply::Cancelled;
-use crate::{DynamicGuard, Message, Packaged, Resource, ResourceIndex, reply};
+use crate::{DynamicGuard, Message, Packaged, Resource, ResourceIndex, mode, reply};
 
 /// A submission result for the scheduler.
 pub type SubmitResult<T> = Result<T, SchedulerClosed>;
@@ -34,13 +34,19 @@ pub enum RegisterError {
 
 /// The [I2o2Handle] allows you to interact with the [I2o2Scheduler](crate::I2o2Scheduler) and
 /// submit IO events to it.
-pub struct I2o2Handle<G = DynamicGuard> {
-    inner: flume::Sender<Message<G>>,
+pub struct I2o2Handle<G = DynamicGuard, M = mode::EntrySize64>
+where
+    M: mode::RingMode,
+{
+    inner: flume::Sender<Message<G, M::SQEntry>>,
     /// A guard that ensures the runtime is woken when the handle is dropped.
     wake_on_drop: Arc<WakeOnDrop>,
 }
 
-impl<G> Clone for I2o2Handle<G> {
+impl<G, M> Clone for I2o2Handle<G, M>
+where
+    M: mode::RingMode,
+{
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -49,8 +55,14 @@ impl<G> Clone for I2o2Handle<G> {
     }
 }
 
-impl<G> I2o2Handle<G> {
-    pub(super) fn new(tx: flume::Sender<Message<G>>, waker: std::task::Waker) -> Self {
+impl<G, M> I2o2Handle<G, M>
+where
+    M: mode::RingMode,
+{
+    pub(super) fn new(
+        tx: flume::Sender<Message<G, M::SQEntry>>,
+        waker: std::task::Waker,
+    ) -> Self {
         Self {
             inner: tx,
             wake_on_drop: Arc::new(WakeOnDrop(waker)),
@@ -58,9 +70,10 @@ impl<G> I2o2Handle<G> {
     }
 }
 
-impl<G> I2o2Handle<G>
+impl<G, M> I2o2Handle<G, M>
 where
     G: Send + 'static,
+    M: mode::RingMode,
 {
     /// Submit an op to the scheduler.
     ///
@@ -102,7 +115,7 @@ where
     ///     Ok(())
     /// }
     /// ```
-    pub unsafe fn submit<O: RingOp>(
+    pub unsafe fn submit<O: RingOp<M>>(
         &self,
         op: O,
         guard: Option<G>,
@@ -163,7 +176,7 @@ where
     ///     Ok(())
     /// }
     /// ```
-    pub unsafe fn submit_many_entries<O: RingOp>(
+    pub unsafe fn submit_many_entries<O: RingOp<M>>(
         &self,
         pairs: impl IntoIterator<Item = (O, Option<G>)>,
     ) -> SubmitResult<impl IntoIterator<Item = reply::ReplyReceiver>> {
@@ -215,7 +228,7 @@ where
     ///     Ok(())
     /// }
     /// ```
-    pub unsafe fn submit_async<O: RingOp>(
+    pub unsafe fn submit_async<O: RingOp<M>>(
         &self,
         op: O,
         guard: Option<G>,
@@ -280,7 +293,7 @@ where
     ///     Ok(())
     /// }
     /// ```
-    pub unsafe fn submit_many_entries_async<O: RingOp>(
+    pub unsafe fn submit_many_entries_async<O: RingOp<M>>(
         &self,
         pairs: impl IntoIterator<Item = (O, Option<G>)>,
     ) -> impl Future<Output = SubmitResult<impl IntoIterator<Item = reply::ReplyReceiver>>>
@@ -523,9 +536,9 @@ where
     }
 }
 
-fn prepare_many_entries<O: RingOp, G>(
+fn prepare_many_entries<M: mode::RingMode, O: RingOp<M>, G>(
     pairs: impl IntoIterator<Item = (O, Option<G>)>,
-) -> (Message<G>, SmallVec<[reply::ReplyReceiver; 4]>) {
+) -> (Message<G, M::SQEntry>, SmallVec<[reply::ReplyReceiver; 4]>) {
     let mut replies = SmallVec::<[reply::ReplyReceiver; 4]>::new();
     let iter = pairs.into_iter().map(|(op, guard)| {
         let (reply, rx) = reply::new();
