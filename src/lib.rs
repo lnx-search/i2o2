@@ -40,13 +40,9 @@ mod flags {
     const FLAGS_MASK: u64 = 0xF000_0000_0000_0000;
     pub const UNGUARDED: u64 = 0x0000_0000_0000_0000;
     pub const EVENT_FD_WAKER: u64 = 0x1000_0000_0000_0000;
-    pub const REGISTER_BUFFER: u64 = 0x2000_0000_0000_0000;
-    pub const UNREGISTER_BUFFER: u64 = 0x3000_0000_0000_0000;
-    pub const REGISTER_FILE: u64 = 0x4000_0000_0000_0000;
-    pub const UNREGISTER_FILE: u64 = 0x5000_0000_0000_0000;
-    pub const GUARDED: u64 = 0x6000_0000_0000_0000;
-    pub const GUARDED_RESOURCE_BUFFER: u64 = 0x7000_0000_0000_0000;
-    pub const GUARDED_RESOURCE_FILE: u64 = 0x8000_0000_0000_0000;
+    pub const GUARDED: u64 = 0x2000_0000_0000_0000;
+    pub const GUARDED_RESOURCE_BUFFER: u64 = 0x3000_0000_0000_0000;
+    pub const GUARDED_RESOURCE_FILE: u64 = 0x4000_0000_0000_0000;
 
     #[repr(u64)]
     #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -54,14 +50,6 @@ mod flags {
     pub enum Flag {
         /// The event is coming from the event FD waker.
         EventFdWaker = EVENT_FD_WAKER,
-        /// The event is coming from the register buffer event.
-        RegisterBuffer = REGISTER_BUFFER,
-        /// The event is coming from the unregister buffer event.
-        UnregisterBuffer = UNREGISTER_BUFFER,
-        /// The event is coming from the register file event.
-        RegisterFile = REGISTER_FILE,
-        /// The event is coming from the unregister file event.
-        UnregisterFile = UNREGISTER_FILE,
         /// The event has a guard value.
         Guarded = GUARDED,
         /// The event has no special properties and has no guard value.
@@ -100,10 +88,6 @@ mod flags {
         let reply_idx = ((packed_value & REPLY_IDX_MASK) >> 30) as u32;
         let flag = match packed_value & FLAGS_MASK {
             EVENT_FD_WAKER => Flag::EventFdWaker,
-            REGISTER_BUFFER => Flag::RegisterBuffer,
-            UNREGISTER_BUFFER => Flag::UnregisterBuffer,
-            REGISTER_FILE => Flag::RegisterFile,
-            UNREGISTER_FILE => Flag::UnregisterFile,
             GUARDED => Flag::Guarded,
             UNGUARDED => Flag::Unguarded,
             GUARDED_RESOURCE_BUFFER => Flag::GuardedResourceBuffer,
@@ -247,6 +231,12 @@ impl<G> I2o2Scheduler<G> {
     pub fn run(mut self) -> io::Result<()> {
         tracing::debug!("scheduler is running");
 
+        #[cfg(test)]
+        fail::fail_point!("scheduler_run_fail", |_| {
+            eprintln!("called??");
+            Err(io::Error::other("test error triggered by failpoints"))
+        });
+
         let (submitter, sq, cq) = self.ring.split();
         let mut runner = RingRunner {
             submitter,
@@ -262,6 +252,10 @@ impl<G> I2o2Scheduler<G> {
 
         while !runner.shutdown {
             runner.run()?;
+        }
+
+        if let Err(e) = runner.unregister_resources() {
+            tracing::warn!(error = ?e, "scheduler failed to gracefully unregister resources");
         }
 
         runner.wait_for_remaining()?;
@@ -326,6 +320,13 @@ impl<'ring, G> RingRunner<'ring, G> {
         #[cfg(feature = "trace-hotpath")]
         tracing::debug!("scheduler has drained all events");
 
+        Ok(())
+    }
+
+    /// Unregisters all resources from the ring.
+    fn unregister_resources(&mut self) -> io::Result<()> {
+        self.submitter.unregister_buffers()?;
+        self.submitter.unregister_files()?;
         Ok(())
     }
 
@@ -414,9 +415,6 @@ impl<'ring, G> RingRunner<'ring, G> {
 
             match flag {
                 flags::Flag::EventFdWaker => self.self_waker.mark_unset(),
-                flags::Flag::UnregisterBuffer | flags::Flag::UnregisterFile => (),
-                flags::Flag::RegisterBuffer => {},
-                flags::Flag::RegisterFile => {},
                 flags::Flag::Guarded => {
                     self.state.acknowledge_reply(reply_idx, result);
                     self.state.drop_guard_if_exists(guard_idx);

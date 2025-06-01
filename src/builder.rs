@@ -216,6 +216,12 @@ impl I2o2Builder {
 
     /// Attempt to create the scheduler using the current configuration.
     pub fn try_create<G>(self) -> io::Result<(I2o2Scheduler<G>, I2o2Handle<G>)> {
+        #[cfg(test)]
+        fail::fail_point!("scheduler_create_fail", |_| {
+            eprintln!("invoked???");
+            Err(io::Error::other("test error triggered by failpoints"))
+        });
+
         let (tx, rx) = flume::bounded(self.queue_size as usize);
         let waker = RingWaker::new()?;
 
@@ -263,6 +269,7 @@ impl I2o2Builder {
             if tx.send(handle).is_err() {
                 return Ok(());
             }
+
             scheduler.run()?;
             Ok::<_, io::Error>(())
         };
@@ -374,8 +381,37 @@ fn load_kernel_uring_probe() -> io::Result<io_uring::Probe> {
     Ok(probe)
 }
 
+#[cfg(not(test))]
 fn kernel_is_at_least(probe: &io_uring::Probe, interest: VersionInterest) -> bool {
     probe.is_supported(interest as u8)
+}
+
+#[cfg(test)]
+fn kernel_is_at_least(probe: &io_uring::Probe, interest: VersionInterest) -> bool {
+    match interest {
+        VersionInterest::V5_15 => {
+            fail::fail_point!("read-dir", |_| false);
+            probe.is_supported(interest as u8)
+        },
+        VersionInterest::V5_19 => {
+            fail::fail_point!("kernel_v5_13", |_| false);
+            fail::fail_point!("kernel_v5_15", |_| false);
+            probe.is_supported(interest as u8)
+        },
+        VersionInterest::V6_0 => {
+            fail::fail_point!("kernel_v5_13", |_| false);
+            fail::fail_point!("kernel_v5_15", |_| false);
+            fail::fail_point!("kernel_v5_19", |_| false);
+            probe.is_supported(interest as u8)
+        },
+        VersionInterest::V6_1 => {
+            fail::fail_point!("kernel_v5_13", |_| false);
+            fail::fail_point!("kernel_v5_15", |_| false);
+            fail::fail_point!("kernel_v5_19", |_| false);
+            fail::fail_point!("kernel_v6_0", |_| false);
+            probe.is_supported(interest as u8)
+        },
+    }
 }
 
 #[repr(u8)]

@@ -1,7 +1,12 @@
 use std::io;
+use std::io::ErrorKind;
 use std::sync::Arc;
+use std::time::Duration;
 
+use fail::FailScenario;
 use io_uring::opcode;
+
+use crate::SchedulerClosed;
 
 #[test]
 fn test_scheduler_noop() {
@@ -140,4 +145,34 @@ async fn test_submit_many_async() {
 
     drop(handle);
     scheduler.join().unwrap().unwrap();
+}
+
+#[test]
+fn failpoint_scheduler_create_fail_try_spawn() {
+    let scenario = FailScenario::setup();
+    let result = crate::create_and_spawn::<()>();
+    match result {
+        Err(e) => assert_eq!(e.kind(), ErrorKind::Other),
+        Ok(_) => panic!("scheduler should fail to be created"),
+    }
+    scenario.teardown();
+}
+
+#[test]
+fn failpoint_scheduler_run_fail_try_spawn() {
+    let scenario = FailScenario::setup();
+    let (scheduler, handle) = crate::create_and_spawn::<()>().unwrap();
+
+    // Give it a moment to shut down...
+    while !scheduler.is_finished() {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let op = opcode::Nop::new().build();
+    let err = unsafe { handle.submit(op, None).unwrap_err() };
+    assert!(matches!(err, SchedulerClosed));
+
+    let err = scheduler.join().unwrap().unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Other);
+    scenario.teardown();
 }

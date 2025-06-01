@@ -550,7 +550,7 @@ impl Drop for WakeOnDrop {
 }
 
 fn handle_register_resource_result(result: i32) -> Result<u32, RegisterError> {
-    if result < 0 && result == crate::MAGIC_ERRNO_NO_CAPACITY {
+    if result == crate::MAGIC_ERRNO_NO_CAPACITY {
         Err(RegisterError::OutOfCapacity)
     } else if result < 0 {
         Err(RegisterError::Io(io::Error::from_raw_os_error(-result)))
@@ -560,9 +560,7 @@ fn handle_register_resource_result(result: i32) -> Result<u32, RegisterError> {
 }
 
 fn handle_unregister_resource_result(result: i32) -> Result<(), RegisterError> {
-    if result < 0 && result == crate::MAGIC_ERRNO_NO_CAPACITY {
-        Err(RegisterError::OutOfCapacity)
-    } else if result < 0 {
+    if result < 0 {
         Err(RegisterError::Io(io::Error::from_raw_os_error(-result)))
     } else {
         Ok(())
