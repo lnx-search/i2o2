@@ -4,7 +4,7 @@ use std::io;
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
-mod shared;
+mod no_op_shared;
 
 const NUM_OPS_PER_WORKER: usize = 250_000;
 
@@ -29,7 +29,7 @@ fn main() -> io::Result<()> {
         ),
     ];
 
-    let mut results = shared::BenchmarkResults::default();
+    let mut results = no_op_shared::BenchmarkResults::default();
 
     for (name, config) in configs {
         eprintln!("running benchmark for config: {config:?}");

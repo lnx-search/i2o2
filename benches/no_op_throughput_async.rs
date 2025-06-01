@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Barrier;
 
-mod shared;
+mod no_op_shared;
 
 const NUM_OPS_PER_WORKER: usize = 250_000;
 
@@ -30,7 +30,7 @@ async fn main() -> io::Result<()> {
         ),
     ];
 
-    let mut results = shared::BenchmarkResults::default();
+    let mut results = no_op_shared::BenchmarkResults::default();
 
     for (name, config) in configs {
         eprintln!("running benchmark for config: {config:?}");
