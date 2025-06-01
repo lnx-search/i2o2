@@ -148,7 +148,7 @@ impl I2o2Builder {
     /// this value using [I2o2Builder::with_sqe_polling_timeout].
     pub const fn with_sqe_polling(mut self, enable: bool) -> Self {
         if enable {
-            self.sqe_poll = Some(Duration::from_millis(2000));
+            self.sqe_poll = Some(Duration::from_millis(20));
         } else {
             self.sqe_poll = None;
         }
