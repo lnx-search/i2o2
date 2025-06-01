@@ -88,8 +88,8 @@ impl I2o2Builder {
         self.num_registered_buffers = size;
 
         assert!(
-            self.num_registered_buffers + self.num_registered_files
-                >= super::flags::MAX_SAFE_IDX,
+            (self.num_registered_buffers + self.num_registered_files)
+                <= super::flags::MAX_SAFE_IDX,
             "total number of registered buffers and files exceeds maximum allowance"
         );
 

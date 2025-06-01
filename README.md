@@ -99,3 +99,11 @@ async fn main() -> io::Result<()> {
 ```
 
 You can see more examples in the [example directory](/examples)
+
+
+## Development
+
+Anyone is welcome to contribute, just be aware I2o2 only wants to act as a slightly higher wrapper around io_uring
+and just provide the async wrapper on top. We don't plan any support for making it more like a traditional runtime.
+
+We also assume you have a very new kernel version for running tests, and by new I mean 6.1+ at least.
