@@ -33,6 +33,8 @@ pub type DynamicGuard = Box<dyn Any>;
 /// A submission result for the scheduler.
 pub type SubmitResult<T> = Result<T, SchedulerClosed>;
 
+pub(crate) const MAGIC_ERRNO_NO_CAPACITY: i32 = -999;
+
 mod flags {
     use std::process::abort;
 
@@ -45,7 +47,8 @@ mod flags {
     pub const REGISTER_FILE: u64 = 0x4000_0000_0000_0000;
     pub const UNREGISTER_FILE: u64 = 0x5000_0000_0000_0000;
     pub const GUARDED: u64 = 0x6000_0000_0000_0000;
-    pub const GUARDED_RESOURCE: u64 = 0x7000_0000_0000_0000;
+    pub const GUARDED_RESOURCE_BUFFER: u64 = 0x7000_0000_0000_0000;
+    pub const GUARDED_RESOURCE_FILE: u64 = 0x8000_0000_0000_0000;
 
     #[repr(u64)]
     #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -65,9 +68,12 @@ mod flags {
         Guarded = GUARDED,
         /// The event has no special properties and has no guard value.
         Unguarded = UNGUARDED,
-        /// The event is tied to a registered resource which is now unregistered
+        /// The event is tied to a registered resource buffer which is now unregistered
         /// _and_ no longer used by any operation in the ring.
-        GuardedResource = GUARDED_RESOURCE,
+        GuardedResourceBuffer = GUARDED_RESOURCE_BUFFER,
+        /// The event is tied to a registered resource file which is now unregistered
+        /// _and_ no longer used by any operation in the ring.
+        GuardedResourceFile = GUARDED_RESOURCE_FILE,
     }
 
     /// Packs the 4 bit `flag` with the 30 bit `reply_idx` and `guard_idx`.
@@ -102,7 +108,8 @@ mod flags {
             UNREGISTER_FILE => Flag::UnregisterFile,
             GUARDED => Flag::Guarded,
             UNGUARDED => Flag::Unguarded,
-            GUARDED_RESOURCE => Flag::GuardedResource,
+            GUARDED_RESOURCE_BUFFER => Flag::GuardedResourceBuffer,
+            GUARDED_RESOURCE_FILE => Flag::GuardedResourceFile,
             // This should **never** happen, if this occurs the system has
             // already entered a UB state since we have to assume that any or all of
             // our prior event reads and unpacking are invalid; which means we have
@@ -424,7 +431,10 @@ impl<'ring, G> RingRunner<'ring, G> {
                 flags::Flag::Unguarded => {
                     self.state.acknowledge_reply(reply_idx, result);
                 },
-                flags::Flag::GuardedResource => {
+                flags::Flag::GuardedResourceBuffer => {
+                    self.state.drop_guard_if_exists(guard_idx);
+                },
+                flags::Flag::GuardedResourceFile => {
                     self.state.drop_guard_if_exists(guard_idx);
                 },
             }
@@ -483,8 +493,8 @@ impl<'ring, G> RingRunner<'ring, G> {
                 }
             },
             Message::OpOne(op) => self.handle_io_op(op),
-            Message::RegisterResource(_op) => {},
-            Message::UnregisterResource(_op) => {},
+            Message::RegisterResource(op) => self.handle_resource_register_op(op),
+            Message::UnregisterResource(op) => self.handle_resource_unregister_op(op),
         }
     }
 
@@ -493,32 +503,70 @@ impl<'ring, G> RingRunner<'ring, G> {
         self.push_entry(entry);
     }
 
-    // fn handle_resource_register_op(&mut self, op: Packaged<Resource, G>) {
-    //     let Packaged { data, reply, guard } = op;
-    //
-    //     let tag = if let Some(guard) = guard {
-    //         let guard_idx = self.state.register_guard(guard);
-    //         flags::pack(flags::Flag::GuardedResource, 0, guard_idx)
-    //     } else {
-    //         0
-    //     };
-    //
-    //     // match data {
-    //     //     Resource::Buffer { .. } => {
-    //     //         self.submitter
-    //     //             .register_buffers_update();
-    //     //     },
-    //     //     Resource::File { .. } => {
-    //     //         self.submitter
-    //     //             .register_files_update_tag();
-    //     //     },
-    //     // }
-    //
-    // }
-    //
-    // fn handle_resource_unregister_op(&mut self, op: Packaged<u32, G>) {
-    //     let Packaged { data, reply, .. } = op;
-    // }
+    fn handle_resource_register_op(&mut self, op: Packaged<Resource, G>) {
+        let Packaged { data, reply, guard } = op;
+
+        let result = if data.is_buffer() {
+            self.state.register_buffer_guard(guard)
+        } else {
+            self.state.register_file_guard(guard)
+        };
+
+        let (tag, offset) = match result {
+            None => {
+                reply.set_result(MAGIC_ERRNO_NO_CAPACITY);
+                return;
+            },
+            Some(offset) if data.is_buffer() => {
+                let packed = flags::pack(flags::Flag::GuardedResourceBuffer, 0, offset);
+                (packed, offset)
+            },
+            Some(offset) => {
+                let packed = flags::pack(flags::Flag::GuardedResourceFile, 0, offset);
+                (packed, offset)
+            },
+        };
+
+        let result = match data {
+            Resource::Buffer(iovec) => unsafe {
+                self.submitter
+                    .register_buffers_update(offset, &[iovec], Some(&[tag]))
+            },
+            Resource::File(fd) => {
+                self.submitter
+                    .register_files_update_tag(offset, &[fd], &[tag])
+            },
+        };
+
+        if result.is_ok() {
+            reply.set_result(0);
+            return;
+        }
+
+        // We have to ensure we don't leak mem if there is an error.
+        if data.is_buffer() {
+            self.state.drop_buffer_guard(offset);
+        } else {
+            self.state.drop_file_guard(offset);
+        };
+
+        let err = result.unwrap_err();
+        reply.set_result(err.raw_os_error().unwrap());
+    }
+
+    fn handle_resource_unregister_op(&mut self, op: Packaged<ResourceIndex, G>) {
+        let Packaged { data, reply, .. } = op;
+
+        let result = match data {
+            ResourceIndex::File(id) => self.submitter.register_files_update(id, &[-1]),
+        };
+
+        if let Err(err) = result {
+            reply.set_result(err.raw_os_error().unwrap());
+        } else {
+            reply.set_result(0);
+        }
+    }
 
     fn push_entry(&mut self, entry: Entry) {
         // SAFETY: Responsibility about ensuring entry validity is pushed to the caller
@@ -537,22 +585,34 @@ impl<'ring, G> RingRunner<'ring, G> {
 }
 
 struct TrackedState<G> {
+    free_registered_files: u32,
+    free_registered_buffers: u32,
+    /// Guards for allocated registered files.
+    resource_file_guards: slab::Slab<Option<G>>,
+    /// Guards for allocated registered buffers.
+    resource_buffer_guards: slab::Slab<Option<G>>,
     /// A set of guards that should be kept alive as long as the ring requires.
     guards: slab::Slab<G>,
     /// A slab of reply handles for scheduled tasks.
     replies: slab::Slab<reply::ReplyNotify>,
 }
 
-impl<G> Default for TrackedState<G> {
-    fn default() -> Self {
+impl<G> TrackedState<G> {
+    fn new(free_registered_files: u32, free_registered_buffers: u32) -> Self {
         Self {
+            free_registered_files,
+            free_registered_buffers,
+            resource_file_guards: slab::Slab::with_capacity(
+                free_registered_files as usize,
+            ),
+            resource_buffer_guards: slab::Slab::with_capacity(
+                free_registered_buffers as usize,
+            ),
             guards: slab::Slab::default(),
             replies: slab::Slab::default(),
         }
     }
-}
 
-impl<G> TrackedState<G> {
     fn remaining_tasks(&self) -> usize {
         self.replies.len()
     }
@@ -589,6 +649,38 @@ impl<G> TrackedState<G> {
     fn drop_guard_if_exists(&mut self, guard_idx: u32) {
         drop(self.guards.try_remove(guard_idx as usize));
     }
+
+    fn register_buffer_guard(&mut self, guard: Option<G>) -> Option<u32> {
+        if self.free_registered_buffers > 0 {
+            self.free_registered_buffers -= 1;
+            Some(self.resource_buffer_guards.insert(guard) as u32)
+        } else {
+            None
+        }
+    }
+
+    fn drop_buffer_guard(&mut self, guard_idx: u32) {
+        let value = self.guards.try_remove(guard_idx as usize);
+        if value.is_some() {
+            self.free_registered_buffers += 1;
+        }
+    }
+
+    fn register_file_guard(&mut self, guard: Option<G>) -> Option<u32> {
+        if self.free_registered_files > 0 {
+            self.free_registered_files -= 1;
+            Some(self.resource_file_guards.insert(guard) as u32)
+        } else {
+            None
+        }
+    }
+
+    fn drop_file_guard(&mut self, guard_idx: u32) {
+        let value = self.guards.try_remove(guard_idx as usize);
+        if value.is_some() {
+            self.free_registered_files += 1;
+        }
+    }
 }
 
 /// An operation to for the scheduler to process.
@@ -612,12 +704,20 @@ struct Packaged<D, G = DynamicGuard> {
 }
 
 enum Resource {
-    Buffer {},
-    File { fd: std::os::fd::RawFd },
+    Buffer(libc::iovec),
+    File(std::os::fd::RawFd),
 }
 
+impl Resource {
+    fn is_buffer(&self) -> bool {
+        matches!(self, Resource::Buffer { .. })
+    }
+}
+
+// SAFETY: The handle ensures the buffers are safe to send across a thread boundary.
+unsafe impl Send for Resource {}
+
 enum ResourceIndex {
-    Buffer(u32),
     File(u32),
 }
 

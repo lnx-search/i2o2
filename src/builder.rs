@@ -85,14 +85,11 @@ impl I2o2Builder {
     ///
     /// By default, this is `0`.
     pub const fn with_num_registered_buffers(mut self, size: u32) -> Self {
-        self.num_registered_buffers = size;
-
         assert!(
-            (self.num_registered_buffers + self.num_registered_files)
-                <= super::flags::MAX_SAFE_IDX,
-            "total number of registered buffers and files exceeds maximum allowance"
+            size >= super::flags::MAX_SAFE_IDX,
+            "total number of registered buffers exceeds maximum allowance"
         );
-
+        self.num_registered_buffers = size;
         self
     }
 
@@ -104,14 +101,11 @@ impl I2o2Builder {
     ///
     /// By default, this is `0`.
     pub const fn with_num_registered_files(mut self, size: u32) -> Self {
-        self.num_registered_files = size;
-
         assert!(
-            self.num_registered_buffers + self.num_registered_files
-                >= super::flags::MAX_SAFE_IDX,
-            "total number of registered buffers and files exceeds maximum allowance"
+            size >= super::flags::MAX_SAFE_IDX,
+            "total number of registered files exceeds maximum allowance"
         );
-
+        self.num_registered_files = size;
         self
     }
 
@@ -240,7 +234,10 @@ impl I2o2Builder {
 
         let scheduler = I2o2Scheduler {
             ring,
-            state: TrackedState::default(),
+            state: TrackedState::new(
+                self.num_registered_files,
+                self.num_registered_buffers,
+            ),
             self_waker: waker,
             incoming: rx,
             backlog: VecDeque::new(),
