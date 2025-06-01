@@ -86,7 +86,7 @@ impl I2o2Builder {
     /// By default, this is `0`.
     pub const fn with_num_registered_buffers(mut self, size: u32) -> Self {
         assert!(
-            size >= super::flags::MAX_SAFE_IDX,
+            size <= super::flags::MAX_SAFE_IDX,
             "total number of registered buffers exceeds maximum allowance"
         );
         self.num_registered_buffers = size;
@@ -102,7 +102,7 @@ impl I2o2Builder {
     /// By default, this is `0`.
     pub const fn with_num_registered_files(mut self, size: u32) -> Self {
         assert!(
-            size >= super::flags::MAX_SAFE_IDX,
+            size <= super::flags::MAX_SAFE_IDX,
             "total number of registered files exceeds maximum allowance"
         );
         self.num_registered_files = size;
@@ -369,7 +369,7 @@ fn load_kernel_uring_probe() -> io::Result<io_uring::Probe> {
     let submitter = ring.submitter();
     submitter.register_probe(&mut probe)?;
 
-    tracing::debug!(supported = ?probe, "loaded ring probe");
+    tracing::debug!("loaded ring probe");
 
     Ok(probe)
 }
@@ -389,10 +389,10 @@ enum VersionInterest {
 impl Display for VersionInterest {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            VersionInterest::V5_15 => write!(f, "v5.15"),
-            VersionInterest::V5_19 => write!(f, "v5.19"),
-            VersionInterest::V6_0 => write!(f, "v6.0"),
-            VersionInterest::V6_1 => write!(f, "v6.1"),
+            VersionInterest::V5_15 => write!(f, "5.15"),
+            VersionInterest::V5_19 => write!(f, "5.19"),
+            VersionInterest::V6_0 => write!(f, "6.0"),
+            VersionInterest::V6_1 => write!(f, "6.1"),
         }
     }
 }
@@ -402,7 +402,7 @@ fn unsupported_version(required: VersionInterest) -> io::Error {
         ErrorKind::Unsupported,
         format!(
             "feature not available, kernel version {required}+ \
-        is required to use this feature"
+        required to use this feature"
         ),
     )
 }
@@ -412,4 +412,59 @@ fn kernel_too_old(required: VersionInterest) -> io::Error {
         ErrorKind::Unsupported,
         format!("I2o2 requires a kernel version of {required} or newer"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[rstest::rstest]
+    #[case(
+        VersionInterest::V5_15,
+        "feature not available, kernel version 5.15+ required to use this feature"
+    )]
+    #[case(
+        VersionInterest::V5_19,
+        "feature not available, kernel version 5.19+ required to use this feature"
+    )]
+    #[case(
+        VersionInterest::V6_0,
+        "feature not available, kernel version 6.0+ required to use this feature"
+    )]
+    #[case(
+        VersionInterest::V6_1,
+        "feature not available, kernel version 6.1+ required to use this feature"
+    )]
+    fn test_unsupported_version_error_display(
+        #[case] version: VersionInterest,
+        #[case] expected: &str,
+    ) {
+        let msg = unsupported_version(version).to_string();
+        assert_eq!(msg, expected)
+    }
+
+    #[rstest::rstest]
+    #[case(
+        VersionInterest::V5_15,
+        "I2o2 requires a kernel version of 5.15 or newer"
+    )]
+    #[case(
+        VersionInterest::V5_19,
+        "I2o2 requires a kernel version of 5.19 or newer"
+    )]
+    #[case(
+        VersionInterest::V6_0,
+        "I2o2 requires a kernel version of 6.0 or newer"
+    )]
+    #[case(
+        VersionInterest::V6_1,
+        "I2o2 requires a kernel version of 6.1 or newer"
+    )]
+    fn test_kernel_too_old_error_display(
+        #[case] version: VersionInterest,
+        #[case] expected: &str,
+    ) {
+        let msg = kernel_too_old(version).to_string();
+        assert_eq!(msg, expected)
+    }
 }

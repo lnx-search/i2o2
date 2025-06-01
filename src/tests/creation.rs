@@ -60,7 +60,7 @@ use crate::I2o2Builder;
 )]
 #[case::with_register_files(
     crate::builder()
-        .with_num_registered_buffers(64)
+        .with_num_registered_files(64)
 )]
 fn test_scheduler_creation(#[case] builder: I2o2Builder) {
     let (_scheduler, _handle) = builder

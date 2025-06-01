@@ -433,6 +433,12 @@ where
     ///
     /// This method can error when there are no free slots available on the ring.
     ///
+    /// # Note
+    ///
+    /// There is no `unregister*` methods for buffers as we currently cannot make a populated
+    /// entry in the ring sparse, so when you register the buffer you are effectively leaking
+    /// the memory!
+    ///
     /// # Safety
     ///
     /// It is the callers responsibility to ensure that the buffer is:
@@ -463,28 +469,6 @@ where
         handle_register_resource_result(result)
     }
 
-    /// Unregister a previously registered buffer with the ring using the `buffer_index`.
-    ///
-    /// If a guard was provided when registering, the guard will be dropped once all
-    /// inflight operations using the registered buffer are complete.
-    ///
-    /// This method can error when attempting to unregister a buffer that does not exist.
-    pub fn unregister_buffer(&self, buffer_index: u32) -> Result<(), RegisterError> {
-        let (reply, rx) = reply::new();
-
-        let message = Message::UnregisterResource(Packaged {
-            data: ResourceIndex::Buffer(buffer_index),
-            reply,
-            guard: None,
-        });
-
-        self.inner
-            .send(message)
-            .map_err(|_| RegisterError::SchedulerClosed(SchedulerClosed))?;
-        let result = rx.wait().map_err(RegisterError::Cancelled)?;
-        handle_unregister_resource_result(result)
-    }
-
     /// Register a buffer with the ring asynchronously returning a buffer index that can be
     /// used with `Fixed` operations.
     ///
@@ -500,6 +484,12 @@ where
     /// parameter.
     ///
     /// This method can error when there are no free slots available on the ring.
+    ///
+    /// # Note
+    ///
+    /// There is no `unregister*` methods for buffers as we currently cannot make a populated
+    /// entry in the ring sparse, so when you register the buffer you are effectively leaking
+    /// the memory!
     ///
     /// # Safety
     ///
@@ -530,32 +520,6 @@ where
             .map_err(|_| RegisterError::SchedulerClosed(SchedulerClosed))?;
         let result = rx.await.map_err(RegisterError::Cancelled)?;
         handle_register_resource_result(result)
-    }
-
-    /// Unregister a previously registered buffer with the ring using the `buffer_index` asynchronously.
-    ///
-    /// If a guard was provided when registering, the guard will be dropped once all
-    /// inflight operations using the registered buffer are complete.
-    ///
-    /// This method can error when attempting to unregister a buffer that does not exist.
-    pub async fn unregister_buffer_async(
-        &self,
-        buffer_index: u32,
-    ) -> Result<(), RegisterError> {
-        let (reply, rx) = reply::new();
-
-        let message = Message::UnregisterResource(Packaged {
-            data: ResourceIndex::Buffer(buffer_index),
-            reply,
-            guard: None,
-        });
-
-        self.inner
-            .send_async(message)
-            .await
-            .map_err(|_| RegisterError::SchedulerClosed(SchedulerClosed))?;
-        let result = rx.await.map_err(RegisterError::Cancelled)?;
-        handle_unregister_resource_result(result)
     }
 }
 

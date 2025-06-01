@@ -31,8 +31,6 @@ compiler_error!(
 /// A guard type that can be any object.
 pub type DynamicGuard = Box<dyn Any>;
 
-static BLANK_MEM: &[u8] = &[];
-
 pub(crate) const MAGIC_ERRNO_NO_CAPACITY: i32 = -999;
 
 mod flags {
@@ -427,10 +425,10 @@ impl<'ring, G> RingRunner<'ring, G> {
                     self.state.acknowledge_reply(reply_idx, result);
                 },
                 flags::Flag::GuardedResourceBuffer => {
-                    self.state.drop_guard_if_exists(guard_idx);
+                    self.state.drop_buffer_guard(guard_idx);
                 },
                 flags::Flag::GuardedResourceFile => {
-                    self.state.drop_guard_if_exists(guard_idx);
+                    self.state.drop_file_guard(guard_idx);
                 },
             }
         }
@@ -555,21 +553,6 @@ impl<'ring, G> RingRunner<'ring, G> {
 
         let result = match data {
             ResourceIndex::File(id) => self.submitter.register_files_update(id, &[-1]),
-            ResourceIndex::Buffer(id) => {
-                // SAFETY: Our replacement buffer is static.
-                unsafe {
-                    self.submitter
-                        .register_buffers_update(
-                            id,
-                            &[libc::iovec {
-                                iov_base: BLANK_MEM.as_ptr() as *mut _,
-                                iov_len: 0,
-                            }],
-                            Some(&[0]),
-                        )
-                        .map(|_| 1)
-                }
-            },
         };
 
         if let Err(err) = result {
@@ -671,7 +654,7 @@ impl<G> TrackedState<G> {
     }
 
     fn drop_buffer_guard(&mut self, guard_idx: u32) {
-        let value = self.guards.try_remove(guard_idx as usize);
+        let value = self.resource_buffer_guards.try_remove(guard_idx as usize);
         if value.is_some() {
             self.free_registered_buffers += 1;
         }
@@ -687,7 +670,7 @@ impl<G> TrackedState<G> {
     }
 
     fn drop_file_guard(&mut self, guard_idx: u32) {
-        let value = self.guards.try_remove(guard_idx as usize);
+        let value = self.resource_file_guards.try_remove(guard_idx as usize);
         if value.is_some() {
             self.free_registered_files += 1;
         }
@@ -730,7 +713,6 @@ unsafe impl Send for Resource {}
 
 enum ResourceIndex {
     File(u32),
-    Buffer(u32),
 }
 
 #[cfg(test)]
