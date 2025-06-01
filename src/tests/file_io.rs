@@ -88,8 +88,7 @@ fn write_file(
         types::Fd(file.as_raw_fd()),
         sample.as_ptr(),
         sample.len() as u32,
-    )
-    .build();
+    );
     eprintln!("built op");
 
     let reply = unsafe {
@@ -127,8 +126,7 @@ async fn write_file_async(
         types::Fd(file.as_raw_fd()),
         sample.as_ptr(),
         sample.len() as u32,
-    )
-    .build();
+    );
     eprintln!("built op");
 
     let reply = unsafe {

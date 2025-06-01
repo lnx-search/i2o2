@@ -61,7 +61,7 @@ fn bench_with_config(
             barrier.wait();
 
             for _ in 0..NUM_OPS_PER_WORKER {
-                let op = i2o2::opcode::Nop::new().build();
+                let op = i2o2::opcode::Nop::new();
                 let reply = unsafe { handle.submit(op, None).unwrap() };
                 let result = reply.wait();
                 assert_eq!(result, Ok(0));
