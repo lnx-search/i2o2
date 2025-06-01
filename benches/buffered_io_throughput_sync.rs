@@ -7,35 +7,32 @@
 //! but on my machine that would mean writing 200GB+ of data every time, and I don't really
 //! want that burning through my NVMEs!
 
-use std::collections::VecDeque;
+use std::cmp;
 use std::io::{BufWriter, Write};
-use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
-use std::{cmp, io};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 
 use crate::io_shared::{BenchmarkResults, FileManager};
 
 mod io_shared;
 
 static BASE_PATH: &str = "./benchmark-data";
-const BUFFER_SIZE: usize = 64 << 10;
+const BUFFER_SIZE: usize = 32 << 10;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let run_id = ulid::Ulid::new();
-    let mut file_manger = FileManager::new(run_id, BASE_PATH.as_ref())?;
+    let base_path = "./benchmark-data";
+
+    let mut file_manger = FileManager::new(run_id, base_path.as_ref())?;
     let mut results = BenchmarkResults::default();
 
     tracing::info!(run_id = %run_id, "starting benchmark");
     run_std_benches(&mut file_manger, &mut results)?;
-    run_ring_benches(&mut file_manger, &mut results)?;
 
     tracing::info!("done!");
-
-    println!("{results}");
 
     Ok(())
 }
@@ -55,105 +52,19 @@ fn run_std_benches(
     tracing::info!("running default file write 10GB");
     let mut file = file_manger.new_file()?;
     let elapsed = sequential_write_repeating(file.as_file_mut(), &buffer, 10 << 30)?;
-    results.push("std::fs::File, 10GB", BUFFER_SIZE, elapsed, 10 << 30);
+    results.push("std::fs::File, 1GB", BUFFER_SIZE, elapsed, 10 << 30);
 
     tracing::info!("running BufWriter file write 1GB");
     let mut file = file_manger.new_file()?;
     let mut writer = BufWriter::with_capacity(1 << 20, file.as_file_mut());
     let elapsed = sequential_write_repeating(&mut writer, &buffer, 10 << 30)?;
-    results.push(
-        "std::io::BufWriter<File>, 1GB",
-        BUFFER_SIZE,
-        elapsed,
-        1 << 30,
-    );
+    results.push("std::fs::File, 1GB", BUFFER_SIZE, elapsed, 1 << 30);
 
     tracing::info!("running BufWriter file write 10GB");
     let mut file = file_manger.new_file()?;
     let mut writer = BufWriter::with_capacity(1 << 20, file.as_file_mut());
     let elapsed = sequential_write_repeating(&mut writer, &buffer, 10 << 30)?;
-    results.push(
-        "std::io::BufWriter<File>, 10GB",
-        BUFFER_SIZE,
-        elapsed,
-        10 << 30,
-    );
-
-    Ok(())
-}
-
-fn run_ring_benches(
-    file_manger: &mut FileManager,
-    results: &mut BenchmarkResults,
-) -> Result<()> {
-    let mut buffer = vec![0; BUFFER_SIZE];
-    fastrand::fill(&mut buffer);
-
-    tracing::info!("running ring file write 1GB");
-    let file = file_manger.new_file()?;
-    let elapsed = sequential_write_repeating_ring(
-        file.as_file(),
-        i2o2::builder(),
-        &buffer,
-        1 << 30,
-    )?;
-    results.push(
-        "i2o2 buffered, default opts, 1GB",
-        BUFFER_SIZE,
-        elapsed,
-        1 << 30,
-    );
-
-    tracing::info!("running ring file write 10GB");
-    let file = file_manger.new_file()?;
-    let elapsed = sequential_write_repeating_ring(
-        file.as_file(),
-        i2o2::builder(),
-        &buffer,
-        10 << 30,
-    )?;
-    results.push(
-        "i2o2 buffered, default opt, 10GB",
-        BUFFER_SIZE,
-        elapsed,
-        10 << 30,
-    );
-
-    tracing::info!("running ring file w/write behind 1GB");
-    let file = file_manger.new_file()?;
-    let elapsed = right_behind_write_repeating_ring(
-        file.as_file(),
-        i2o2::builder()
-            .with_num_registered_files(1)
-            .with_num_registered_buffers(1),
-        &buffer,
-        1 << 30,
-        4,
-    )?;
-    results.push(
-        "i2o2 buffered, write behind (4), 1GB",
-        BUFFER_SIZE,
-        elapsed,
-        1 << 30,
-    );
-
-    tracing::info!("running ring file w/write behind 10GB");
-    let file = file_manger.new_file()?;
-    let elapsed = right_behind_write_repeating_ring(
-        file.as_file(),
-        i2o2::builder()
-            .with_num_registered_files(1)
-            .with_num_registered_buffers(1),
-        &buffer,
-        10 << 30,
-        4,
-    )?;
-    results.push(
-        "i2o2 buffered, write behind (4), 10GB",
-        BUFFER_SIZE,
-        elapsed,
-        10 << 30,
-    );
+    results.push("std::fs::File, 1GB", BUFFER_SIZE, elapsed, 10 << 30);
 
     Ok(())
 }
@@ -186,123 +97,6 @@ fn sequential_write_repeating<W: Write>(
             "system could not write file fully wrote: {bytes_written} expected: {target_file_size}"
         );
     }
-
-    Ok(elapsed)
-}
-
-/// Run a simple sequential write of a buffer for a given target file size using io_uring.
-///
-/// We probably expect this to be slower than the default method, because the overhead
-/// of the channel and submission and completion logic.
-fn sequential_write_repeating_ring(
-    file: &std::fs::File,
-    options: i2o2::I2o2Builder,
-    buffer: &[u8],
-    target_file_size: usize,
-) -> Result<Duration> {
-    let (scheduler_thread_handle, handle) = options.try_spawn::<()>()?;
-
-    let now = Instant::now();
-
-    let mut bytes_written = 0;
-    while bytes_written < target_file_size {
-        let remaining = target_file_size - bytes_written;
-        let len = cmp::min(buffer.len(), remaining);
-
-        let op = i2o2::opcode::Write::new(
-            i2o2::types::Fd(file.as_raw_fd()),
-            buffer.as_ptr(),
-            len as u32,
-        )
-        .offset(bytes_written as u64);
-
-        let reply = unsafe { handle.submit(op, None) }?;
-        let result = reply.wait()?;
-
-        if result < 0 {
-            bail!("got error: {}", io::Error::from_raw_os_error(-result));
-        }
-
-        if result == 0 {
-            break;
-        }
-
-        bytes_written += result as usize;
-    }
-
-    let elapsed = now.elapsed();
-
-    drop(handle);
-    scheduler_thread_handle.join().unwrap()?;
-
-    Ok(elapsed)
-}
-
-/// Run a sequential write of a buffer for a given target file size using io_uring with a
-/// write behind buffer.
-///
-/// This may not be correct for all situations, but in our case, it is probably file.
-fn right_behind_write_repeating_ring(
-    file: &std::fs::File,
-    options: i2o2::I2o2Builder,
-    buffer: &[u8],
-    target_file_size: usize,
-    write_behind: usize,
-) -> Result<Duration> {
-    let (scheduler_thread_handle, handle) =
-        options.try_spawn::<()>().context("create scheduler")?;
-
-    handle.register_file(file.as_raw_fd(), None)?;
-    unsafe { handle.register_buffer(buffer.as_ptr() as *mut u8, buffer.len(), None) }?;
-
-    let mut pending_ops = VecDeque::with_capacity(write_behind);
-
-    let now = Instant::now();
-
-    let mut bytes_written = 0;
-    while bytes_written < target_file_size {
-        let remaining = target_file_size - bytes_written;
-        let len = cmp::min(buffer.len(), remaining);
-
-        let op = i2o2::opcode::Write::new(
-            i2o2::types::Fd(file.as_raw_fd()),
-            buffer.as_ptr(),
-            len as u32,
-        )
-        .offset(bytes_written as u64);
-
-        let reply = unsafe { handle.submit(op, None) }?;
-
-        pending_ops.push_back(reply);
-        bytes_written += len;
-
-        if pending_ops.len() <= write_behind {
-            continue;
-        }
-
-        let reply = pending_ops.pop_front().unwrap();
-        let result = reply.wait()?;
-
-        if result < 0 {
-            bail!("got error: {}", io::Error::from_raw_os_error(-result));
-        } else if result == 0 {
-            break;
-        } else if result as usize != len {
-            bail!("system did partial write")
-        }
-    }
-
-    while let Some(reply) = pending_ops.pop_front() {
-        let result = reply.wait()?;
-        if result < 0 {
-            bail!("got error: {}", io::Error::from_raw_os_error(-result));
-        }
-    }
-
-    let elapsed = now.elapsed();
-
-    drop(handle);
-    scheduler_thread_handle.join().unwrap()?;
 
     Ok(elapsed)
 }

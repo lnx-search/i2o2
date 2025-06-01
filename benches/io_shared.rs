@@ -62,6 +62,7 @@ fn format_duration(dur: Duration) -> String {
 }
 
 pub struct FileManager {
+    run_id: ulid::Ulid,
     base_path: PathBuf,
     sequence_id: usize,
 }
@@ -73,7 +74,8 @@ impl FileManager {
         std::fs::create_dir_all(&path)?;
 
         Ok(Self {
-            base_path: path,
+            run_id,
+            base_path: base_path.to_path_buf(),
             sequence_id: 0,
         })
     }
