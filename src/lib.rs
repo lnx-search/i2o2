@@ -337,11 +337,11 @@ where
 
     /// Unregisters all resources from the ring.
     fn unregister_resources(&mut self) -> io::Result<()> {
-        if self.state.resource_buffer_guards.len() > 0 {
+        if !self.state.resource_buffer_guards.is_empty() {
             self.submitter.unregister_buffers()?;
         }
 
-        if self.state.resource_file_guards.len() > 0 {
+        if !self.state.resource_file_guards.is_empty() {
             self.submitter.unregister_files()?;
         }
 

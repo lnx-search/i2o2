@@ -113,6 +113,20 @@ impl_ring_op!(opcode::Writev);
 impl_ring_op!(opcode::WriteFixed);
 impl_ring_op!(opcode::WaitId);
 
+impl_ring_op!(opcode::UringCmd16);
+
+impl sealed::Sealed for opcode::UringCmd80 {}
+
+impl RingOp<mode::EntrySize128> for opcode::UringCmd80 {
+    fn into_entry(self) -> <mode::EntrySize128 as mode::RingMode>::SQEntry {
+        self.build()
+    }
+
+    fn into_any_opcode(self) -> AnyOpcode<mode::EntrySize128> {
+        AnyOpcode(self.into_entry())
+    }
+}
+
 /// A helper type that allows you to mix and match ops as part of the bulk API
 /// without having to box.
 pub struct AnyOpcode<M: mode::RingMode = mode::EntrySize64>(M::SQEntry);
