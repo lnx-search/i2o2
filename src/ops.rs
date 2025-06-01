@@ -127,7 +127,6 @@ impl RingOp<mode::EntrySize128> for opcode::UringCmd80 {
     }
 }
 
-
 /// A helper type that allows you to mix and match ops as part of the bulk API
 /// without having to box.
 pub struct AnyOpcode<M: mode::RingMode = mode::EntrySize64>(M::SQEntry);
