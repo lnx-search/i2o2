@@ -2,7 +2,7 @@
 ///
 /// Normally you want [EntrySize64] which is usable for all IO operations
 /// _except_ NVME pass through currently.
-pub trait RingMode: sealed::Sealed {
+pub trait RingMode: sealed::Sealed + Send + 'static {
     type SQEntry: SQEntryOptions;
     type CQEntry: CQEntryOptions;
 }
@@ -36,7 +36,7 @@ impl RingMode for EntrySize128 {
 }
 
 pub trait SQEntryOptions:
-    io_uring::squeue::EntryMarker + From<io_uring::squeue::Entry>
+    io_uring::squeue::EntryMarker + From<io_uring::squeue::Entry> + Send + 'static
 {
     fn user_data(self, data: u64) -> Self;
 }
@@ -53,7 +53,7 @@ impl SQEntryOptions for io_uring::squeue::Entry128 {
     }
 }
 
-pub trait CQEntryOptions: io_uring::cqueue::EntryMarker {
+pub trait CQEntryOptions: io_uring::cqueue::EntryMarker + Send + 'static {
     fn user_data(&self) -> u64;
 
     fn result(&self) -> i32;

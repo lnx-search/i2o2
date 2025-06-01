@@ -8,7 +8,9 @@ use io_uring::IoUring;
 
 use crate::handle::I2o2Handle;
 use crate::wake::RingWaker;
-use crate::{I2o2Scheduler, TrackedState};
+use crate::{I2o2Scheduler, TrackedState, mode};
+
+type SchedulerThreadHandle = std::thread::JoinHandle<io::Result<()>>;
 
 #[derive(Debug, Clone)]
 /// A set of configuration options for customising the [I2o2Scheduler] scheduler.
@@ -215,7 +217,53 @@ impl I2o2Builder {
     }
 
     /// Attempt to create the scheduler using the current configuration.
+    ///
+    /// This uses the default [mode::EntrySize64] operating mode.
     pub fn try_create<G>(self) -> io::Result<(I2o2Scheduler<G>, I2o2Handle<G>)> {
+        self.try_create_inner()
+    }
+
+    /// Attempt to create the scheduler using the current configuration.
+    ///
+    /// This uses the larger [mode::EntrySize128] operating mode which supports NVME
+    /// pass through.
+    pub fn try_create_size128<G>(self) -> io::Result<(I2o2Scheduler<G>, I2o2Handle<G>)> {
+        self.try_create_inner()
+    }
+
+    /// Attempt to create the scheduler and run it in a background thread using the
+    /// current configuration.
+    ///
+    /// This uses the default [mode::EntrySize64] operating mode.
+    pub fn try_spawn<G>(
+        self,
+    ) -> io::Result<(std::thread::JoinHandle<io::Result<()>>, I2o2Handle<G>)>
+    where
+        G: Send + 'static,
+    {
+        self.try_spawn_inner()
+    }
+
+    /// Attempt to create the scheduler and run it in a background thread using the
+    /// current configuration.
+    ///
+    /// This uses the larger [mode::EntrySize128] operating mode which supports NVME
+    /// pass through.
+    pub fn try_spawn_size128<G>(
+        self,
+    ) -> io::Result<(SchedulerThreadHandle, I2o2Handle<G, mode::EntrySize128>)>
+    where
+        G: Send + 'static,
+    {
+        self.try_spawn_inner()
+    }
+
+    fn try_create_inner<G, M>(
+        self,
+    ) -> io::Result<(I2o2Scheduler<G, M>, I2o2Handle<G, M>)>
+    where
+        M: mode::RingMode,
+    {
         #[cfg(test)]
         fail::fail_point!("scheduler_create_fail", |_| {
             eprintln!("invoked???");
@@ -230,10 +278,10 @@ impl I2o2Builder {
             return Err(kernel_too_old(VersionInterest::V5_15));
         }
 
-        let ring = self.setup_io_ring(&probe)?;
+        let ring = self.setup_io_ring::<M>(&probe)?;
         tracing::debug!(features = ?ring.params(), "ring created with features");
 
-        self.setup_registered_resources(&probe, &ring)?;
+        self.setup_registered_resources::<M>(&probe, &ring)?;
         tracing::debug!("successfully registered resources with ring");
 
         let handle = I2o2Handle::new(tx, waker.task_waker());
@@ -253,18 +301,17 @@ impl I2o2Builder {
         Ok((scheduler, handle))
     }
 
-    /// Attempt to create the scheduler and run it in a background thread using the
-    /// current configuration.
-    pub fn try_spawn<G>(
+    fn try_spawn_inner<G, M>(
         self,
-    ) -> io::Result<(std::thread::JoinHandle<io::Result<()>>, I2o2Handle<G>)>
+    ) -> io::Result<(SchedulerThreadHandle, I2o2Handle<G, M>)>
     where
         G: Send + 'static,
+        M: mode::RingMode,
     {
         let (tx, rx) = flume::bounded(1);
 
         let task = move || {
-            let (scheduler, handle) = self.try_create()?;
+            let (scheduler, handle) = self.try_create_inner()?;
 
             if tx.send(handle).is_err() {
                 return Ok(());
@@ -289,7 +336,13 @@ impl I2o2Builder {
         }
     }
 
-    fn setup_io_ring(&self, probe: &io_uring::Probe) -> io::Result<IoUring> {
+    fn setup_io_ring<M>(
+        &self,
+        probe: &io_uring::Probe,
+    ) -> io::Result<IoUring<M::SQEntry, M::CQEntry>>
+    where
+        M: mode::RingMode,
+    {
         let mut builder = IoUring::builder();
 
         if kernel_is_at_least(probe, VersionInterest::V6_0) {
@@ -327,11 +380,14 @@ impl I2o2Builder {
         builder.build(self.queue_size)
     }
 
-    fn setup_registered_resources(
+    fn setup_registered_resources<M>(
         &self,
         probe: &io_uring::Probe,
-        ring: &IoUring,
-    ) -> io::Result<()> {
+        ring: &IoUring<M::SQEntry, M::CQEntry>,
+    ) -> io::Result<()>
+    where
+        M: mode::RingMode,
+    {
         let submitter = ring.submitter();
 
         if self.num_registered_files > 0 {
