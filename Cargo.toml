@@ -12,7 +12,6 @@ license = "MIT"
 [features]
 # Enable tracing in the hotpath of the scheduler
 trace-hotpath = []
-failpoints = []
 
 [dependencies]
 thiserror = "2"
