@@ -1,9 +1,9 @@
 use std::io;
 use std::sync::Arc;
 
-use io_uring::squeue::Entry;
 use smallvec::SmallVec;
 
+use crate::ops::RingOp;
 use crate::reply::Cancelled;
 use crate::{DynamicGuard, Message, Packaged, Resource, ResourceIndex, reply};
 
@@ -85,7 +85,7 @@ where
     ///
     /// fn main() -> io::Result<()> {
     ///     let (scheduler, scheduler_handle) = i2o2::create_for_current_thread::<()>()?;
-    ///     let op = i2o2::opcode::Nop::new().build();
+    ///     let op = i2o2::opcode::Nop::new();
     ///     
     ///     let reply = unsafe {
     ///         scheduler_handle
@@ -102,14 +102,14 @@ where
     ///     Ok(())
     /// }
     /// ```
-    pub unsafe fn submit(
+    pub unsafe fn submit<O: RingOp>(
         &self,
-        entry: Entry,
+        op: O,
         guard: Option<G>,
     ) -> SubmitResult<reply::ReplyReceiver> {
         let (reply, rx) = reply::new();
         let message = Message::OpOne(Packaged {
-            data: entry,
+            data: op.into_entry(),
             reply,
             guard,
         });
@@ -144,7 +144,7 @@ where
     /// fn main() -> io::Result<()> {
     ///     let (thread_handle, scheduler_handle) = i2o2::create_and_spawn::<()>()?;
     ///     
-    ///     let ops = std::iter::repeat_with(|| (i2o2::opcode::Nop::new().build(), None)).take(5);
+    ///     let ops = std::iter::repeat_with(|| (i2o2::opcode::Nop::new(), None)).take(5);
     ///     
     ///     let replies = unsafe {
     ///         scheduler_handle
@@ -163,9 +163,9 @@ where
     ///     Ok(())
     /// }
     /// ```
-    pub unsafe fn submit_many_entries(
+    pub unsafe fn submit_many_entries<O: RingOp>(
         &self,
-        pairs: impl IntoIterator<Item = (Entry, Option<G>)>,
+        pairs: impl IntoIterator<Item = (O, Option<G>)>,
     ) -> SubmitResult<impl IntoIterator<Item = reply::ReplyReceiver>> {
         let (message, replies) = prepare_many_entries(pairs);
 
@@ -197,7 +197,7 @@ where
     /// #[tokio::main]
     /// async fn main() -> io::Result<()> {
     ///     let (thread_handle, scheduler_handle) = i2o2::create_and_spawn::<()>()?;
-    ///     let op = i2o2::opcode::Nop::new().build();
+    ///     let op = i2o2::opcode::Nop::new();
     ///     
     ///     let reply = unsafe {
     ///         scheduler_handle
@@ -215,16 +215,16 @@ where
     ///     Ok(())
     /// }
     /// ```
-    pub unsafe fn submit_async(
+    pub unsafe fn submit_async<O: RingOp>(
         &self,
-        entry: Entry,
+        op: O,
         guard: Option<G>,
     ) -> impl Future<Output = SubmitResult<reply::ReplyReceiver>> + '_ {
         use futures_util::TryFutureExt;
 
         let (reply, rx) = reply::new();
         let message = Message::OpOne(Packaged {
-            data: entry,
+            data: op.into_entry(),
             reply,
             guard,
         });
@@ -261,7 +261,7 @@ where
     /// #[tokio::main]
     /// async fn main() -> io::Result<()> {
     ///     let (thread_handle, scheduler_handle) = i2o2::create_and_spawn::<()>()?;
-    ///     let ops = std::iter::repeat_with(|| (i2o2::opcode::Nop::new().build(), None)).take(5);
+    ///     let ops = std::iter::repeat_with(|| (i2o2::opcode::Nop::new(), None)).take(5);
     ///     
     ///     let replies = unsafe {
     ///         scheduler_handle
@@ -280,9 +280,9 @@ where
     ///     Ok(())
     /// }
     /// ```
-    pub unsafe fn submit_many_entries_async(
+    pub unsafe fn submit_many_entries_async<O: RingOp>(
         &self,
-        pairs: impl IntoIterator<Item = (Entry, Option<G>)>,
+        pairs: impl IntoIterator<Item = (O, Option<G>)>,
     ) -> impl Future<Output = SubmitResult<impl IntoIterator<Item = reply::ReplyReceiver>>>
     {
         let (message, replies) = prepare_many_entries(pairs);
@@ -523,16 +523,16 @@ where
     }
 }
 
-fn prepare_many_entries<G>(
-    pairs: impl IntoIterator<Item = (Entry, Option<G>)>,
+fn prepare_many_entries<O: RingOp, G>(
+    pairs: impl IntoIterator<Item = (O, Option<G>)>,
 ) -> (Message<G>, SmallVec<[reply::ReplyReceiver; 4]>) {
     let mut replies = SmallVec::<[reply::ReplyReceiver; 4]>::new();
-    let iter = pairs.into_iter().map(|(entry, guard)| {
+    let iter = pairs.into_iter().map(|(op, guard)| {
         let (reply, rx) = reply::new();
         replies.push(rx);
 
         Packaged {
-            data: entry,
+            data: op.into_entry(),
             reply,
             guard,
         }

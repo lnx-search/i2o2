@@ -100,7 +100,7 @@ fn test_register_files_sync() {
     // use a nop to run through a cycle and give io_uring a chance
     // to handle the file unregistering.
     unsafe {
-        let nop = crate::opcode::Nop::new().build();
+        let nop = crate::opcode::Nop::new();
         handle.submit(nop, None).unwrap();
     }
     std::thread::sleep(Duration::from_millis(200));
@@ -147,7 +147,7 @@ async fn test_register_files_async() {
     // use a nop to run through a cycle and give io_uring a chance
     // to handle the file unregistering.
     unsafe {
-        let nop = crate::opcode::Nop::new().build();
+        let nop = crate::opcode::Nop::new();
         handle.submit_async(nop, None).await.unwrap();
     }
     tokio::time::sleep(Duration::from_millis(200)).await;

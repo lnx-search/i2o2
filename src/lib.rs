@@ -2,6 +2,7 @@
 
 mod builder;
 mod handle;
+mod ops;
 mod reply;
 #[cfg(test)]
 mod tests;
@@ -21,6 +22,7 @@ use smallvec::SmallVec;
 
 pub use crate::builder::I2o2Builder;
 pub use crate::handle::{I2o2Handle, RegisterError, SchedulerClosed, SubmitResult};
+pub use crate::ops::{AnyOpcode, RingOp};
 use crate::wake::RingWaker;
 
 #[cfg(not(target_os = "linux"))]

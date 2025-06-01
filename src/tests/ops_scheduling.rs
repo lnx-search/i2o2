@@ -15,7 +15,7 @@ fn test_scheduler_noop() {
     let (scheduler, handle) = crate::create_for_current_thread::<()>().unwrap();
     let handle2 = handle.clone();
 
-    let op = opcode::Nop::new().build();
+    let op = opcode::Nop::new();
     eprintln!("built op");
 
     let reply = unsafe {
@@ -46,7 +46,7 @@ fn test_scheduler_noop_with_guard() {
     let (scheduler, handle) = crate::create_for_current_thread().unwrap();
     let guard = Arc::new(());
 
-    let op = opcode::Nop::new().build();
+    let op = opcode::Nop::new();
     eprintln!("built op");
 
     let reply = unsafe {
@@ -86,7 +86,7 @@ fn test_submit_many_sync() {
         handle
             .submit_many_entries(
                 std::iter::repeat_with(|| {
-                    let op = opcode::Nop::new().build();
+                    let op = opcode::Nop::new();
                     (op, None)
                 })
                 .take(5),
@@ -122,7 +122,7 @@ async fn test_submit_many_async() {
         handle
             .submit_many_entries_async(
                 std::iter::repeat_with(|| {
-                    let op = opcode::Nop::new().build();
+                    let op = opcode::Nop::new();
                     (op, None)
                 })
                 .take(5),
@@ -168,7 +168,7 @@ fn failpoint_scheduler_run_fail_try_spawn() {
         std::thread::sleep(Duration::from_millis(10));
     }
 
-    let op = opcode::Nop::new().build();
+    let op = opcode::Nop::new();
     let err = unsafe { handle.submit(op, None).unwrap_err() };
     assert!(matches!(err, SchedulerClosed));
 
