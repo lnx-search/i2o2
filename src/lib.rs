@@ -2,6 +2,7 @@
 
 mod builder;
 mod handle;
+pub mod mode;
 mod ops;
 mod reply;
 #[cfg(test)]
@@ -15,13 +16,13 @@ use std::task::Poll;
 
 use flume::r#async::RecvFut;
 use futures_util::FutureExt;
-use io_uring::squeue::Entry;
 use io_uring::{CompletionQueue, IoUring, SubmissionQueue, Submitter};
 pub use io_uring::{opcode, types};
 use smallvec::SmallVec;
 
 pub use crate::builder::I2o2Builder;
 pub use crate::handle::{I2o2Handle, RegisterError, SchedulerClosed, SubmitResult};
+use crate::mode::{CQEntryOptions, SQEntryOptions};
 pub use crate::ops::{AnyOpcode, RingOp};
 use crate::wake::RingWaker;
 
@@ -209,24 +210,30 @@ pub const fn builder() -> I2o2Builder {
 ///
 /// Communication between the handles and the scheduler can be done both synchronously
 /// and asynchronously.
-pub struct I2o2Scheduler<G = DynamicGuard> {
-    ring: IoUring,
+pub struct I2o2Scheduler<G = DynamicGuard, M = mode::EntrySize64>
+where
+    M: mode::RingMode,
+{
+    ring: IoUring<M::SQEntry, M::CQEntry>,
     state: TrackedState<G>,
     /// A waker handle for triggering a completion event on `self`
     /// intern causing events to be processed.
     self_waker: RingWaker,
     /// A stream of incoming IO events to process.
-    incoming: flume::Receiver<Message<G>>,
+    incoming: flume::Receiver<Message<G, M::SQEntry>>,
     /// A backlog of IO events to process once the queue has available space.
     ///
     /// The entries in this backlog have already had user data assigned to them
     /// and can be copied directly to the queue.
-    backlog: VecDeque<Entry>,
+    backlog: VecDeque<M::SQEntry>,
     /// A null pointer used to prevent people from sending the scheduler across
     _anti_send_ptr: *mut u8,
 }
 
-impl<G> I2o2Scheduler<G> {
+impl<G, M> I2o2Scheduler<G, M>
+where
+    M: mode::RingMode,
+{
     /// Run the scheduler in the current thread until it is shut down.
     ///
     /// This will wait for all remaining tasks to complete.
@@ -240,7 +247,7 @@ impl<G> I2o2Scheduler<G> {
         });
 
         let (submitter, sq, cq) = self.ring.split();
-        let mut runner = RingRunner {
+        let mut runner: RingRunner<'_, G, M> = RingRunner {
             submitter,
             sq,
             cq,
@@ -267,19 +274,22 @@ impl<G> I2o2Scheduler<G> {
     }
 }
 
-struct RingRunner<'ring, G> {
+struct RingRunner<'ring, G, M: mode::RingMode> {
     submitter: Submitter<'ring>,
-    sq: SubmissionQueue<'ring>,
-    cq: CompletionQueue<'ring>,
+    sq: SubmissionQueue<'ring, M::SQEntry>,
+    cq: CompletionQueue<'ring, M::CQEntry>,
     state: &'ring mut TrackedState<G>,
     self_waker: &'ring mut RingWaker,
-    backlog: &'ring mut VecDeque<Entry>,
-    incoming: &'ring flume::Receiver<Message<G>>,
-    pending_future: Option<RecvFut<'ring, Message<G>>>,
+    backlog: &'ring mut VecDeque<M::SQEntry>,
+    incoming: &'ring flume::Receiver<Message<G, M::SQEntry>>,
+    pending_future: Option<RecvFut<'ring, Message<G, M::SQEntry>>>,
     shutdown: bool,
 }
 
-impl<'ring, G> RingRunner<'ring, G> {
+impl<'ring, G, M> RingRunner<'ring, G, M>
+where
+    M: mode::RingMode,
+{
     /// Run a single cycle of the event loop.
     ///
     /// This executes steps in the order of:
@@ -478,7 +488,7 @@ impl<'ring, G> RingRunner<'ring, G> {
         }
     }
 
-    fn handle_message(&mut self, message: Message<G>) {
+    fn handle_message(&mut self, message: Message<G, M::SQEntry>) {
         match message {
             Message::OpMany(ops) => {
                 for op in ops {
@@ -491,7 +501,7 @@ impl<'ring, G> RingRunner<'ring, G> {
         }
     }
 
-    fn handle_io_op(&mut self, op: Packaged<Entry, G>) {
+    fn handle_io_op(&mut self, op: Packaged<M::SQEntry, G>) {
         let entry = self.state.register(op);
         self.push_entry(entry);
     }
@@ -562,7 +572,7 @@ impl<'ring, G> RingRunner<'ring, G> {
         }
     }
 
-    fn push_entry(&mut self, entry: Entry) {
+    fn push_entry(&mut self, entry: M::SQEntry) {
         // SAFETY: Responsibility about ensuring entry validity is pushed to the caller
         //         on the handle side.
         if unsafe { self.sq.push(&entry).is_err() } {
@@ -611,7 +621,7 @@ impl<G> TrackedState<G> {
         self.replies.len()
     }
 
-    fn register(&mut self, op: Packaged<Entry, G>) -> Entry {
+    fn register<E: SQEntryOptions>(&mut self, op: Packaged<E, G>) -> E {
         let Packaged { data, reply, guard } = op;
 
         let reply_idx = self.replies.insert(reply);
@@ -678,13 +688,13 @@ impl<G> TrackedState<G> {
 }
 
 /// An operation to for the scheduler to process.
-enum Message<G = DynamicGuard> {
+enum Message<G, E> {
     /// Submit many IO operations to the kernel.
     ///
     /// This can help avoid overhead with the channel communication.
-    OpMany(SmallVec<[Packaged<Entry, G>; 3]>),
+    OpMany(SmallVec<[Packaged<E, G>; 3]>),
     /// Submit one IO operation to the kernel.
-    OpOne(Packaged<Entry, G>),
+    OpOne(Packaged<E, G>),
     /// Register a new resource to the ring.
     RegisterResource(Packaged<Resource, G>),
     /// Unregister an existing resource on the ring.

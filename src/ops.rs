@@ -1,15 +1,16 @@
 use io_uring::opcode;
-use io_uring::squeue::Entry;
+
+use crate::mode;
 
 /// A [RingOp] is a [opcode] that is valid to use via the I2o2 interface.
 ///
 /// This trait mostly exists to prevent foot guns around registered buffers, etc...
-pub trait RingOp: sealed::Sealed {
+pub trait RingOp<M: mode::RingMode = mode::EntrySize64>: sealed::Sealed {
     /// Consume `self` and return the raw submission queue entry.
-    fn into_entry(self) -> Entry;
+    fn into_entry(self) -> M::SQEntry;
 
     /// Consume `self` and return a [AnyOpcode] entry.
-    fn into_any_opcode(self) -> AnyOpcode;
+    fn into_any_opcode(self) -> AnyOpcode<M>;
 }
 
 mod sealed {
@@ -20,15 +21,15 @@ macro_rules! impl_ring_op {
     ($t:ty) => {
         impl sealed::Sealed for $t {}
 
-        impl RingOp for $t {
+        impl<M: mode::RingMode> RingOp<M> for $t {
             #[inline]
-            fn into_entry(self) -> Entry {
-                self.build()
+            fn into_entry(self) -> M::SQEntry {
+                self.build().into()
             }
 
             #[inline]
-            fn into_any_opcode(self) -> AnyOpcode {
-                AnyOpcode(self.into_entry())
+            fn into_any_opcode(self) -> AnyOpcode<M> {
+                AnyOpcode(<Self as RingOp<M>>::into_entry(self))
             }
         }
     };
@@ -114,18 +115,18 @@ impl_ring_op!(opcode::WaitId);
 
 /// A helper type that allows you to mix and match ops as part of the bulk API
 /// without having to box.
-pub struct AnyOpcode(Entry);
+pub struct AnyOpcode<M: mode::RingMode = mode::EntrySize64>(M::SQEntry);
 
-impl sealed::Sealed for AnyOpcode {}
+impl<M: mode::RingMode> sealed::Sealed for AnyOpcode<M> {}
 
-impl RingOp for AnyOpcode {
+impl<M: mode::RingMode> RingOp<M> for AnyOpcode<M> {
     #[inline]
-    fn into_entry(self) -> Entry {
+    fn into_entry(self) -> M::SQEntry {
         self.0
     }
 
     #[inline]
-    fn into_any_opcode(self) -> AnyOpcode {
+    fn into_any_opcode(self) -> Self {
         self
     }
 }
@@ -136,7 +137,12 @@ mod tests {
 
     #[test]
     fn test_any_opcode() {
-        let mut foo = opcode::Nop::new().into_any_opcode();
+        let mut foo: AnyOpcode = opcode::Nop::new().into_any_opcode();
+        foo = foo.into_any_opcode();
+        let _entry = foo.into_entry();
+
+        let mut foo: AnyOpcode<mode::EntrySize128> =
+            opcode::Nop::new().into_any_opcode();
         foo = foo.into_any_opcode();
         let _entry = foo.into_entry();
     }

@@ -1,6 +1,8 @@
 # I2o2
 
-A tiny scheduler for executing IO calls with an io_uring executor.
+A tiny scheduler for executing IO calls with an io_uring executor which aims to be flexible while still being
+simple to set up, in particular it supports _both_ 64 byte and 128 byte operating modes of io_uring which means
+NVME pass through is supported.
 
 This project is designed for [lnx](https://github.com/lnx-search/lnx) as a replacement to glommio's file system API
 and is a relatively low-level API.
