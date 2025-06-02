@@ -13,8 +13,7 @@ use std::any::Any;
 use std::collections::VecDeque;
 use std::io;
 use std::task::Poll;
-
-use flume::r#async::RecvFut;
+use std::time::Instant;
 use futures_util::FutureExt;
 use io_uring::{CompletionQueue, IoUring, SubmissionQueue, Submitter};
 pub use io_uring::{opcode, types};
@@ -220,7 +219,7 @@ where
     /// intern causing events to be processed.
     self_waker: RingWaker,
     /// A stream of incoming IO events to process.
-    incoming: flume::Receiver<Message<G, M::SQEntry>>,
+    incoming: kanal::Receiver<Message<G, M::SQEntry>>,
     /// A backlog of IO events to process once the queue has available space.
     ///
     /// The entries in this backlog have already had user data assigned to them
@@ -281,8 +280,8 @@ struct RingRunner<'ring, G, M: mode::RingMode> {
     state: &'ring mut TrackedState<G>,
     self_waker: &'ring mut RingWaker,
     backlog: &'ring mut VecDeque<M::SQEntry>,
-    incoming: &'ring flume::Receiver<Message<G, M::SQEntry>>,
-    pending_future: Option<RecvFut<'ring, Message<G, M::SQEntry>>>,
+    incoming: &'ring kanal::Receiver<Message<G, M::SQEntry>>,
+    pending_future: Option<kanal::ReceiveFuture<'ring, Message<G, M::SQEntry>>>,
     shutdown: bool,
 }
 
@@ -390,7 +389,7 @@ where
         );
 
         'ingest: while !self.sq.is_full() {
-            if let Ok(message) = self.incoming.try_recv() {
+            if let Ok(Some(message)) = self.incoming.try_recv() {
                 self.handle_message(message);
                 continue;
             }
@@ -401,7 +400,7 @@ where
                 let mut context = self.self_waker.context();
                 let future = self
                     .pending_future
-                    .get_or_insert_with(|| self.incoming.recv_async());
+                    .get_or_insert_with(|| self.incoming.as_async().recv());
                 match future.poll_unpin(&mut context) {
                     Poll::Pending => break 'ingest,
                     Poll::Ready(Err(_)) => {
@@ -462,7 +461,8 @@ where
 
     /// Submit all new submission events to the kernel and wait
     /// for completion events to be ready if there is not anymore outstanding work.
-    fn submit_and_maybe_wait(&self) -> io::Result<()> {
+    fn submit_and_maybe_wait(&mut self) -> io::Result<()> {
+        self.cq.sync();
         if !self.has_outstanding_work() {
             #[cfg(feature = "trace-hotpath")]
             tracing::debug!("waiting for completion events");

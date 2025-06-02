@@ -14,7 +14,7 @@ const NUM_OPS_PER_WORKER: usize = 250_000;
 async fn main() -> io::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let concurrency_levels = [1, 8, 32, 64, 128];
+    let concurrency_levels = [1, 8, 32, 64, 128, 256, 512];
 
     let configs = [
         ("default config", i2o2::builder()),
