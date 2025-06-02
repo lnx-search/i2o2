@@ -95,4 +95,26 @@ impl FileManager {
             TempPath::from_path(path),
         ))
     }
+
+    #[allow(unused)]
+    pub async fn new_async_file(
+        &mut self,
+    ) -> io::Result<tempfile::NamedTempFile<tokio::fs::File>> {
+        self.sequence_id += 1;
+
+        let path = self.base_path.join(format!("stage-{}", self.sequence_id));
+
+        let file = tokio::fs::File::options()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .await?;
+
+        Ok(tempfile::NamedTempFile::from_parts(
+            file,
+            TempPath::from_path(path),
+        ))
+    }
 }
