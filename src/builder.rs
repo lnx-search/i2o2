@@ -270,7 +270,7 @@ impl I2o2Builder {
             Err(io::Error::other("test error triggered by failpoints"))
         });
 
-        let (tx, rx) = kanal::bounded(self.queue_size as usize);
+        let (tx, rx) = flume::bounded(self.queue_size as usize);
         let waker = RingWaker::new()?;
 
         let probe = load_kernel_uring_probe()?;
@@ -308,7 +308,7 @@ impl I2o2Builder {
         G: Send + 'static,
         M: mode::RingMode,
     {
-        let (tx, rx) = kanal::bounded(1);
+        let (tx, rx) = flume::bounded(1);
 
         let task = move || {
             let (scheduler, handle) = self.try_create_inner()?;

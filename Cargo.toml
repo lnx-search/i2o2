@@ -22,7 +22,7 @@ slab = "0.4"
 tracing = "0.1"
 parking_lot = "0.12"
 smallvec = "1.15"
-kanal = "0.1.1"
+flume = "0.11"
 
 # TODO: Replace with newer version of io-uring when/if released.
 io-uring = { git = "https://github.com/ChillFish8/io-uring.git", branch = "chillfish8/add-remaining-register-calls" }

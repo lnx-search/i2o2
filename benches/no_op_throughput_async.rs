@@ -14,17 +14,22 @@ const NUM_OPS_PER_WORKER: usize = 250_000;
 async fn main() -> io::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let concurrency_levels = [1, 8, 32, 64, 128, 256, 512];
+    // 1, 8, 32, 64, 128
+    let concurrency_levels = [256, 512];
 
     let configs = [
-        ("default config", i2o2::builder()),
+        ("default config", i2o2::builder()
+            .with_queue_size(1024)),
         (
             "IO polling w/default timeout",
-            i2o2::builder().with_sqe_polling(true),
+            i2o2::builder()
+                .with_queue_size(1024)
+                .with_sqe_polling(true),
         ),
         (
             "IO polling w/100ms timeout",
             i2o2::builder()
+                .with_queue_size(1024)
                 .with_sqe_polling(true)
                 .with_sqe_polling_timeout(Duration::from_millis(100)),
         ),

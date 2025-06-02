@@ -38,7 +38,7 @@ pub struct I2o2Handle<G = DynamicGuard, M = mode::EntrySize64>
 where
     M: mode::RingMode,
 {
-    inner: kanal::Sender<Message<G, M::SQEntry>>,
+    inner: flume::Sender<Message<G, M::SQEntry>>,
     /// A guard that ensures the runtime is woken when the handle is dropped.
     wake_on_drop: Arc<WakeOnDrop>,
 }
@@ -60,7 +60,7 @@ where
     M: mode::RingMode,
 {
     pub(super) fn new(
-        tx: kanal::Sender<Message<G, M::SQEntry>>,
+        tx: flume::Sender<Message<G, M::SQEntry>>,
         waker: std::task::Waker,
     ) -> Self {
         Self {
@@ -244,8 +244,7 @@ where
 
         async {
             self.inner
-                .as_async()
-                .send(message)
+                .send_async(message)
                 .map_err(|_| SchedulerClosed)
                 .await
                 .map(|_| rx)
@@ -303,8 +302,7 @@ where
 
         async {
             self.inner
-                .as_async()
-                .send(message)
+                .send_async(message)
                 .await
                 .map_err(|_| SchedulerClosed)?;
             Ok(replies.into_iter())
@@ -399,8 +397,7 @@ where
         });
 
         self.inner
-            .as_async()
-            .send(message)
+            .send_async(message)
             .await
             .map_err(|_| RegisterError::SchedulerClosed(SchedulerClosed))?;
         let result = rx.await.map_err(RegisterError::Cancelled)?;
@@ -426,8 +423,7 @@ where
         });
 
         self.inner
-            .as_async()
-            .send(message)
+            .send_async(message)
             .await
             .map_err(|_| RegisterError::SchedulerClosed(SchedulerClosed))?;
         let result = rx.await.map_err(RegisterError::Cancelled)?;
@@ -532,8 +528,7 @@ where
         });
 
         self.inner
-            .as_async()
-            .send(message)
+            .send_async(message)
             .await
             .map_err(|_| RegisterError::SchedulerClosed(SchedulerClosed))?;
         let result = rx.await.map_err(RegisterError::Cancelled)?;
