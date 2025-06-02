@@ -12,6 +12,7 @@ mod wake;
 use std::any::Any;
 use std::collections::VecDeque;
 use std::io;
+use std::pin::Pin;
 use std::task::Poll;
 use std::time::Instant;
 use futures_util::FutureExt;
@@ -219,7 +220,7 @@ where
     /// intern causing events to be processed.
     self_waker: RingWaker,
     /// A stream of incoming IO events to process.
-    incoming: kanal::Receiver<Message<G, M::SQEntry>>,
+    incoming: flume::Receiver<Message<G, M::SQEntry>>,
     /// A backlog of IO events to process once the queue has available space.
     ///
     /// The entries in this backlog have already had user data assigned to them
@@ -280,8 +281,8 @@ struct RingRunner<'ring, G, M: mode::RingMode> {
     state: &'ring mut TrackedState<G>,
     self_waker: &'ring mut RingWaker,
     backlog: &'ring mut VecDeque<M::SQEntry>,
-    incoming: &'ring kanal::Receiver<Message<G, M::SQEntry>>,
-    pending_future: Option<kanal::ReceiveFuture<'ring, Message<G, M::SQEntry>>>,
+    incoming: &'ring flume::Receiver<Message<G, M::SQEntry>>,
+    pending_future: Option<flume::r#async::RecvFut<'ring, Message<G, M::SQEntry>>>,
     shutdown: bool,
 }
 
@@ -389,7 +390,7 @@ where
         );
 
         'ingest: while !self.sq.is_full() {
-            if let Ok(Some(message)) = self.incoming.try_recv() {
+            if let Ok(message) = self.incoming.try_recv() {
                 self.handle_message(message);
                 continue;
             }
@@ -400,7 +401,7 @@ where
                 let mut context = self.self_waker.context();
                 let future = self
                     .pending_future
-                    .get_or_insert_with(|| self.incoming.as_async().recv());
+                    .get_or_insert_with(|| self.incoming.recv_async());
                 match future.poll_unpin(&mut context) {
                     Poll::Pending => break 'ingest,
                     Poll::Ready(Err(_)) => {
