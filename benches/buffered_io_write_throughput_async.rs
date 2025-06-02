@@ -15,7 +15,7 @@ use std::{cmp, io};
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-use crate::io_shared::{BenchmarkResults, FileManager};
+use crate::io_shared::{BenchmarkWriteResults, FileManager};
 
 mod io_shared;
 
@@ -28,7 +28,7 @@ async fn main() -> Result<()> {
 
     let run_id = ulid::Ulid::new();
     let mut file_manger = FileManager::new(run_id, BASE_PATH.as_ref())?;
-    let mut results = BenchmarkResults::default();
+    let mut results = BenchmarkWriteResults::default();
 
     tracing::info!(run_id = %run_id, "starting benchmark");
     run_std_benches(&mut file_manger, &mut results).await?;
@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
 
 async fn run_std_benches(
     file_manger: &mut FileManager,
-    results: &mut BenchmarkResults,
+    results: &mut BenchmarkWriteResults,
 ) -> Result<()> {
     let mut buffer = vec![0; BUFFER_SIZE];
     fastrand::fill(&mut buffer);
@@ -65,7 +65,7 @@ async fn run_std_benches(
 
 async fn run_ring_benches(
     file_manger: &mut FileManager,
-    results: &mut BenchmarkResults,
+    results: &mut BenchmarkWriteResults,
 ) -> Result<()> {
     let mut buffer = vec![0; BUFFER_SIZE];
     fastrand::fill(&mut buffer);
