@@ -62,9 +62,13 @@ name = "no_op_throughput_async"
 harness = false
 
 [[bench]]
-name = "buffered_io_throughput_sync"
+name = "buffered_io_write_throughput_sync"
 harness = false
 
 [[bench]]
-name = "buffered_io_throughput_async"
+name = "buffered_io_write_throughput_async"
+harness = false
+
+[[bench]]
+name = "buffered_io_read_throughput_async"
 harness = false
