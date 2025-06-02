@@ -24,6 +24,7 @@ impl Default for BenchmarkWriteResults {
 }
 
 impl BenchmarkWriteResults {
+    #[allow(unused)]
     pub fn push(
         &mut self,
         name: &str,
@@ -102,6 +103,7 @@ impl Display for BenchmarkRandomReadResults {
     }
 }
 
+#[allow(unused)]
 fn format_duration(dur: Duration) -> String {
     if dur < Duration::from_secs(1) {
         let millis = dur.as_secs_f32() * 1000.0;
@@ -170,6 +172,7 @@ impl FileManager {
         Ok(file)
     }
 
+    #[allow(unused)]
     pub fn new_file(&mut self) -> io::Result<tempfile::NamedTempFile> {
         self.sequence_id += 1;
 

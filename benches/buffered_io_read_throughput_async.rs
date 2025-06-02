@@ -7,13 +7,15 @@
 //! but on my machine that would mean writing 200GB+ of data every time, and I don't really
 //! want that burning through my NVMEs!
 
+use std::collections::VecDeque;
 use std::hint::black_box;
 use std::io;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use tokio::sync::Barrier;
 use tokio::task::JoinSet;
 
@@ -54,7 +56,7 @@ async fn run_std_benches(
     let file_1gb = file_manger.create_random_file(1 << 30).map(Arc::new)?;
 
     for concurrency in [1, 8, 32, 64, 256, 512] {
-        tracing::info!(concurrency, "running benchmark 1gb");
+        tracing::info!(concurrency, "running tokio benchmark 1gb");
         let iops =
             std_random_concurrent_read(file_1gb.clone(), 1 << 30, concurrency).await?;
         results.push("tokio::fs::File", 1 << 30, concurrency, BUFFER_SIZE, iops);
@@ -63,7 +65,7 @@ async fn run_std_benches(
     let file_10gb = file_manger.create_random_file(10 << 30).map(Arc::new)?;
 
     for concurrency in [1, 8, 32, 64, 256, 512] {
-        tracing::info!(concurrency, "running benchmark 10gb");
+        tracing::info!(concurrency, "running tokio benchmark 10gb");
         let iops =
             std_random_concurrent_read(file_10gb.clone(), 10 << 30, concurrency).await?;
         results.push("tokio::fs::File", 10 << 30, concurrency, BUFFER_SIZE, iops);
@@ -79,10 +81,34 @@ async fn run_ring_benches(
     let mut buffer = vec![0; BUFFER_SIZE];
     fastrand::fill(&mut buffer);
 
-    let mut file_1gb = file_manger.create_random_file(1 << 30)?;
+    let file_1gb = file_manger.create_random_file(1 << 30).map(Arc::new)?;
 
-    let mut file_10gb = file_manger.create_random_file(10 << 30)?;
+    for concurrency in [1, 8, 32, 64, 256, 512] {
+        tracing::info!(concurrency, "running i2o2 benchmark 1gb");
+        let iops = i2o2_random_concurrent_read(
+            &file_1gb,
+            i2o2::builder(),
+            1 << 30,
+            concurrency,
+        )
+        .await?;
+        results.push("i2o2 default", 1 << 30, concurrency, BUFFER_SIZE, iops);
+    }
 
+    let file_10gb = file_manger.create_random_file(10 << 30).map(Arc::new)?;
+
+    // for concurrency in [1, 8, 32, 64, 256, 512] {
+    //     tracing::info!(concurrency, "running i2o2 benchmark 10gb");
+    //     let iops = i2o2_random_concurrent_read(
+    //         &file_10gb,
+    //         i2o2::builder(),
+    //         10 << 30,
+    //         concurrency,
+    //     )
+    //     .await?;
+    //     results.push("i2o2 default", 10 << 30, concurrency, BUFFER_SIZE, iops);
+    // }
+    
     Ok(())
 }
 
@@ -106,10 +132,11 @@ async fn std_random_concurrent_read(
             let start = Instant::now();
             for _ in 0..NUM_IOPS_PER_WORKER {
                 let block_idx = fastrand::usize(0..file_len / BUFFER_SIZE);
-                file.read_at(&mut buffer[..], (block_idx * BUFFER_SIZE) as u64)?;
+                let n = file.read_at(&mut buffer[..], (block_idx * BUFFER_SIZE) as u64)?;
+                assert_eq!(n, BUFFER_SIZE);
                 black_box(&buffer);
             }
-
+            
             Ok::<_, io::Error>(start.elapsed())
         });
     }
@@ -121,7 +148,125 @@ async fn std_random_concurrent_read(
         total += timing?;
     }
 
+    let op_avg_time = (total / concurrency as u32).as_secs_f32() / NUM_IOPS_PER_WORKER as f32;
+    eprintln!("{:.2}us per op", op_avg_time * 1000.0 * 1000.0);
+    
     let iops = NUM_IOPS_PER_WORKER as f32 / (total / concurrency as u32).as_secs_f32();
 
+    Ok(iops)
+}
+
+async fn i2o2_random_concurrent_read(
+    file: &std::fs::File,
+    builder: i2o2::I2o2Builder,
+    file_len: usize,
+    concurrency: usize,
+) -> Result<f32> {
+    let (scheduler_thread, handle) = builder
+        .with_sqe_polling(true)
+        .with_num_registered_buffers(concurrency as u32)
+        .with_num_registered_files(1)
+        .try_spawn::<()>()?;
+
+    let fd = file.as_raw_fd();
+    handle.register_file_async(fd, None).await?;
+    
+    // let barrier = Arc::new(Barrier::new(concurrency));
+    // let mut set = JoinSet::new();
+    // 
+    // for _ in 0..concurrency {
+    //     let handle = handle.clone();
+    //     let barrier = barrier.clone();
+    // 
+    //     let mut buffer = vec![0; BUFFER_SIZE];
+    //     let index = unsafe {
+    //         handle.register_buffer_async(
+    //             buffer.as_mut_ptr(),
+    //             buffer.len(),
+    //             None,
+    //         ).await?
+    //     };
+    //     
+    //     set.spawn(async move {       
+    //         let _ = barrier.wait().await;
+    // 
+    //         let mut backlog = VecDeque::new();
+    //         
+    //         let start = Instant::now();
+    //         for _ in 0..NUM_IOPS_PER_WORKER {
+    //             let block_idx = fastrand::usize(0..file_len / BUFFER_SIZE);
+    // 
+    //             let op = i2o2::opcode::ReadFixed::new(
+    //                 i2o2::types::Fd(fd),
+    //                 buffer.as_mut_ptr(),
+    //                 buffer.len() as u32,
+    //                 index as u16,
+    //             )
+    //             .offset((block_idx * BUFFER_SIZE) as u64);
+    // 
+    //             let reply = unsafe { handle.submit_async(op, None).await? };
+    //             backlog.push_back(reply);
+    //             
+    //             if backlog.len() > 4 {
+    //                 let reply = backlog.pop_front().unwrap();
+    //                 let n = reply.await?;
+    //                 if n < 0 {
+    //                     bail!("IO error from read: {}", io::Error::from_raw_os_error(-n));
+    //                 }
+    //             }
+    //             
+    //         }
+    //         
+    //         for reply in backlog {
+    //             let n = reply.await?;
+    //             if n < 0 {
+    //                 bail!("IO error from read: {}", io::Error::from_raw_os_error(-n));
+    //             }
+    //         }
+    // 
+    //         black_box(&buffer);
+    //         
+    //         Ok::<_, anyhow::Error>(start.elapsed())
+    //     });
+    // }
+    // 
+    // let timings = set.join_all().await;
+    // 
+    // let mut total = Duration::default();
+    // for timing in timings {
+    //     total += timing?;
+    // }
+
+    let start = Instant::now();
+
+    let mut replies = Vec::new();
+    for _ in 0..NUM_IOPS_PER_WORKER {
+        // let op = i2o2::opcode::Read::new(
+        //     i2o2::types::Fd(fd),
+        //     buffer.as_mut_ptr(),
+        //     buffer.len() as u32,
+        // )
+        //     .offset((block_idx * BUFFER_SIZE) as u64);
+
+        let op = i2o2::opcode::Nop::new();
+        let reply = unsafe { handle.submit_async(op, None).await? };
+        replies.push(reply);
+    }
+
+    for reply in replies {
+        let _result = reply.await?;
+    }
+    
+    let elapsed = start.elapsed();
+    eprintln!("{:.2}us per op", (elapsed.as_secs_f32() / NUM_IOPS_PER_WORKER as f32) * 1000.0 * 1000.0);
+    
+    // let op_avg_time = (total / concurrency as u32).as_secs_f32() / NUM_IOPS_PER_WORKER as f32;
+    // eprintln!("{:.2}us per op", op_avg_time * 1000.0 * 1000.0);
+    
+    let iops = NUM_IOPS_PER_WORKER as f32 / (elapsed / concurrency as u32).as_secs_f32();
+
+    drop(handle);
+    scheduler_thread.join().unwrap()?;
+    
     Ok(iops)
 }
