@@ -4,17 +4,18 @@ use std::io;
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
-mod shared;
+mod no_op_shared;
 
 const NUM_OPS_PER_WORKER: usize = 250_000;
 
 fn main() -> io::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let concurrency_levels = [1, 2, 4, 8, 16];
+    let concurrency_levels = [1, 8, 16, 32];
 
     let configs = [
         ("default config", i2o2::builder()),
+        ("defer task run", i2o2::builder().with_defer_task_run(true)),
         (
             "IO polling w/default timeout",
             i2o2::builder().with_sqe_polling(true),
@@ -22,12 +23,13 @@ fn main() -> io::Result<()> {
         (
             "IO polling w/100ms timeout",
             i2o2::builder()
+                .with_queue_size(128)
                 .with_sqe_polling(true)
-                .with_sqe_polling_timeout(Duration::from_millis(100)),
+                .with_sqe_polling_timeout(Duration::from_millis(500)),
         ),
     ];
 
-    let mut results = shared::BenchmarkResults::default();
+    let mut results = no_op_shared::BenchmarkResults::default();
 
     for (name, config) in configs {
         eprintln!("running benchmark for config: {config:?}");

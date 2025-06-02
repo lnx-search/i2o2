@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Barrier;
 
-mod shared;
+mod no_op_shared;
 
 const NUM_OPS_PER_WORKER: usize = 250_000;
 
@@ -14,7 +14,7 @@ const NUM_OPS_PER_WORKER: usize = 250_000;
 async fn main() -> io::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let concurrency_levels = [1, 2, 4, 8, 16];
+    let concurrency_levels = [1, 8, 32, 64, 128];
 
     let configs = [
         ("default config", i2o2::builder()),
@@ -30,7 +30,7 @@ async fn main() -> io::Result<()> {
         ),
     ];
 
-    let mut results = shared::BenchmarkResults::default();
+    let mut results = no_op_shared::BenchmarkResults::default();
 
     for (name, config) in configs {
         eprintln!("running benchmark for config: {config:?}");
