@@ -8,7 +8,7 @@ use io_uring::IoUring;
 
 use crate::handle::I2o2Handle;
 use crate::wake::RingWaker;
-use crate::{I2o2Scheduler, TrackedState, mode};
+use crate::{I2o2Scheduler, TrackedState, mode, wake};
 
 type SchedulerThreadHandle = std::thread::JoinHandle<io::Result<()>>;
 
@@ -271,7 +271,7 @@ impl I2o2Builder {
         });
 
         let (tx, rx) = flume::bounded(self.queue_size as usize);
-        let waker = RingWaker::new()?;
+        let (waker, controller) = wake::new()?;
 
         let probe = load_kernel_uring_probe()?;
         if !kernel_is_at_least(&probe, VersionInterest::V5_15) {
@@ -284,7 +284,7 @@ impl I2o2Builder {
         self.setup_registered_resources::<M>(&probe, &ring)?;
         tracing::debug!("successfully registered resources with ring");
 
-        let handle = I2o2Handle::new(tx, waker.task_waker());
+        let handle = I2o2Handle::new(tx, waker);
 
         let scheduler = I2o2Scheduler {
             ring,
@@ -292,7 +292,7 @@ impl I2o2Builder {
                 self.num_registered_files,
                 self.num_registered_buffers,
             ),
-            self_waker: waker,
+            waker_controller: controller,
             incoming: rx,
             backlog: VecDeque::new(),
             _anti_send_ptr: std::ptr::null_mut(),
