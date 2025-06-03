@@ -4,6 +4,7 @@ mod builder;
 mod handle;
 pub mod mode;
 mod ops;
+mod queue;
 mod reply;
 #[cfg(test)]
 mod tests;
@@ -15,6 +16,7 @@ use std::io;
 use std::pin::Pin;
 use std::task::Poll;
 use std::time::Instant;
+
 use futures_util::FutureExt;
 use io_uring::{CompletionQueue, IoUring, SubmissionQueue, Submitter};
 pub use io_uring::{opcode, types};
@@ -24,7 +26,6 @@ pub use crate::builder::I2o2Builder;
 pub use crate::handle::{I2o2Handle, RegisterError, SchedulerClosed, SubmitResult};
 use crate::mode::{CQEntryOptions, SQEntryOptions};
 pub use crate::ops::{AnyOpcode, RingOp};
-use crate::wake::RingWaker;
 
 #[cfg(not(target_os = "linux"))]
 compiler_error!(
@@ -218,7 +219,7 @@ where
     state: TrackedState<G>,
     /// A waker handle for triggering a completion event on `self`
     /// intern causing events to be processed.
-    self_waker: RingWaker,
+    waker_controller: wake::RingWakerController,
     /// A stream of incoming IO events to process.
     incoming: flume::Receiver<Message<G, M::SQEntry>>,
     /// A backlog of IO events to process once the queue has available space.
@@ -252,10 +253,9 @@ where
             sq,
             cq,
             state: &mut self.state,
-            self_waker: &mut self.self_waker,
+            self_waker: &mut self.waker_controller,
             backlog: &mut self.backlog,
             incoming: &self.incoming,
-            pending_future: None,
             shutdown: false,
         };
 
@@ -279,10 +279,9 @@ struct RingRunner<'ring, G, M: mode::RingMode> {
     sq: SubmissionQueue<'ring, M::SQEntry>,
     cq: CompletionQueue<'ring, M::CQEntry>,
     state: &'ring mut TrackedState<G>,
-    self_waker: &'ring mut RingWaker,
+    self_waker: &'ring mut wake::RingWakerController,
     backlog: &'ring mut VecDeque<M::SQEntry>,
     incoming: &'ring flume::Receiver<Message<G, M::SQEntry>>,
-    pending_future: Option<flume::r#async::RecvFut<'ring, Message<G, M::SQEntry>>>,
     shutdown: bool,
 }
 
@@ -389,33 +388,11 @@ where
             "ingesting new entries from incoming"
         );
 
-        'ingest: while !self.sq.is_full() {
-            if let Ok(message) = self.incoming.try_recv() {
-                self.handle_message(message);
-                continue;
-            }
+        while let Ok(message) = self.incoming.try_recv() {
+            self.handle_message(message);
 
-            // We must continue until we get either a disconnect or `pending` state
-            // so we can be sure the waker is registered.
-            loop {
-                let mut context = self.self_waker.context();
-                let future = self
-                    .pending_future
-                    .get_or_insert_with(|| self.incoming.recv_async());
-                match future.poll_unpin(&mut context) {
-                    Poll::Pending => break 'ingest,
-                    Poll::Ready(Err(_)) => {
-                        #[cfg(feature = "trace-hotpath")]
-                        tracing::debug!("scheduler handle has been disconnected");
-                        self.pending_future = None;
-                        self.shutdown = true;
-                        break 'ingest;
-                    },
-                    Poll::Ready(Ok(message)) => {
-                        self.pending_future = None;
-                        self.handle_message(message)
-                    },
-                }
+            if self.sq.is_full() {
+                break;
             }
         }
         self.sq.sync();
@@ -456,7 +433,13 @@ where
     /// This is used to wake the scheduler when new `incoming` operations are available
     /// while waiting for completion events.
     fn maybe_register_waker(&mut self) {
-        self.self_waker.maybe_submit_self(&mut self.sq);
+        if self.incoming.is_empty() {
+            if let Some(op) = self.self_waker.get_sqe_if_needed() {
+                if self.push_entry(op) {
+                    self.self_waker.mark_set();
+                }
+            }
+        }
         self.sq.sync();
     }
 
@@ -579,11 +562,14 @@ where
         }
     }
 
-    fn push_entry(&mut self, entry: M::SQEntry) {
+    fn push_entry(&mut self, entry: M::SQEntry) -> bool {
         // SAFETY: Responsibility about ensuring entry validity is pushed to the caller
         //         on the handle side.
         if unsafe { self.sq.push(&entry).is_err() } {
             self.backlog.push_back(entry);
+            false
+        } else {
+            true
         }
     }
 

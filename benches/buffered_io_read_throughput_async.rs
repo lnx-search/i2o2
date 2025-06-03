@@ -108,7 +108,7 @@ async fn run_ring_benches(
     //     .await?;
     //     results.push("i2o2 default", 10 << 30, concurrency, BUFFER_SIZE, iops);
     // }
-    
+
     Ok(())
 }
 
@@ -132,11 +132,12 @@ async fn std_random_concurrent_read(
             let start = Instant::now();
             for _ in 0..NUM_IOPS_PER_WORKER {
                 let block_idx = fastrand::usize(0..file_len / BUFFER_SIZE);
-                let n = file.read_at(&mut buffer[..], (block_idx * BUFFER_SIZE) as u64)?;
+                let n =
+                    file.read_at(&mut buffer[..], (block_idx * BUFFER_SIZE) as u64)?;
                 assert_eq!(n, BUFFER_SIZE);
                 black_box(&buffer);
             }
-            
+
             Ok::<_, io::Error>(start.elapsed())
         });
     }
@@ -168,55 +169,54 @@ async fn i2o2_random_concurrent_read(
 
     let fd = file.as_raw_fd();
     handle.register_file_async(fd, None).await?;
-    
+
     let barrier = Arc::new(Barrier::new(concurrency));
     let mut set = JoinSet::new();
-    
+
     for _ in 0..concurrency {
         let handle = handle.clone();
         let barrier = barrier.clone();
-    
-        
-        set.spawn(async move {       
+
+        set.spawn(async move {
             let _ = barrier.wait().await;
-    
+
             let mut buffer = vec![0; BUFFER_SIZE];
-            
+
             let start = Instant::now();
             for _ in 0..NUM_IOPS_PER_WORKER {
                 let block_idx = fastrand::usize(0..file_len / BUFFER_SIZE);
-    
+
                 let op = i2o2::opcode::Read::new(
                     i2o2::types::Fd(fd),
                     buffer.as_mut_ptr(),
                     buffer.len() as u32,
                 )
                 .offset((block_idx * BUFFER_SIZE) as u64);
-    
+
                 let reply = unsafe { handle.submit_async(op, None).await? };
                 let n = reply.await?;
                 if n < 0 {
                     bail!("IO error from read: {}", io::Error::from_raw_os_error(-n));
-                }     
+                }
             }
-            
+
             black_box(&buffer);
-            
+
             Ok::<_, anyhow::Error>(start.elapsed())
         });
     }
-    
+
     let timings = set.join_all().await;
-    
+
     let mut total = Duration::default();
     for timing in timings {
         total += timing?;
     }
-   
+
     let iops = NUM_IOPS_PER_WORKER as f32 / (total / concurrency as u32).as_secs_f32();
 
     drop(handle);
     scheduler_thread.join().unwrap()?;
-    
+
     Ok(iops)
 }

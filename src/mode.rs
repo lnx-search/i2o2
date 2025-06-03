@@ -36,11 +36,7 @@ impl RingMode for EntrySize128 {
 }
 
 pub trait SQEntryOptions:
-    io_uring::squeue::EntryMarker 
-    + From<io_uring::squeue::Entry> 
-    + Unpin
-    + Send 
-    + 'static
+    io_uring::squeue::EntryMarker + From<io_uring::squeue::Entry> + Unpin + Send + 'static
 {
     fn user_data(self, data: u64) -> Self;
 }

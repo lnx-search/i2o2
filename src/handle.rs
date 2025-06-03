@@ -1,5 +1,4 @@
 use std::io;
-use std::sync::Arc;
 
 use smallvec::SmallVec;
 
@@ -39,8 +38,7 @@ where
     M: mode::RingMode,
 {
     inner: flume::Sender<Message<G, M::SQEntry>>,
-    /// A guard that ensures the runtime is woken when the handle is dropped.
-    wake_on_drop: Arc<WakeOnDrop>,
+    waker: super::wake::RingWaker,
 }
 
 impl<G, M> Clone for I2o2Handle<G, M>
@@ -50,7 +48,7 @@ where
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
-            wake_on_drop: self.wake_on_drop.clone(),
+            waker: self.waker.clone(),
         }
     }
 }
@@ -61,12 +59,9 @@ where
 {
     pub(super) fn new(
         tx: flume::Sender<Message<G, M::SQEntry>>,
-        waker: std::task::Waker,
+        waker: super::wake::RingWaker,
     ) -> Self {
-        Self {
-            inner: tx,
-            wake_on_drop: Arc::new(WakeOnDrop(waker)),
-        }
+        Self { inner: tx, waker }
     }
 }
 

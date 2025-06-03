@@ -1,112 +1,126 @@
 use std::io;
-use std::os::fd::RawFd;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use io_uring::{SubmissionQueue, opcode, types};
+use io_uring::{opcode, types};
 
-use super::flags;
+use crate::flags;
+use crate::mode::SQEntryOptions;
 
-/// An EventFD based waker for the io_uring ring.
+/// Create a new waker pair.
+pub(super) fn new() -> io::Result<(RingWaker, RingWakerController)> {
+    let guard = WakerGuard::new()?;
+    let waker_ref = Arc::new(guard);
+
+    let waker = RingWaker {
+        waker_ref: waker_ref.clone(),
+    };
+
+    let controller = RingWakerController {
+        value: 0,
+        is_set: false,
+        waker_ref,
+    };
+
+    Ok((waker, controller))
+}
+
+#[derive(Clone)]
+/// The ring waker notifies the scheduler that there is outstanding operations
+/// to submit to the submission queue ring.
 pub(super) struct RingWaker {
-    event_fd: RawFd,
-    counter: u64,
-    waker: std::task::Waker,
-    is_set: bool,
+    waker_ref: Arc<WakerGuard>,
 }
 
 impl RingWaker {
-    /// Creates a new waker for the ring.
-    pub(super) fn new() -> io::Result<Self> {
-        let event_fd = unsafe { libc::eventfd(0, 0) };
-        if event_fd < 0 {
-            return Err(io::Error::last_os_error());
+    pub(super) fn maybe_wake(&self) {
+        let waker = self.waker_ref.as_ref();
+
+        let wants_wake = waker.wants_wake.load(Ordering::SeqCst);
+        if wants_wake {
+            if let Some(_guard) = waker.guard.try_lock() {
+                waker.wake();
+            }
         }
+    }
+}
 
-        let inner = Arc::new(EventFdWaker {
-            event_fd,
-            is_closed: false,
-        });
-        let waker = std::task::Waker::from(inner);
+pub(super) struct RingWakerController {
+    value: u64,
+    is_set: bool,
+    waker_ref: Arc<WakerGuard>,
+}
 
-        Ok(Self {
-            event_fd,
-            counter: 0,
-            waker,
-            is_set: false,
-        })
+impl RingWakerController {
+    pub(super) fn mark_set(&mut self) {
+        self.is_set = true;
+        let waker = self.waker_ref.as_ref();
+        waker.wants_wake.store(true, Ordering::SeqCst);
     }
 
     pub(super) fn mark_unset(&mut self) {
-        #[cfg(feature = "trace-hotpath")]
-        tracing::trace!("waker has been unset");
         self.is_set = false;
+        let waker = self.waker_ref.as_ref();
+        waker.wants_wake.store(false, Ordering::SeqCst);
     }
 
-    pub(super) fn maybe_submit_self<E: io_uring::squeue::EntryMarker>(
-        &mut self,
-        submission: &mut SubmissionQueue<'_, E>,
-    ) -> bool {
+    pub(super) fn get_sqe_if_needed<E: SQEntryOptions>(&mut self) -> Option<E> {
         if self.is_set {
-            #[cfg(feature = "trace-hotpath")]
-            tracing::trace!("waker already registered");
-            return true;
+            return None;
         }
 
+        let waker = self.waker_ref.as_ref();
         let entry = opcode::Read::new(
-            types::Fd(self.event_fd),
-            (&mut self.counter) as *mut u64 as *mut _,
-            size_of::<u64>() as u32,
+            types::Fd(waker.fd),
+            (&mut self.value) as *mut u64 as *mut _,
+            8,
         )
         .build()
         .user_data(flags::pack(flags::Flag::EventFdWaker, 0, 0))
         .into();
-        self.is_set = unsafe { submission.push(&entry).is_ok() };
 
-        #[cfg(feature = "trace-hotpath")]
-        tracing::trace!(is_set = self.is_set, "submitting self waker to queue");
-
-        self.is_set
-    }
-
-    pub(super) fn task_waker(&self) -> std::task::Waker {
-        self.waker.clone()
-    }
-
-    /// Creates a new [std::task::Context] with a waker for the current ring.
-    pub(super) fn context(&self) -> std::task::Context {
-        std::task::Context::from_waker(&self.waker)
+        Some(entry)
     }
 }
 
-struct EventFdWaker {
-    event_fd: RawFd,
+/// The waker guard wraps an eventfd handle and gracefully
+/// closes the eventfd when it is dropped.
+struct WakerGuard {
+    fd: libc::c_int,
+    wants_wake: AtomicBool,
+    guard: parking_lot::Mutex<()>,
     is_closed: bool,
 }
 
-impl EventFdWaker {
-    fn wake_inner(&self) {
-        let result = unsafe { libc::eventfd_write(self.event_fd, 1) };
-        assert_ne!(result, -1);
+impl WakerGuard {
+    fn new() -> io::Result<Self> {
+        let fd = unsafe { libc::eventfd(0, 0) };
+        if fd < 0 {
+            return Err(io::Error::from_raw_os_error(-fd));
+        }
+
+        Ok(Self {
+            fd,
+            wants_wake: AtomicBool::new(false),
+            guard: parking_lot::Mutex::new(()),
+            is_closed: false,
+        })
+    }
+
+    pub(super) fn wake(&self) {
+        unsafe {
+            libc::eventfd_write(self.fd, 1);
+        }
     }
 }
 
-impl std::task::Wake for EventFdWaker {
-    fn wake(self: Arc<Self>) {
-        self.wake_inner()
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.wake_inner()
-    }
-}
-
-impl Drop for EventFdWaker {
+impl Drop for WakerGuard {
     fn drop(&mut self) {
-        // We can close the fd on drop here because this inner type
-        // is only dropped once all references to the waker are dropped, including
-        // the ring.
-        if !self.is_closed {
-            let _ = unsafe { libc::close(self.event_fd) };
+        if self.is_closed {
+            self.wake();
+            unsafe {
+                let _ = libc::close(self.fd);
+            };
             self.is_closed = true;
         }
     }
@@ -114,22 +128,34 @@ impl Drop for EventFdWaker {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[test]
     fn test_wake_behaviour() {
-        let ring_waker = RingWaker::new().expect("create eventfd");
+        let (waker, mut controller) = super::new().expect("create eventfd");
 
-        let task_waker = ring_waker.task_waker();
-        task_waker.wake();
-        let mut result: u64 = 0;
-        unsafe { libc::eventfd_read(ring_waker.event_fd, (&mut result) as *mut _) };
-        assert_eq!(result, 1);
+        // Used to prevent the eventfd blocking
+        unsafe {
+            libc::eventfd_write(controller.waker_ref.fd, 1);
+        };
 
-        let task_waker = ring_waker.task_waker();
-        task_waker.wake_by_ref();
-        let mut result: u64 = 0;
-        unsafe { libc::eventfd_read(ring_waker.event_fd, (&mut result) as *mut _) };
-        assert_eq!(result, 1);
+        // We shouldn't wake because the controller hasn't asked for it.
+        waker.maybe_wake();
+
+        let mut value: u64 = 0;
+        unsafe {
+            libc::eventfd_read(controller.waker_ref.fd, (&mut value) as *mut _);
+        }
+        assert_eq!(value, 1);
+
+        controller.mark_set();
+
+        // We should wake now since the controller has asked for it.
+        waker.maybe_wake();
+
+        let mut value: u64 = 0;
+        unsafe {
+            libc::eventfd_read(controller.waker_ref.fd, (&mut value) as *mut _);
+        }
+        assert_eq!(value, 1);
     }
 }

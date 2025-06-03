@@ -18,13 +18,10 @@ async fn main() -> io::Result<()> {
     let concurrency_levels = [256, 512];
 
     let configs = [
-        ("default config", i2o2::builder()
-            .with_queue_size(1024)),
+        ("default config", i2o2::builder().with_queue_size(1024)),
         (
             "IO polling w/default timeout",
-            i2o2::builder()
-                .with_queue_size(1024)
-                .with_sqe_polling(true),
+            i2o2::builder().with_queue_size(1024).with_sqe_polling(true),
         ),
         (
             "IO polling w/100ms timeout",
