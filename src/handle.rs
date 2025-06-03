@@ -122,10 +122,7 @@ where
             guard,
         });
 
-        self.inner
-            .send(message)
-            .map_err(|_| SchedulerClosed)
-            .map(|_| rx)
+        self.send_sync_inner(message).map(|_| rx)
     }
 
     /// Submit multiple ops to the scheduler.
@@ -176,9 +173,7 @@ where
         pairs: impl IntoIterator<Item = (O, Option<G>)>,
     ) -> SubmitResult<impl IntoIterator<Item = reply::ReplyReceiver>> {
         let (message, replies) = prepare_many_entries(pairs);
-
-        self.inner.send(message).map_err(|_| SchedulerClosed)?;
-
+        self.send_sync_inner(message)?;
         Ok(replies.into_iter())
     }
 
@@ -228,8 +223,6 @@ where
         op: O,
         guard: Option<G>,
     ) -> impl Future<Output = SubmitResult<reply::ReplyReceiver>> + '_ {
-        use futures_util::TryFutureExt;
-
         let (reply, rx) = reply::new();
         let message = Message::OpOne(Packaged {
             data: op.into_entry(),
@@ -237,13 +230,7 @@ where
             guard,
         });
 
-        async {
-            self.inner
-                .send_async(message)
-                .map_err(|_| SchedulerClosed)
-                .await
-                .map(|_| rx)
-        }
+        async { self.send_async_inner(message).await.map(|_| rx) }
     }
 
     /// Submit multiple ops to the scheduler asynchronously waiting if the queue is currently
@@ -296,10 +283,7 @@ where
         let (message, replies) = prepare_many_entries(pairs);
 
         async {
-            self.inner
-                .send_async(message)
-                .await
-                .map_err(|_| SchedulerClosed)?;
+            self.send_async_inner(message).await?;
             Ok(replies.into_iter())
         }
     }
@@ -333,9 +317,8 @@ where
             guard,
         });
 
-        self.inner
-            .send(message)
-            .map_err(|_| RegisterError::SchedulerClosed(SchedulerClosed))?;
+        self.send_sync_inner(message)
+            .map_err(RegisterError::SchedulerClosed)?;
         let result = rx.wait().map_err(RegisterError::Cancelled)?;
         handle_register_resource_result(result)
     }
@@ -355,9 +338,8 @@ where
             guard: None,
         });
 
-        self.inner
-            .send(message)
-            .map_err(|_| RegisterError::SchedulerClosed(SchedulerClosed))?;
+        self.send_sync_inner(message)
+            .map_err(RegisterError::SchedulerClosed)?;
         let result = rx.wait().map_err(RegisterError::Cancelled)?;
         handle_unregister_resource_result(result)
     }
@@ -391,10 +373,9 @@ where
             guard,
         });
 
-        self.inner
-            .send_async(message)
+        self.send_async_inner(message)
             .await
-            .map_err(|_| RegisterError::SchedulerClosed(SchedulerClosed))?;
+            .map_err(RegisterError::SchedulerClosed)?;
         let result = rx.await.map_err(RegisterError::Cancelled)?;
         handle_register_resource_result(result)
     }
@@ -417,10 +398,9 @@ where
             guard: None,
         });
 
-        self.inner
-            .send_async(message)
+        self.send_async_inner(message)
             .await
-            .map_err(|_| RegisterError::SchedulerClosed(SchedulerClosed))?;
+            .map_err(RegisterError::SchedulerClosed)?;
         let result = rx.await.map_err(RegisterError::Cancelled)?;
         handle_unregister_resource_result(result)
     }
@@ -470,9 +450,8 @@ where
             guard,
         });
 
-        self.inner
-            .send(message)
-            .map_err(|_| RegisterError::SchedulerClosed(SchedulerClosed))?;
+        self.send_sync_inner(message)
+            .map_err(RegisterError::SchedulerClosed)?;
         let result = rx.wait().map_err(RegisterError::Cancelled)?;
         handle_register_resource_result(result)
     }
@@ -522,12 +501,37 @@ where
             guard,
         });
 
-        self.inner
-            .send_async(message)
+        self.send_async_inner(message)
             .await
-            .map_err(|_| RegisterError::SchedulerClosed(SchedulerClosed))?;
+            .map_err(RegisterError::SchedulerClosed)?;
         let result = rx.await.map_err(RegisterError::Cancelled)?;
         handle_register_resource_result(result)
+    }
+
+    fn send_sync_inner(
+        &self,
+        message: Message<G, M::SQEntry>,
+    ) -> Result<(), SchedulerClosed> {
+        let result = self.inner.send(message).map_err(|_| SchedulerClosed);
+        if result.is_ok() {
+            self.waker.maybe_wake();
+        }
+        result
+    }
+
+    async fn send_async_inner(
+        &self,
+        message: Message<G, M::SQEntry>,
+    ) -> Result<(), SchedulerClosed> {
+        let result = self
+            .inner
+            .send_async(message)
+            .await
+            .map_err(|_| SchedulerClosed);
+        if result.is_ok() {
+            self.waker.maybe_wake();
+        }
+        result
     }
 }
 
@@ -547,14 +551,6 @@ fn prepare_many_entries<M: mode::RingMode, O: RingOp<M>, G>(
     });
 
     (Message::OpMany(SmallVec::from_iter(iter)), replies)
-}
-
-struct WakeOnDrop(std::task::Waker);
-
-impl Drop for WakeOnDrop {
-    fn drop(&mut self) {
-        self.0.wake_by_ref();
-    }
 }
 
 fn handle_register_resource_result(result: i32) -> Result<u32, RegisterError> {

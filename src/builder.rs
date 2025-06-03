@@ -7,7 +7,6 @@ use std::time::Duration;
 use io_uring::IoUring;
 
 use crate::handle::I2o2Handle;
-use crate::wake::RingWaker;
 use crate::{I2o2Scheduler, TrackedState, mode, wake};
 
 type SchedulerThreadHandle = std::thread::JoinHandle<io::Result<()>>;

@@ -13,11 +13,7 @@ mod wake;
 use std::any::Any;
 use std::collections::VecDeque;
 use std::io;
-use std::pin::Pin;
-use std::task::Poll;
-use std::time::Instant;
 
-use futures_util::FutureExt;
 use io_uring::{CompletionQueue, IoUring, SubmissionQueue, Submitter};
 pub use io_uring::{opcode, types};
 use smallvec::SmallVec;
@@ -256,10 +252,9 @@ where
             self_waker: &mut self.waker_controller,
             backlog: &mut self.backlog,
             incoming: &self.incoming,
-            shutdown: false,
         };
 
-        while !runner.shutdown {
+        while !(self.incoming.is_disconnected() && self.incoming.is_empty()) {
             runner.run()?;
         }
 
@@ -282,7 +277,6 @@ struct RingRunner<'ring, G, M: mode::RingMode> {
     self_waker: &'ring mut wake::RingWakerController,
     backlog: &'ring mut VecDeque<M::SQEntry>,
     incoming: &'ring flume::Receiver<Message<G, M::SQEntry>>,
-    shutdown: bool,
 }
 
 impl<'ring, G, M> RingRunner<'ring, G, M>
@@ -300,7 +294,7 @@ where
     /// 5) Submit outstanding submission events.
     /// 6) Wait for completion events if there is no outstanding work left.
     ///
-    fn run(&mut self) -> io::Result<bool> {
+    fn run(&mut self) -> io::Result<()> {
         self.sq.sync();
         self.cq.sync();
 
@@ -311,7 +305,7 @@ where
 
         self.submit_and_maybe_wait()?;
 
-        Ok(self.shutdown)
+        Ok(())
     }
 
     fn wait_for_remaining(&mut self) -> io::Result<()> {
@@ -449,7 +443,9 @@ where
         self.cq.sync();
         if !self.has_outstanding_work() {
             #[cfg(feature = "trace-hotpath")]
-            tracing::debug!("waiting for completion events");
+            tracing::debug!(
+                "waiting for completion events because there is no outstanding work"
+            );
             self.submit_and_wait()
         } else {
             #[cfg(feature = "trace-hotpath")]
