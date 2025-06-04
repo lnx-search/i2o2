@@ -25,7 +25,7 @@ mod io_shared;
 
 static BASE_PATH: &str = "./benchmark-data";
 const BUFFER_SIZE: usize = 8 << 10;
-const NUM_IOPS_PER_WORKER: usize = 10_0000;
+const NUM_IOPS_PER_WORKER: usize = 100_000;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -55,7 +55,7 @@ async fn run_std_benches(
 
     let file_1gb = file_manger.create_random_file(1 << 30).map(Arc::new)?;
 
-    for concurrency in [1, 8, 32, 64, 256, 512] {
+    for concurrency in [1, 8, 32, 64, 256] {
         tracing::info!(concurrency, "running tokio benchmark 1gb");
         let iops =
             std_random_concurrent_read(file_1gb.clone(), 1 << 30, concurrency).await?;
@@ -64,7 +64,7 @@ async fn run_std_benches(
 
     let file_10gb = file_manger.create_random_file(10 << 30).map(Arc::new)?;
 
-    for concurrency in [1, 8, 32, 64, 256, 512] {
+    for concurrency in [1, 8, 32, 64, 256] {
         tracing::info!(concurrency, "running tokio benchmark 10gb");
         let iops =
             std_random_concurrent_read(file_10gb.clone(), 10 << 30, concurrency).await?;
@@ -97,17 +97,17 @@ async fn run_ring_benches(
 
     let file_10gb = file_manger.create_random_file(10 << 30).map(Arc::new)?;
 
-    // for concurrency in [1, 8, 32, 64, 256, 512] {
-    //     tracing::info!(concurrency, "running i2o2 benchmark 10gb");
-    //     let iops = i2o2_random_concurrent_read(
-    //         &file_10gb,
-    //         i2o2::builder(),
-    //         10 << 30,
-    //         concurrency,
-    //     )
-    //     .await?;
-    //     results.push("i2o2 default", 10 << 30, concurrency, BUFFER_SIZE, iops);
-    // }
+    for concurrency in [1, 8, 32, 64, 256, 512] {
+        tracing::info!(concurrency, "running i2o2 benchmark 10gb");
+        let iops = i2o2_random_concurrent_read(
+            &file_10gb,
+            i2o2::builder(),
+            10 << 30,
+            concurrency,
+        )
+        .await?;
+        results.push("i2o2 default", 10 << 30, concurrency, BUFFER_SIZE, iops);
+    }
 
     Ok(())
 }
@@ -161,14 +161,15 @@ async fn i2o2_random_concurrent_read(
     concurrency: usize,
 ) -> Result<f32> {
     let (scheduler_thread, handle) = builder
-        .with_queue_size(2048)
+        .with_queue_size(512)
         .with_sqe_polling(true)
-        .with_num_registered_buffers(concurrency as u32)
+        .with_sqe_polling_timeout(Duration::from_millis(50))
+        .with_sqe_polling_pin_cpu(8)
         .with_num_registered_files(1)
         .try_spawn::<()>()?;
 
     let fd = file.as_raw_fd();
-    handle.register_file_async(fd, None).await?;
+    // let id = handle.register_file_async(fd, None).await?;
 
     let barrier = Arc::new(Barrier::new(concurrency));
     let mut set = JoinSet::new();
@@ -180,12 +181,12 @@ async fn i2o2_random_concurrent_read(
         set.spawn(async move {
             let _ = barrier.wait().await;
 
-            let mut buffer = vec![0; BUFFER_SIZE];
 
             let start = Instant::now();
             for _ in 0..NUM_IOPS_PER_WORKER {
                 let block_idx = fastrand::usize(0..file_len / BUFFER_SIZE);
 
+                let mut buffer = vec![0; BUFFER_SIZE];
                 let op = i2o2::opcode::Read::new(
                     i2o2::types::Fd(fd),
                     buffer.as_mut_ptr(),
@@ -199,8 +200,6 @@ async fn i2o2_random_concurrent_read(
                     bail!("IO error from read: {}", io::Error::from_raw_os_error(-n));
                 }
             }
-
-            black_box(&buffer);
 
             Ok::<_, anyhow::Error>(start.elapsed())
         });
