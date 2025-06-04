@@ -43,7 +43,9 @@ impl<T> SchedulerSender<T> {
     
     /// Send a new message to the scheduler.
     pub fn send(&self, value: T) {
-        self.inner.queue.push(value)
+        if self.inner.queue.push(value).is_err() {
+            panic!("we ran out of space? {}", self.inner.queue.len());
+        }
     }
     
     /// Returns if the queue holds no items.
@@ -96,14 +98,14 @@ impl<T> Drop for SchedulerReceiver<T> {
 
 struct Inner<T> {
     // TODO: make bounded.
-    queue: crossbeam_queue::SegQueue<T>,
+    queue: crossbeam_queue::ArrayQueue<T>,
     receiver_disconnected: AtomicBool,
 }
 
 impl<T> Inner<T> {
     fn new(_size: usize) -> Self {
         Self {
-            queue: crossbeam_queue::SegQueue::new(),
+            queue: crossbeam_queue::ArrayQueue::new(1024),
             receiver_disconnected: AtomicBool::new(false),
         }
     }
