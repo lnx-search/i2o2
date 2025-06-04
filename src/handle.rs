@@ -526,12 +526,11 @@ where
         &self,
         message: Message<G, M::SQEntry>,
     ) -> Result<(), SchedulerClosed> {
-        self.inner
-            .send(message);
-        
+        self.inner.send(message);
+
         // if result.is_ok() {
         self.waker.maybe_wake();
-        //}        
+        //}
         //result
         Ok(())
     }

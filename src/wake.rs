@@ -33,7 +33,7 @@ pub(super) fn new() -> io::Result<(RingWaker, RingWakerController)> {
 /// to submit to the submission queue ring.
 pub(super) struct RingWaker {
     /// The guard ensures that at least one event is triggered when all
-    /// handles are dropped. This is to ensure the scheduler is aware and 
+    /// handles are dropped. This is to ensure the scheduler is aware and
     /// shuts down gracefully.
     _guard: Arc<WakerGuard>,
     inner: Arc<WakerInner>,
@@ -63,6 +63,10 @@ pub(super) struct RingWakerController {
 }
 
 impl RingWakerController {
+    pub(super) fn is_set(&self) -> bool {
+        self.is_set
+    }
+
     pub(super) fn mark_set(&mut self) {
         self.is_set = true;
         let waker = self.inner.as_ref();

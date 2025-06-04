@@ -22,6 +22,7 @@ pub use crate::builder::I2o2Builder;
 pub use crate::handle::{I2o2Handle, RegisterError, SchedulerClosed, SubmitResult};
 use crate::mode::{CQEntryOptions, SQEntryOptions};
 pub use crate::ops::{AnyOpcode, RingOp};
+pub use crate::reply::{Cancelled, ReplyReceiver, TryGetResultError};
 
 #[cfg(not(target_os = "linux"))]
 compiler_error!(
@@ -364,6 +365,7 @@ where
                 break;
             }
         }
+
         self.sq.sync();
     }
 
@@ -380,6 +382,10 @@ where
             sq_capacity = self.sq.capacity(),
             "ingesting new entries from incoming"
         );
+
+        if self.sq.is_full() || !self.backlog.is_empty() {
+            return;
+        }
 
         while let Some(message) = self.incoming.pop() {
             self.handle_message(message);
@@ -428,7 +434,7 @@ where
     fn maybe_register_waker(&mut self) {
         if self.incoming.is_empty() {
             if let Some(op) = self.self_waker.get_sqe_if_needed() {
-                if self.push_entry(op) {
+                if unsafe { self.sq.push(&op).is_ok() } {
                     self.self_waker.mark_set();
                 }
             }
@@ -440,7 +446,7 @@ where
     /// for completion events to be ready if there is not anymore outstanding work.
     fn submit_and_maybe_wait(&mut self) -> io::Result<()> {
         self.cq.sync();
-        if !self.has_outstanding_work() {
+        if !self.has_outstanding_work() && self.self_waker.is_set() {
             #[cfg(feature = "trace-hotpath")]
             tracing::debug!(
                 "waiting for completion events because there is no outstanding work"
