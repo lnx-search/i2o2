@@ -1,5 +1,6 @@
 use std::fmt::{Display, Formatter};
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use std::{cmp, io};
@@ -149,6 +150,7 @@ impl FileManager {
     pub fn create_random_file(
         &mut self,
         target_size: usize,
+        flags: i32,
     ) -> anyhow::Result<std::fs::File> {
         let fp = self.core_path.join(format!("rng-file-read-{target_size}"));
 
@@ -168,6 +170,13 @@ impl FileManager {
         fastrand::fill(&mut buffer);
 
         write_content(&mut file, &buffer, target_size)?;
+
+        file.sync_all()?;
+
+        let file = std::fs::File::options()
+            .read(true)
+            .custom_flags(flags)
+            .open(&fp)?;
 
         Ok(file)
     }
