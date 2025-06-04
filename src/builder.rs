@@ -269,7 +269,7 @@ impl I2o2Builder {
             Err(io::Error::other("test error triggered by failpoints"))
         });
 
-        let (tx, rx) = flume::bounded(self.queue_size as usize);
+        let (tx, rx) = super::queue::new(self.queue_size as usize);
         let (waker, controller) = wake::new()?;
 
         let probe = load_kernel_uring_probe()?;
