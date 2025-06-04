@@ -217,7 +217,7 @@ where
     /// intern causing events to be processed.
     waker_controller: wake::RingWakerController,
     /// A stream of incoming IO events to process.
-    incoming: flume::Receiver<Message<G, M::SQEntry>>,
+    incoming: queue::SchedulerReceiver<Message<G, M::SQEntry>>,
     /// A backlog of IO events to process once the queue has available space.
     ///
     /// The entries in this backlog have already had user data assigned to them
@@ -239,7 +239,6 @@ where
 
         #[cfg(test)]
         fail::fail_point!("scheduler_run_fail", |_| {
-            eprintln!("called??");
             Err(io::Error::other("test error triggered by failpoints"))
         });
 
@@ -276,7 +275,7 @@ struct RingRunner<'ring, G, M: mode::RingMode> {
     state: &'ring mut TrackedState<G>,
     self_waker: &'ring mut wake::RingWakerController,
     backlog: &'ring mut VecDeque<M::SQEntry>,
-    incoming: &'ring flume::Receiver<Message<G, M::SQEntry>>,
+    incoming: &'ring queue::SchedulerReceiver<Message<G, M::SQEntry>>,
 }
 
 impl<'ring, G, M> RingRunner<'ring, G, M>
@@ -382,7 +381,7 @@ where
             "ingesting new entries from incoming"
         );
 
-        while let Ok(message) = self.incoming.try_recv() {
+        while let Some(message) = self.incoming.pop() {
             self.handle_message(message);
 
             if self.sq.is_full() {

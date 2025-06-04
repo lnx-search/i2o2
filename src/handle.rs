@@ -37,7 +37,7 @@ pub struct I2o2Handle<G = DynamicGuard, M = mode::EntrySize64>
 where
     M: mode::RingMode,
 {
-    inner: flume::Sender<Message<G, M::SQEntry>>,
+    inner: super::queue::SchedulerSender<Message<G, M::SQEntry>>,
     waker: super::wake::RingWaker,
 }
 
@@ -58,7 +58,7 @@ where
     M: mode::RingMode,
 {
     pub(super) fn new(
-        tx: flume::Sender<Message<G, M::SQEntry>>,
+        tx: super::queue::SchedulerSender<Message<G, M::SQEntry>>,
         waker: super::wake::RingWaker,
     ) -> Self {
         Self { inner: tx, waker }
@@ -512,26 +512,28 @@ where
         &self,
         message: Message<G, M::SQEntry>,
     ) -> Result<(), SchedulerClosed> {
-        let result = self.inner.send(message).map_err(|_| SchedulerClosed);
-        if result.is_ok() {
-            self.waker.maybe_wake();
-        }
-        result
+        // let result = self.inner.send(message).map_err(|_| SchedulerClosed);
+        // if result.is_ok() {
+        //     self.waker.maybe_wake();
+        // }
+        // result
+        self.inner.send(message);
+        self.waker.maybe_wake();
+        Ok(())
     }
 
     async fn send_async_inner(
         &self,
         message: Message<G, M::SQEntry>,
     ) -> Result<(), SchedulerClosed> {
-        let result = self
-            .inner
-            .send_async(message)
-            .await
-            .map_err(|_| SchedulerClosed);
-        if result.is_ok() {
-            self.waker.maybe_wake();
-        }
-        result
+        self.inner
+            .send(message);
+        
+        // if result.is_ok() {
+        self.waker.maybe_wake();
+        //}        
+        //result
+        Ok(())
     }
 }
 
