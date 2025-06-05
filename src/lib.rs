@@ -451,7 +451,7 @@ where
             tracing::debug!(
                 "waiting for completion events because there is no outstanding work"
             );
-            self.submit_and_wait()
+            self.submit_no_wait()
         } else {
             #[cfg(feature = "trace-hotpath")]
             tracing::debug!("outstanding work ready, submitting without wait");
