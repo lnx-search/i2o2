@@ -152,7 +152,7 @@ impl FileManager {
         target_size: usize,
         flags: i32,
     ) -> anyhow::Result<std::fs::File> {
-        let fp = self.core_path.join(format!("rng-file-read-{target_size}"));
+        let fp = self.get_random_file_path(target_size);
 
         if fp.exists() {
             let file = std::fs::File::open(&fp)?;
@@ -179,6 +179,10 @@ impl FileManager {
             .open(&fp)?;
 
         Ok(file)
+    }
+
+    pub fn get_random_file_path(&mut self, target_size: usize) -> PathBuf {
+        self.core_path.join(format!("rng-file-read-{target_size}"))
     }
 
     #[allow(unused)]
