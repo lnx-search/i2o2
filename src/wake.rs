@@ -2,10 +2,7 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use io_uring::{opcode, types};
-
 use crate::flags;
-use crate::mode::SQEntryOptions;
 
 /// Create a new waker pair.
 pub(super) fn new() -> io::Result<(RingWaker, RingWakerController)> {
@@ -79,23 +76,23 @@ impl RingWakerController {
         waker.wants_wake.store(false, Ordering::SeqCst);
     }
 
-    pub(super) fn get_sqe_if_needed<E: SQEntryOptions>(&mut self) -> Option<E> {
-        if self.is_set {
-            return None;
-        }
-
-        let waker = self.inner.as_ref();
-        let entry = opcode::Read::new(
-            types::Fd(waker.fd),
-            (&mut self.value) as *mut u64 as *mut _,
-            8,
-        )
-        .build()
-        .user_data(flags::pack(flags::Flag::EventFdWaker, 0, 0))
-        .into();
-
-        Some(entry)
-    }
+    // pub(super) fn get_sqe_if_needed<E: SQEntryOptions>(&mut self) -> Option<E> {
+    //     if self.is_set {
+    //         return None;
+    //     }
+    //
+    //     let waker = self.inner.as_ref();
+    //     let entry = opcode::Read::new(
+    //         types::Fd(waker.fd),
+    //         (&mut self.value) as *mut u64 as *mut _,
+    //         8,
+    //     )
+    //     .build()
+    //     .user_data(flags::pack(flags::Flag::EventFdWaker, 0, 0))
+    //     .into();
+    //
+    //     Some(entry)
+    // }
 }
 
 /// The waker guard wraps an eventfd handle and gracefully
