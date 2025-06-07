@@ -16,7 +16,6 @@ trace-hotpath = []
 [dependencies]
 thiserror = "2"
 futures-executor = "0.3"
-futures-util = "0.3"
 libc = "0.2"
 slab = "0.4"
 tracing = "0.1"
@@ -25,10 +24,8 @@ smallvec = "1.15"
 flume = "0.11"
 
 crossbeam-queue = "0.3.12"
-atomicring = "1.2.9"
 
-# TODO: Replace with newer version of io-uring when/if released.
-io-uring = { git = "https://github.com/ChillFish8/io-uring.git", branch = "chillfish8/add-remaining-register-calls" }
+axboe-liburing = { git = "https://github.com/cmazakas/liburing.git", rev = "8ce8811" }
 
 [dev-dependencies]
 rstest = "0.25"

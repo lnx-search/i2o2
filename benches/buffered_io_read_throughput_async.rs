@@ -153,7 +153,7 @@ async fn run_ring_benches(
     }
 
     // let file_10gb = file_manger.create_random_file(10 << 30, 0).map(Arc::new)?;
-    // 
+    //
     // for concurrency in [1, 8, 32, 64, 256, 512] {
     //     tracing::info!(concurrency, "running i2o2 benchmark 10gb");
     //     let iops = i2o2_random_concurrent_read(
@@ -246,7 +246,8 @@ async fn glommio_random_concurrent_read(
         total += timing.await?;
     }
 
-    let iops = NUM_IOPS_PER_WORKER as f32 / (total / (concurrency * 2) as u32).as_secs_f32();
+    let iops =
+        NUM_IOPS_PER_WORKER as f32 / (total / (concurrency * 2) as u32).as_secs_f32();
 
     Ok(iops)
 }
@@ -284,12 +285,13 @@ async fn i2o2_random_concurrent_read(
             for _ in 0..NUM_IOPS_PER_WORKER {
                 let block_idx = fastrand::usize(0..file_len / BUFFER_SIZE);
                 let mut buf = vec![0; BUFFER_SIZE];
-                
+
                 let op = i2o2::opcode::Read::new(
                     i2o2::types::Fixed(id),
                     buf.as_mut_ptr(),
                     buf.len() as u32,
-                ).offset((block_idx * BUFFER_SIZE) as u64);
+                )
+                .offset((block_idx * BUFFER_SIZE) as u64);
 
                 let reply = unsafe { handle.submit_async(op, None).await? };
                 let _ = reply.await;
