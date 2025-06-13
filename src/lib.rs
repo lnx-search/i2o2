@@ -1,5 +1,5 @@
 mod flags;
-mod ops;
+pub mod opcode;
 mod reply;
 mod ring;
 mod wake;
