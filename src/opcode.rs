@@ -269,6 +269,13 @@ pub enum AnyOp {
     Cmd80(UringCmd80),
 }
 
+impl AnyOp {
+    #[inline]
+    pub(super) fn requires_size128(&self) -> bool {
+        matches!(self, AnyOp::Cmd80(_))
+    }
+}
+
 impl sealed::RegisterOp for AnyOp {
     fn register_with_sqe(&self, sqe: &mut io_uring_sqe) {
         match self {
@@ -647,7 +654,7 @@ impl_op_boilerplate!(code = IORING_OP_READ_FIXED, ReadFixed);
 /// Invokes [IORING_OP_WRITE](https://man.archlinux.org/man/io_uring_enter.2.en#IORING_OP_WRITE).
 pub struct Write {
     fd: sealed::FixedOrFd,
-    buf_addr: *mut u8,
+    buf_addr: *const u8,
     buf_len: u32,
     offset: u64,
     io_prio: u16,
@@ -658,7 +665,7 @@ impl Write {
     /// Creates a new [Write] op.
     pub fn new(
         fd: impl IntoFdTarget,
-        buf_addr: *mut u8,
+        buf_addr: *const u8,
         buf_len: usize,
         offset: u64,
     ) -> Self {
@@ -679,7 +686,7 @@ impl sealed::RegisterOp for Write {
             io_uring_prep_write(
                 sqe,
                 self.fd.as_fd(),
-                self.buf_addr as *mut _,
+                self.buf_addr as *const _,
                 self.buf_len,
                 self.offset,
             )
@@ -695,7 +702,7 @@ impl_op_boilerplate!(code = IORING_OP_WRITE, Write);
 /// Invokes [IORING_OP_WRITE_FIXED](https://man.archlinux.org/man/io_uring_enter.2.en#IORING_OP_WRITE_FIXED).
 pub struct WriteFixed {
     fd: sealed::FixedOrFd,
-    buf_addr: *mut u8,
+    buf_addr: *const u8,
     buf_len: u32,
     buf_index: u32,
     offset: u64,
@@ -710,7 +717,7 @@ impl WriteFixed {
     /// with the ring  with the provided `buf_index`.
     pub fn new(
         fd: impl IntoFdTarget,
-        buf_addr: *mut u8,
+        buf_addr: *const u8,
         buf_len: usize,
         buf_index: u32,
         offset: u64,
@@ -733,7 +740,7 @@ impl sealed::RegisterOp for WriteFixed {
             io_uring_prep_write_fixed(
                 sqe,
                 self.fd.as_fd(),
-                self.buf_addr as *mut _,
+                self.buf_addr as *const _,
                 self.buf_len,
                 self.offset,
                 self.buf_index as i32,

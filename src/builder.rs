@@ -83,7 +83,7 @@ impl I2o2Builder {
     /// op, for NVME pass through.
     ///
     /// By default, this is `false`.
-    pub const fn with_sqe128(mut self, enabled: bool) -> Self {
+    pub const fn with_sqe_size128(mut self, enabled: bool) -> Self {
         self.size128 = enabled;
         self
     }
@@ -293,6 +293,7 @@ impl I2o2Builder {
 
         let scheduler = I2o2Scheduler {
             ring,
+            ring_size128: self.size128,
             state: TrackedState::new(
                 self.num_registered_files,
                 self.num_registered_buffers,
@@ -342,6 +343,11 @@ impl I2o2Builder {
         let probe = RingProbe::new()?;
 
         let mut params: io_uring_params = unsafe { std::mem::zeroed() };
+
+        if self.size128 {
+            params.flags |= IORING_SETUP_SQE128;
+            params.flags |= IORING_SETUP_CQE32;
+        }
 
         if probe.is_kernel_v6_0_or_newer() {
             params.flags |= IORING_SETUP_SINGLE_ISSUER;
