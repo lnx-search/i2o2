@@ -2,7 +2,7 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 
-use crate::opcode::target;
+use crate::opcode::types;
 use crate::{I2o2Handle, I2o2Scheduler, opcode};
 
 #[test]
@@ -162,7 +162,7 @@ fn write_file(
     let sample = vec![1; buffer_size];
 
     let op = opcode::Write::new(
-        target::Fd(file.as_raw_fd()),
+        types::Fd(file.as_raw_fd()),
         sample.as_ptr(),
         sample.len(),
         0,
@@ -201,7 +201,7 @@ async fn write_file_async(
     let sample = vec![1; buffer_size];
 
     let op = opcode::Write::new(
-        target::Fd(file.as_raw_fd()),
+        types::Fd(file.as_raw_fd()),
         sample.as_ptr(),
         sample.len(),
         0,

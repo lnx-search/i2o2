@@ -8,22 +8,22 @@ use tokio::sync::Barrier;
 
 mod no_op_shared;
 
-const NUM_OPS_PER_WORKER: usize = 250_000;
+const NUM_OPS_PER_WORKER: usize = 100_000;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let concurrency_levels = [64, 128, 256, 512];
+    let concurrency_levels = [1, 8, 32, 64, 128, 256, 512];
 
     let configs = [
         ("default config", i2o2::builder().with_queue_size(1024)),
         (
-            "IO polling w/default timeout",
+            "SQ polling w/default timeout",
             i2o2::builder().with_queue_size(1024).with_sqe_polling(true),
         ),
         (
-            "IO polling w/100ms timeout",
+            "SQ polling w/100ms timeout",
             i2o2::builder()
                 .with_queue_size(1024)
                 .with_sqe_polling(true)
