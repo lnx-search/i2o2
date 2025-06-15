@@ -58,7 +58,7 @@ pub(super) struct RingWakerController {
 }
 
 impl RingWakerController {
-    pub(super) fn mark_set(&mut self) {
+    pub(super) fn ask_for_wake(&mut self) {
         self.is_set = true;
         let waker = self.inner.as_ref();
         waker.wants_wake.store(true, Ordering::SeqCst);
@@ -75,7 +75,6 @@ impl RingWakerController {
     }
 
     pub(super) fn wait_for_events(&mut self) {
-        self.mark_set();
         unsafe {
             libc::eventfd_read(self.inner.fd, &raw mut self.value);
         }
@@ -161,7 +160,7 @@ mod tests {
         }
         assert_eq!(value, 1);
 
-        controller.mark_set();
+        controller.ask_for_wake();
 
         // We should wake now since the controller has asked for it.
         waker.maybe_wake();

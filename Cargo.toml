@@ -20,7 +20,6 @@ libc = "0.2"
 slab = "0.4"
 tracing = "0.1"
 parking_lot = "0.12"
-smallvec = "1.15"
 flume = "0.11"
 
 crossbeam-queue = "0.3.12"
@@ -66,14 +65,14 @@ harness = false
 name = "no_op_throughput_async"
 harness = false
 
-[[bench]]
-name = "buffered_io_write_throughput_sync"
-harness = false
-
-[[bench]]
-name = "buffered_io_write_throughput_async"
-harness = false
-
-[[bench]]
-name = "buffered_io_read_throughput_async"
-harness = false
+# [[bench]]
+# name = "buffered_io_write_throughput_sync"
+# harness = false
+#
+# [[bench]]
+# name = "buffered_io_write_throughput_async"
+# harness = false
+#
+# [[bench]]
+# name = "buffered_io_read_throughput_async"
+# harness = false

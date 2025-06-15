@@ -195,9 +195,9 @@ async fn sequential_write_repeating_ring(
         let op = i2o2::opcode::Write::new(
             i2o2::types::Fd(file.as_raw_fd()),
             buffer.as_ptr(),
-            len as u32,
-        )
-        .offset(bytes_written as u64);
+            len,
+            bytes_written as u64,
+        );
 
         let reply = unsafe { handle.submit_async(op, None).await }?;
         let result = reply.await?;
@@ -249,9 +249,9 @@ async fn right_behind_write_repeating_ring(
         let op = i2o2::opcode::Write::new(
             i2o2::types::Fd(file.as_raw_fd()),
             buffer.as_ptr(),
-            len as u32,
-        )
-        .offset(bytes_written as u64);
+            len,
+            bytes_written as u64,
+        );
 
         let reply = unsafe { handle.submit_async(op, None).await }?;
 

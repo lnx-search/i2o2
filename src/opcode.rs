@@ -203,7 +203,7 @@ pub trait RingOp: sealed::RegisterOp {
 }
 
 /// Describes the resource being affected by the IO op.
-pub mod target {
+pub mod types {
     use crate::opcode::sealed::FixedOrFd;
 
     /// A standard file descriptor.

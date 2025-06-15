@@ -35,8 +35,8 @@ fn main() -> Result<()> {
     let mut results = BenchmarkRandomReadResults::default();
 
     tracing::info!(run_id = %run_id, "starting benchmark");
-    // run_std_benches(&mut file_manger, &mut results)?;
-    // run_glommio_benches(&mut file_manger, &mut results)?;
+    run_std_benches(&mut file_manger, &mut results)?;
+    run_glommio_benches(&mut file_manger, &mut results)?;
     run_ring_benches(&mut file_manger, &mut results)?;
 
     tracing::info!("done!");
@@ -152,19 +152,19 @@ async fn run_ring_benches(
         results.push("i2o2 default", 1 << 30, concurrency, BUFFER_SIZE, iops);
     }
 
-    // let file_10gb = file_manger.create_random_file(10 << 30, 0).map(Arc::new)?;
-    //
-    // for concurrency in [1, 8, 32, 64, 256, 512] {
-    //     tracing::info!(concurrency, "running i2o2 benchmark 10gb");
-    //     let iops = i2o2_random_concurrent_read(
-    //         &file_10gb,
-    //         i2o2::builder(),
-    //         10 << 30,
-    //         concurrency,
-    //     )
-    //     .await?;
-    //     results.push("i2o2 default", 10 << 30, concurrency, BUFFER_SIZE, iops);
-    // }
+    let file_10gb = file_manger.create_random_file(10 << 30, 0).map(Arc::new)?;
+
+    for concurrency in [1, 8, 32, 64, 256, 512] {
+        tracing::info!(concurrency, "running i2o2 benchmark 10gb");
+        let iops = i2o2_random_concurrent_read(
+            &file_10gb,
+            i2o2::builder(),
+            10 << 30,
+            concurrency,
+        )
+        .await?;
+        results.push("i2o2 default", 10 << 30, concurrency, BUFFER_SIZE, iops);
+    }
 
     Ok(())
 }
@@ -289,9 +289,9 @@ async fn i2o2_random_concurrent_read(
                 let op = i2o2::opcode::Read::new(
                     i2o2::types::Fixed(id),
                     buf.as_mut_ptr(),
-                    buf.len() as u32,
-                )
-                .offset((block_idx * BUFFER_SIZE) as u64);
+                    buf.len(),
+                    (block_idx * BUFFER_SIZE) as u64,
+                );
 
                 let reply = unsafe { handle.submit_async(op, None).await? };
                 let _ = reply.await;

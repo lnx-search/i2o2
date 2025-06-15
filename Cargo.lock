@@ -534,7 +534,6 @@ dependencies = [
  "parking_lot 0.12.3",
  "rstest",
  "slab",
- "smallvec",
  "tabled",
  "tempfile",
  "thiserror",

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 mod no_op_shared;
 
-const NUM_OPS_PER_WORKER: usize = 250_000;
+const NUM_OPS_PER_WORKER: usize = 100_000;
 
 fn main() -> io::Result<()> {
     tracing_subscriber::fmt::init();
@@ -15,17 +15,16 @@ fn main() -> io::Result<()> {
 
     let configs = [
         ("default config", i2o2::builder()),
-        ("defer task run", i2o2::builder().with_defer_task_run(true)),
         (
-            "IO polling w/default timeout",
+            "SQ polling w/default timeout",
             i2o2::builder().with_sqe_polling(true),
         ),
         (
-            "IO polling w/100ms timeout",
+            "SQ polling w/100ms timeout",
             i2o2::builder()
                 .with_queue_size(128)
                 .with_sqe_polling(true)
-                .with_sqe_polling_timeout(Duration::from_millis(500)),
+                .with_sqe_polling_timeout(Duration::from_millis(100)),
         ),
     ];
 

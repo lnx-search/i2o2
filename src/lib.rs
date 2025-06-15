@@ -20,6 +20,7 @@ mod wake;
 
 pub use self::builder::I2o2Builder;
 pub use self::handle::{I2o2Handle, RegisterError, SchedulerClosed, SubmitResult};
+pub use self::opcode::types;
 pub use self::reply::{ReplyReceiver, TryGetResultError};
 
 #[cfg(not(target_os = "linux"))]
@@ -279,6 +280,13 @@ impl<G> I2o2Scheduler<G> {
     /// Wait for events if there is no outstanding work to be done.
     fn maybe_wait_for_events(&mut self) {
         if !self.has_outstanding_work() {
+            self.waker_controller.ask_for_wake();
+
+            // Check again because of atomics, yada, yada...
+            if !self.has_outstanding_work() {
+                return;
+            }
+
             #[cfg(feature = "trace-hotpath")]
             tracing::trace!("scheduler waiting on eventfd events...");
             self.waker_controller.wait_for_events();

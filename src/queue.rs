@@ -53,12 +53,19 @@ impl<T> SchedulerSender<T> {
             },
         }
 
+        let notify_fut = self.inner.notify.notified();
+        tokio::pin!(notify_fut);
+
         loop {
+            notify_fut.as_mut().enable();
+
             match self.inner.try_send(value) {
                 Err(TrySendError::Disconnected(value)) => return Err(value),
                 Err(TrySendError::Full(v)) => {
                     value = v;
-                    self.inner.notify.notified().await;
+                    eprintln!("waiting!");
+                    notify_fut.as_mut().await;
+                    notify_fut.set(self.inner.notify.notified());
                 },
                 Ok(()) => return Ok(()),
             }
