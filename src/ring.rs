@@ -22,8 +22,13 @@ pub(super) struct IoRing {
 }
 
 impl IoRing {
+    #[cfg(test)]
+    pub(super) fn for_test(queue_size: u32) -> io::Result<Self> {
+        Self::new(queue_size, unsafe { std::mem::zeroed() })
+    }
+
     /// Creates a new ring using the given queue size and flags.
-    pub(super) fn new(queue_size: u32, flags: u32) -> io::Result<Self> {
+    pub(super) fn new(queue_size: u32, mut params: io_uring_params) -> io::Result<Self> {
         let probe = RingProbe::new()?;
 
         if !probe.is_kernel_v5_15_or_newer() {
@@ -33,11 +38,13 @@ impl IoRing {
             ));
         }
 
-        probe.validate_ring_setup_flags(flags)?;
+        probe.validate_ring_setup_flags(params.flags)?;
 
         let mut ring = unsafe { std::mem::zeroed::<io_uring>() };
 
-        let result = unsafe { io_uring_queue_init(queue_size, &raw mut ring, flags) };
+        let result = unsafe {
+            io_uring_queue_init_params(queue_size, &raw mut ring, &raw mut params)
+        };
         check_err!(result)?;
 
         if probe.is_kernel_v5_18_or_newer() {
@@ -50,6 +57,12 @@ impl IoRing {
             probe,
             closed: false,
         })
+    }
+
+    /// Register an eventfd with the ring.
+    pub(super) fn register_eventfd(&mut self, fd: libc::c_int) -> io::Result<()> {
+        let result = unsafe { io_uring_register_eventfd(&raw mut self.ring, fd) };
+        check_err!(result)
     }
 
     /// Preallocate a sparse set of files.
@@ -94,6 +107,15 @@ impl IoRing {
         check_err!(result)
     }
 
+    /// Unregister a single file slot.
+    pub(super) fn unregister_file(&mut self, slot: u32) -> io::Result<()> {
+        let fds = [-1];
+        let result = unsafe {
+            io_uring_register_files_update(&raw mut self.ring, slot, fds.as_ptr(), 1)
+        };
+        check_err!(result)
+    }
+
     /// Unregister all files on the ring.
     pub(super) fn unregister_files(&mut self) -> io::Result<()> {
         let result = unsafe { io_uring_unregister_files(&raw mut self.ring) };
@@ -114,14 +136,10 @@ impl IoRing {
     pub(super) fn register_buffer(
         &mut self,
         slot: u32,
-        buf_ptr: *mut u8,
-        buf_len: usize,
+        iovec: iovec,
         tag: u64,
     ) -> io::Result<()> {
-        let buffers = [iovec {
-            iov_base: buf_ptr as *mut _,
-            iov_len: buf_len,
-        }];
+        let buffers = [iovec];
         let tags = [tag];
         let result = unsafe {
             io_uring_register_buffers_update_tag(
@@ -225,12 +243,12 @@ mod tests {
 
     #[test]
     fn test_basic_ring_creation() {
-        let _ring = IoRing::new(64, 0).expect("ring should be created ok");
+        let _ring = IoRing::for_test(64).expect("ring should be created ok");
     }
 
     #[test]
     fn test_ring_submit_and_recv_no_op() {
-        let mut ring = IoRing::new(8, 0).expect("create ring");
+        let mut ring = IoRing::for_test(8).expect("create ring");
 
         let sqe = ring.get_available_sqe().expect("sqe should be available");
 
@@ -255,7 +273,7 @@ mod tests {
     #[case::failpoint_kernel_v5_19_default_flags()]
     fn test_ring_register_files() {
         let scenario = fail::FailScenario::setup();
-        let mut ring = IoRing::new(8, 0).expect("create ring");
+        let mut ring = IoRing::for_test(8).expect("create ring");
 
         ring.register_files_sparse(8)
             .expect("create sparse file array");
@@ -271,14 +289,21 @@ mod tests {
 
     #[test]
     fn test_ring_register_buffers() {
-        let mut ring = IoRing::new(8, 0).expect("create ring");
+        let mut ring = IoRing::for_test(8).expect("create ring");
 
         ring.register_buffers_sparse(8)
             .expect("create sparse file array");
 
         let mut buffer = vec![0; 128];
-        ring.register_buffer(0, buffer.as_mut_ptr(), buffer.len(), 1)
-            .expect("registering file should succeed");
+        ring.register_buffer(
+            0,
+            iovec {
+                iov_base: buffer.as_mut_ptr().cast(),
+                iov_len: buffer.len() as _,
+            },
+            1,
+        )
+        .expect("registering file should succeed");
 
         ring.unregister_buffers().expect("unregister buffers");
 
@@ -331,7 +356,10 @@ mod tests {
     #[case::failpoint_kernel_v6_1_defer_taskrun_flags(IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN)]
     fn test_ring_setup_flags(#[case] flags: u32) {
         let scenario = fail::FailScenario::setup();
-        let _ring = IoRing::new(8, flags).expect("create ring");
+
+        let mut params: io_uring_params = unsafe { std::mem::zeroed() };
+        params.flags = flags;
+        let _ring = IoRing::new(8, params).expect("create ring");
         scenario.teardown();
     }
 }

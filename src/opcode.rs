@@ -1,6 +1,8 @@
+use std::fmt::Formatter;
 use std::io;
 use std::io::ErrorKind;
 
+pub use liburing_rs::iovec;
 use liburing_rs::*;
 
 use crate::opcode::sealed::IntoFdTarget;
@@ -141,7 +143,7 @@ impl Drop for RingProbe {
 }
 
 pub(super) mod sealed {
-    use liburing_rs::{IOSQE_FIXED_FILE, io_uring_sqe, iovec};
+    use liburing_rs::{IOSQE_FIXED_FILE, io_uring_sqe};
 
     pub trait RegisterOp {
         fn register_with_sqe(&self, sqe: &mut io_uring_sqe);
@@ -151,13 +153,9 @@ pub(super) mod sealed {
         fn into_fd_target(self) -> FixedOrFd;
     }
 
-    pub trait IntoBufTarget {
-        fn into_buf_target(self) -> FixedOrBuf;
-    }
-
     pub enum FixedOrFd {
         Fd(std::os::fd::RawFd),
-        Fixed(u16),
+        Fixed(u32),
     }
 
     impl FixedOrFd {
@@ -174,11 +172,6 @@ pub(super) mod sealed {
                 FixedOrFd::Fixed(_) => IOSQE_FIXED_FILE as u8,
             }
         }
-    }
-
-    pub enum FixedOrBuf {
-        Buf(iovec),
-        Fixed(u16),
     }
 }
 
@@ -211,16 +204,24 @@ pub trait RingOp: sealed::RegisterOp {
 
 /// Describes the resource being affected by the IO op.
 pub mod target {
+    use crate::opcode::sealed::FixedOrFd;
+
     /// A standard file descriptor.
     pub struct Fd(pub std::os::fd::RawFd);
 
-    /// A previously registered buffer or file descriptor index.
-    pub struct Fixed(pub u16);
+    impl super::sealed::IntoFdTarget for Fd {
+        fn into_fd_target(self) -> FixedOrFd {
+            FixedOrFd::Fd(self.0)
+        }
+    }
 
-    /// A standard buffer pointer.
-    pub struct Buf {
-        ptr: *mut u8,
-        len: usize,
+    /// A previously registered buffer or file descriptor index.
+    pub struct Fixed(pub u32);
+
+    impl super::sealed::IntoFdTarget for Fixed {
+        fn into_fd_target(self) -> FixedOrFd {
+            FixedOrFd::Fixed(self.0)
+        }
     }
 }
 
@@ -229,6 +230,16 @@ macro_rules! impl_op_boilerplate {
         code = $code:ident,
         $op:ident
     ) => {
+        impl std::fmt::Debug for $op {
+            fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                write!(
+                    f,
+                    "Op(code={}, io_prio={}, flags={})",
+                    $code, self.io_prio, self.additional_flags
+                )
+            }
+        }
+
         impl RingOp for $op {
             const CODE: io_uring_op = $code;
 
@@ -242,6 +253,62 @@ macro_rules! impl_op_boilerplate {
         }
     };
 }
+
+/// An enum of all supported IO ops.
+pub enum AnyOp {
+    Nop(Nop),
+    Fadvise(Fadvise),
+    Fallocate(Fallocate),
+    Fsync(Fsync),
+    Ftruncate(Ftruncate),
+    Read(Read),
+    ReadFixed(ReadFixed),
+    Write(Write),
+    WriteFixed(WriteFixed),
+    Madvise(Madvise),
+    Cmd80(UringCmd80),
+}
+
+impl sealed::RegisterOp for AnyOp {
+    fn register_with_sqe(&self, sqe: &mut io_uring_sqe) {
+        match self {
+            AnyOp::Nop(op) => op.register_with_sqe(sqe),
+            AnyOp::Fadvise(op) => op.register_with_sqe(sqe),
+            AnyOp::Fallocate(op) => op.register_with_sqe(sqe),
+            AnyOp::Fsync(op) => op.register_with_sqe(sqe),
+            AnyOp::Ftruncate(op) => op.register_with_sqe(sqe),
+            AnyOp::Read(op) => op.register_with_sqe(sqe),
+            AnyOp::ReadFixed(op) => op.register_with_sqe(sqe),
+            AnyOp::Write(op) => op.register_with_sqe(sqe),
+            AnyOp::WriteFixed(op) => op.register_with_sqe(sqe),
+            AnyOp::Madvise(op) => op.register_with_sqe(sqe),
+            AnyOp::Cmd80(op) => op.register_with_sqe(sqe),
+        }
+    }
+}
+
+unsafe impl Send for AnyOp {}
+
+macro_rules! impl_from {
+    ($t:ident, $op:ident) => {
+        impl From<$t> for $op {
+            fn from(value: $t) -> Self {
+                Self::$t(value)
+            }
+        }
+    };
+}
+
+impl_from!(Nop, AnyOp);
+impl_from!(Fadvise, AnyOp);
+impl_from!(Fallocate, AnyOp);
+impl_from!(Fsync, AnyOp);
+impl_from!(Ftruncate, AnyOp);
+impl_from!(Read, AnyOp);
+impl_from!(ReadFixed, AnyOp);
+impl_from!(Write, AnyOp);
+impl_from!(WriteFixed, AnyOp);
+impl_from!(Madvise, AnyOp);
 
 /// Invokes [IORING_OP_NOP](https://man.archlinux.org/man/io_uring_enter.2.en#IORING_OP_NOP).
 pub struct Nop {
@@ -679,3 +746,58 @@ impl sealed::RegisterOp for WriteFixed {
 }
 
 impl_op_boilerplate!(code = IORING_OP_WRITE_FIXED, WriteFixed);
+
+/// Invokes [IORING_OP_URING_CMD](https://man.archlinux.org/man/io_uring_enter.2.en#IORING_OP_URING_CMD).
+pub struct UringCmd80 {
+    fd: sealed::FixedOrFd,
+    cmd_op: u32,
+    cmd: [u8; 80],
+    io_prio: u16,
+    additional_flags: u8,
+}
+
+impl UringCmd80 {
+    /// Creates a new [UringCmd80] op.
+    pub fn new(fd: impl IntoFdTarget, cmd_op: u32, cmd: [u8; 80]) -> Self {
+        Self {
+            fd: fd.into_fd_target(),
+            cmd_op,
+            cmd,
+            io_prio: 0,
+            additional_flags: 0,
+        }
+    }
+}
+
+impl sealed::RegisterOp for UringCmd80 {
+    fn register_with_sqe(&self, sqe: &mut io_uring_sqe) {
+        sqe.opcode = IORING_OP_URING_CMD as u8;
+        sqe.fd = self.fd.as_fd();
+
+        let cmd1: [u8; 16] = self.cmd[..16].try_into().unwrap();
+        let cmd2: [u8; 64] = self.cmd[16..].try_into().unwrap();
+
+        unsafe {
+            sqe.__liburing_anon_1.__liburing_anon_1.cmd_op = self.cmd_op;
+            *sqe.__liburing_anon_6
+                .cmd
+                .as_mut()
+                .as_mut_ptr()
+                .cast::<[u8; 16]>() = cmd1;
+        }
+
+        sqe.flags |= self.fd.sqe_flags();
+        sqe.flags |= self.additional_flags;
+        sqe.ioprio = self.io_prio;
+
+        // Write the command bytes in the 64-byte void space between the current and next SQE.
+        unsafe {
+            let data_ptr = (sqe as *mut io_uring_sqe)
+                .add(size_of::<io_uring_sqe>())
+                .cast::<[u8; 64]>();
+            data_ptr.write(cmd2);
+        }
+    }
+}
+
+impl_op_boilerplate!(code = IORING_OP_URING_CMD, UringCmd80);

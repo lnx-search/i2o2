@@ -2,8 +2,6 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::flags;
-
 /// Create a new waker pair.
 pub(super) fn new() -> io::Result<(RingWaker, RingWakerController)> {
     let inner = WakerInner::new()?;
@@ -60,10 +58,6 @@ pub(super) struct RingWakerController {
 }
 
 impl RingWakerController {
-    pub(super) fn is_set(&self) -> bool {
-        self.is_set
-    }
-
     pub(super) fn mark_set(&mut self) {
         self.is_set = true;
         let waker = self.inner.as_ref();
@@ -76,23 +70,17 @@ impl RingWakerController {
         waker.wants_wake.store(false, Ordering::SeqCst);
     }
 
-    // pub(super) fn get_sqe_if_needed<E: SQEntryOptions>(&mut self) -> Option<E> {
-    //     if self.is_set {
-    //         return None;
-    //     }
-    //
-    //     let waker = self.inner.as_ref();
-    //     let entry = opcode::Read::new(
-    //         types::Fd(waker.fd),
-    //         (&mut self.value) as *mut u64 as *mut _,
-    //         8,
-    //     )
-    //     .build()
-    //     .user_data(flags::pack(flags::Flag::EventFdWaker, 0, 0))
-    //     .into();
-    //
-    //     Some(entry)
-    // }
+    pub(super) fn fd(&self) -> libc::c_int {
+        self.inner.fd
+    }
+
+    pub(super) fn wait_for_events(&mut self) {
+        self.mark_set();
+        unsafe {
+            libc::eventfd_read(self.inner.fd, &raw mut self.value);
+        }
+        self.mark_unset();
+    }
 }
 
 /// The waker guard wraps an eventfd handle and gracefully

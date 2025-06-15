@@ -7,6 +7,7 @@ pub const EVENT_FD_WAKER: u64 = 0x1000_0000_0000_0000;
 pub const GUARDED: u64 = 0x2000_0000_0000_0000;
 pub const GUARDED_RESOURCE_BUFFER: u64 = 0x3000_0000_0000_0000;
 pub const GUARDED_RESOURCE_FILE: u64 = 0x4000_0000_0000_0000;
+pub const FILLER_OP: u64 = 0x5000_0000_0000_0000;
 
 #[repr(u64)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -24,6 +25,9 @@ pub enum Flag {
     /// The event is tied to a registered resource file which is now unregistered
     /// _and_ no longer used by any operation in the ring.
     GuardedResourceFile = GUARDED_RESOURCE_FILE,
+    /// A no-op used to ensure there is a valid op submitted when the incoming queue
+    /// returns `None` after we have acquired a new SQE.
+    FillerOp = FILLER_OP,
 }
 
 /// Packs the 4 bit `flag` with the 30 bit `reply_idx` and `guard_idx`.
@@ -56,6 +60,7 @@ pub fn unpack(packed_value: u64) -> (Flag, u32, u32) {
         UNGUARDED => Flag::Unguarded,
         GUARDED_RESOURCE_BUFFER => Flag::GuardedResourceBuffer,
         GUARDED_RESOURCE_FILE => Flag::GuardedResourceFile,
+        FILLER_OP => Flag::FillerOp,
         // This should **never** happen, if this occurs the system has
         // already entered a UB state since we have to assume that any or all of
         // our prior event reads and unpacking are invalid; which means we have
