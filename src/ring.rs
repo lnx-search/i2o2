@@ -190,6 +190,7 @@ impl IoRing {
         Ok(result as usize)
     }
 
+    #[cfg(test)]
     /// Submit any outstanding submissions to the kernel and wait for at least
     /// 1 completion event to be ready.
     pub(super) fn submit_and_wait_one(&mut self) -> io::Result<()> {
@@ -218,7 +219,7 @@ pub(super) struct CqeIterator<'ring> {
 }
 
 impl<'ring> Iterator for CqeIterator<'ring> {
-    type Item = &'ring mut io_uring_cqe;
+    type Item = CqeEntry;
 
     fn next(&mut self) -> Option<Self::Item> {
         unsafe {
@@ -228,10 +229,23 @@ impl<'ring> Iterator for CqeIterator<'ring> {
                 None
             } else {
                 self.ring.advance_seen_cqe(cqe);
-                cqe.as_mut()
+                let cqe = cqe.as_mut()?;
+                Some(CqeEntry {
+                    result: cqe.res,
+                    user_data: cqe.user_data,
+                })
             }
         }
     }
+}
+
+#[derive(Debug)]
+/// The CQ entry for a IO op.
+pub struct CqeEntry {
+    /// The result of the syscall.
+    pub result: i32,
+    /// The user data tied to the OP when it was submitted.
+    pub user_data: u64,
 }
 
 #[cfg(test)]

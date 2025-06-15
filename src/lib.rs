@@ -14,6 +14,8 @@ pub mod opcode;
 mod queue;
 mod reply;
 mod ring;
+#[cfg(test)]
+mod tests;
 mod wake;
 
 pub use self::builder::I2o2Builder;
@@ -29,6 +31,7 @@ compiler_error!(
 pub type DynamicGuard = Box<dyn Any>;
 
 pub(crate) const MAGIC_ERRNO_NO_CAPACITY: i32 = -999;
+pub(crate) const MAGIC_ERRNO_NOT_SIZE128: i32 = -1000;
 
 /// Create a new [I2o2Scheduler] and [I2o2Handle] pair backed by io_uring.
 ///
@@ -113,6 +116,7 @@ pub const fn builder() -> I2o2Builder {
 /// and asynchronously.
 pub struct I2o2Scheduler<G = DynamicGuard> {
     ring: ring::IoRing,
+    ring_size128: bool,
     state: TrackedState<G>,
     /// A waker handle for triggering a completion event on `self`
     /// intern causing events to be processed.
@@ -190,6 +194,17 @@ impl<G> I2o2Scheduler<G> {
                 },
             };
 
+            if msg.entry.requires_size128() && !self.ring_size128 {
+                #[cfg(feature = "trace-hotpath")]
+                tracing::trace!(
+                    "rejecting op because size128 is required but not active"
+                );
+
+                write_filler_op(sqe);
+                let _ = msg.reply.set_result(MAGIC_ERRNO_NOT_SIZE128);
+                continue;
+            }
+
             self.state.register(sqe, msg);
         }
 
@@ -231,23 +246,23 @@ impl<G> I2o2Scheduler<G> {
 
     /// Processes all completion events from the ring.
     fn drain_completions(&mut self) -> io::Result<()> {
-        for cqe in self.ring.iter_completions() {
-            let result: i32 = cqe.res;
-            let user_data: u64 = cqe.user_data;
+        #[cfg(feature = "trace-hotpath")]
+        tracing::trace!("draining completion events");
 
-            let (flag, reply_idx, guard_idx) = flags::unpack(user_data);
+        for cqe in self.ring.iter_completions() {
+            let (flag, reply_idx, guard_idx) = flags::unpack(cqe.user_data);
 
             #[cfg(feature = "trace-hotpath")]
-            tracing::trace!(flag = ?flag, task_id = reply_idx, result = result, "completion");
+            tracing::trace!(flag = ?flag, task_id = reply_idx, result = cqe.result, "completion");
 
             match flag {
                 flags::Flag::FillerOp | flags::Flag::EventFdWaker => {},
                 flags::Flag::Guarded => {
-                    self.state.acknowledge_reply(reply_idx, result);
+                    self.state.acknowledge_reply(reply_idx, cqe.result);
                     self.state.drop_guard_if_exists(guard_idx);
                 },
                 flags::Flag::Unguarded => {
-                    self.state.acknowledge_reply(reply_idx, result);
+                    self.state.acknowledge_reply(reply_idx, cqe.result);
                 },
                 flags::Flag::GuardedResourceBuffer => {
                     self.state.drop_buffer_guard(guard_idx);
@@ -275,7 +290,7 @@ impl<G> I2o2Scheduler<G> {
         #[cfg(feature = "trace-hotpath")]
         tracing::debug!("scheduler is draining remaining events");
 
-        while self.state.remaining_tasks() > 0 {
+        while !self.incoming_ops.is_empty() || self.state.remaining_tasks() > 0 {
             self.drain_incoming_io()?;
             self.drain_completions()?;
             self.maybe_wait_for_events();
@@ -520,18 +535,4 @@ unsafe impl Send for Resource {}
 
 enum ResourceIndex {
     File(u32),
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::opcode::AnyOp;
-
-    #[test]
-    fn test_op_size() {
-        dbg!(
-            size_of::<Packaged<AnyOp, ()>>(),
-            size_of::<Packaged<AnyOp, DynamicGuard>>()
-        );
-    }
 }

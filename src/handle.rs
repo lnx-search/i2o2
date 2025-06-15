@@ -1,6 +1,6 @@
 use std::io;
+use std::io::ErrorKind;
 
-use crate::opcode::AnyOp;
 use crate::reply::Cancelled;
 use crate::{
     DynamicGuard,
@@ -113,7 +113,7 @@ where
     ///     Ok(())
     /// }
     /// ```
-    pub unsafe fn submit<O: Into<AnyOp>>(
+    pub unsafe fn submit<O: Into<opcode::AnyOp>>(
         &self,
         op: O,
         guard: Option<G>,
@@ -169,7 +169,7 @@ where
     ///     Ok(())
     /// }
     /// ```
-    pub unsafe fn submit_async<O: Into<AnyOp>>(
+    pub unsafe fn submit_async<O: Into<opcode::AnyOp>>(
         &self,
         op: O,
         guard: Option<G>,
@@ -452,6 +452,11 @@ where
 fn handle_register_resource_result(result: i32) -> Result<u32, RegisterError> {
     if result == crate::MAGIC_ERRNO_NO_CAPACITY {
         Err(RegisterError::OutOfCapacity)
+    } else if result == crate::MAGIC_ERRNO_NOT_SIZE128 {
+        Err(RegisterError::Io(io::Error::new(
+            ErrorKind::InvalidInput,
+            "128 byte SQE size must be enabled to use this op",
+        )))
     } else if result < 0 {
         Err(RegisterError::Io(io::Error::from_raw_os_error(-result)))
     } else {
