@@ -172,11 +172,13 @@ impl FileManager {
         write_content(&mut file, &buffer, target_size)?;
 
         file.sync_all()?;
-
+        drop(file);
+                
         let file = std::fs::File::options()
             .read(true)
             .custom_flags(flags)
             .open(&fp)?;
+        
 
         Ok(file)
     }
