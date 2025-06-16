@@ -11,20 +11,19 @@ const NUM_OPS_PER_WORKER: usize = 100_000;
 fn main() -> io::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let concurrency_levels = [1, 8, 16, 32];
+    let concurrency_levels = [1usize, 8, 16, 32];
 
     let configs = [
         ("default config", i2o2::builder()),
         (
             "SQ polling w/default timeout",
-            i2o2::builder().with_sqe_polling(true),
+            i2o2::builder()
+                .with_sqe_polling(true),
         ),
         (
-            "SQ polling w/100ms timeout",
+            "COOP task run",
             i2o2::builder()
-                .with_queue_size(128)
-                .with_sqe_polling(true)
-                .with_sqe_polling_timeout(Duration::from_millis(100)),
+                .with_coop_task_run(true),
         ),
     ];
 
@@ -32,10 +31,14 @@ fn main() -> io::Result<()> {
 
     for (name, config) in configs {
         eprintln!("running benchmark for config: {config:?}");
-        for (run_id, num_workers) in concurrency_levels.iter().enumerate() {
+        for (run_id, num_workers) in concurrency_levels.iter().enumerate() {            
             eprintln!("  {run_id} - run with {num_workers} workers");
             let (elapsed, total_ops, ops_per_sec) =
-                bench_with_config(config.clone(), *num_workers)?;
+                bench_with_config(
+                    config.clone()
+                        .with_queue_size(*num_workers as u32 * 8),
+                    *num_workers,
+                )?;
             results.push(name, *num_workers, elapsed, total_ops, ops_per_sec);
         }
     }

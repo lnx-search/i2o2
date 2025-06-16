@@ -56,6 +56,10 @@ use crate::I2o2Builder;
     crate::builder()
         .with_queue_size(64)
 )]
+#[case::with_ring_depth(
+    crate::builder()
+        .with_ring_depth(64)
+)]
 #[case::with_register_buffers(
     crate::builder()
         .with_num_registered_buffers(64)

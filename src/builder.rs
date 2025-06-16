@@ -32,6 +32,7 @@ type SchedulerThreadHandle = std::thread::JoinHandle<io::Result<()>>;
 /// ```
 pub struct I2o2Builder {
     queue_size: u32,
+    ring_depth: u32,
     io_poll: bool,
     size128: bool,
     sqe_poll: Option<Duration>,
@@ -52,6 +53,7 @@ impl I2o2Builder {
     pub(super) const fn const_default() -> Self {
         Self {
             queue_size: 128,
+            ring_depth: 128,
             io_poll: false,
             size128: false,
             sqe_poll: None,
@@ -63,20 +65,28 @@ impl I2o2Builder {
         }
     }
 
-    /// Set the queue size of the ring and handler buffer.
+    /// Set the queue size of the message queue between clients and the scheduler.
     ///
-    /// The provided value should be a power of `2`.
-    ///
+    /// This value will be rounded to the nearest power of two.
+    /// 
     /// By default, this is `128`.
     pub const fn with_queue_size(mut self, size: u32) -> Self {
-        assert!(
-            size != 0 && (size & (size - 1)) == 0,
-            "provided `size` value must be a power of 2"
-        );
         self.queue_size = size;
         self
     }
 
+    /// Set the ring depth.
+    /// 
+    /// This is the SQ size of the ring itself.
+    ///
+    /// This value must be a power of two.
+    ///
+    /// By default, this is `128`.
+    pub const fn with_ring_depth(mut self, size: u32) -> Self {
+        self.ring_depth = size;
+        self
+    }
+    
     /// Set the size of the SQ entry to be 128 bytes instead of 64.
     ///
     /// This is only required for the [opcode::UringCmd80](crate::opcode::UringCmd80)
@@ -374,7 +384,7 @@ impl I2o2Builder {
             params.flags |= IORING_SETUP_COOP_TASKRUN;
         }
 
-        ring::IoRing::new(self.queue_size, params)
+        ring::IoRing::new(self.ring_depth, params)
     }
 
     fn setup_registered_resources(&self, ring: &mut ring::IoRing) -> io::Result<()> {
