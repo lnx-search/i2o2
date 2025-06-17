@@ -63,7 +63,6 @@ impl<T> SchedulerSender<T> {
                 Err(TrySendError::Disconnected(value)) => return Err(value),
                 Err(TrySendError::Full(v)) => {
                     value = v;
-                    eprintln!("waiting!");
                     notify_fut.as_mut().await;
                     notify_fut.set(self.inner.notify.notified());
                 },

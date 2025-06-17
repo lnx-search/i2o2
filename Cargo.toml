@@ -22,10 +22,11 @@ tracing = "0.1"
 parking_lot = "0.12"
 flume = "0.11"
 
+axboe-liburing = "2.11.0"
+
 crossbeam-queue = "0.3.12"
 atomicring = "1.2.9"
 
-axboe-liburing = { git = "https://github.com/cmazakas/liburing.git", rev = "8ce8811" }
 
 tokio = { version = "1", features = ["sync"] }
 
@@ -74,5 +75,5 @@ name = "buffered_io_write_throughput_async"
 harness = false
 
 [[bench]]
-name = "buffered_io_read_throughput_async"
+name = "direct_io_random_read"
 harness = false

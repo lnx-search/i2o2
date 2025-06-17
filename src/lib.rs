@@ -200,7 +200,6 @@ impl<G> I2o2Scheduler<G> {
                 tracing::trace!(
                     "rejecting op because size128 is required but not active"
                 );
-
                 write_filler_op(sqe);
                 let _ = msg.reply.set_result(MAGIC_ERRNO_NOT_SIZE128);
                 continue;
