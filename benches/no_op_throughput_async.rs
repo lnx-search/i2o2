@@ -22,26 +22,20 @@ async fn main() -> io::Result<()> {
             "SQ polling w/default timeout",
             i2o2::builder().with_sqe_polling(true),
         ),
-        (
-            "COOP task run",
-            i2o2::builder()
-                .with_coop_task_run(true),
-        ),
+        ("COOP task run", i2o2::builder().with_coop_task_run(true)),
     ];
 
     let mut results = no_op_shared::BenchmarkResults::default();
 
     for (name, config) in configs {
         eprintln!("running benchmark for config: {config:?}");
-        for (run_id, num_workers) in concurrency_levels.iter().enumerate() {            
+        for (run_id, num_workers) in concurrency_levels.iter().enumerate() {
             eprintln!("  {run_id} - run with {num_workers} concurrent tasks");
-            let (elapsed, total_ops, ops_per_sec) =
-                bench_with_config(
-                    config
-                        .clone()
-                        .with_queue_size(*num_workers as u32 * 8), 
-                    *num_workers,
-                ).await?;
+            let (elapsed, total_ops, ops_per_sec) = bench_with_config(
+                config.clone().with_queue_size(*num_workers as u32 * 8),
+                *num_workers,
+            )
+            .await?;
             results.push(name, *num_workers, elapsed, total_ops, ops_per_sec);
         }
     }

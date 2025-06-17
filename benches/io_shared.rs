@@ -150,12 +150,19 @@ impl FileManager {
     pub fn create_random_file(
         &mut self,
         target_size: usize,
-        flags: i32,
+        direct_io: bool,
     ) -> anyhow::Result<std::fs::File> {
         let fp = self.get_random_file_path(target_size);
 
         if fp.exists() {
-            let file = std::fs::File::open(&fp)?;
+            let file = if direct_io {
+                std::fs::File::options()
+                    .read(true)
+                    .custom_flags(libc::O_CLOEXEC | libc::O_DIRECT)
+                    .open(&fp)?
+            } else {
+                std::fs::File::options().read(true).open(&fp)?
+            };
             return Ok(file);
         }
 
@@ -173,12 +180,11 @@ impl FileManager {
 
         file.sync_all()?;
         drop(file);
-                
+
         let file = std::fs::File::options()
             .read(true)
-            .custom_flags(flags)
+            .custom_flags(libc::O_CLOEXEC | libc::O_DIRECT)
             .open(&fp)?;
-        
 
         Ok(file)
     }

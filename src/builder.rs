@@ -19,7 +19,6 @@ type SchedulerThreadHandle = std::thread::JoinHandle<io::Result<()>>;
 /// use std::time::Duration;
 ///
 /// let (scheduler, handle) = i2o2::I2o2Builder::default()
-///     .with_defer_task_run(false)
 ///     .with_io_polling(true)
 ///     .with_sqe_polling(true)
 ///     .with_sqe_polling_timeout(Duration::from_millis(100))
@@ -37,7 +36,6 @@ pub struct I2o2Builder {
     size128: bool,
     sqe_poll: Option<Duration>,
     sqe_poll_cpu: Option<u32>,
-    defer_task_run: bool,
     coop_task_run: bool,
     num_registered_files: u32,
     num_registered_buffers: u32,
@@ -58,7 +56,6 @@ impl I2o2Builder {
             size128: false,
             sqe_poll: None,
             sqe_poll_cpu: None,
-            defer_task_run: false,
             coop_task_run: false,
             num_registered_buffers: 0,
             num_registered_files: 0,
@@ -68,7 +65,7 @@ impl I2o2Builder {
     /// Set the queue size of the message queue between clients and the scheduler.
     ///
     /// This value will be rounded to the nearest power of two.
-    /// 
+    ///
     /// By default, this is `128`.
     pub const fn with_queue_size(mut self, size: u32) -> Self {
         self.queue_size = size;
@@ -76,7 +73,7 @@ impl I2o2Builder {
     }
 
     /// Set the ring depth.
-    /// 
+    ///
     /// This is the SQ size of the ring itself.
     ///
     /// This value must be a power of two.
@@ -86,7 +83,7 @@ impl I2o2Builder {
         self.ring_depth = size;
         self
     }
-    
+
     /// Set the size of the SQ entry to be 128 bytes instead of 64.
     ///
     /// This is only required for the [opcode::UringCmd80](crate::opcode::UringCmd80)
@@ -213,28 +210,6 @@ impl I2o2Builder {
             );
         }
         self.sqe_poll_cpu = Some(cpu);
-        self
-    }
-
-    /// Enables/disables the defer task run io_uring flag.
-    ///
-    /// Sets `IORING_SETUP_DEFER_TASKRUN`
-    ///
-    /// <https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html>
-    ///
-    /// > By default, io_uring will process all outstanding work at
-    /// > the end of any system call or thread interrupt. This can
-    /// > delay the application from making other progress.  Setting
-    /// > this flag will hint to io_uring that it should defer work
-    /// > until an io_uring_enter(2) call with the
-    /// > IORING_ENTER_GETEVENTS flag set.
-    ///
-    /// WARNING: You must have a kernel version **6.1+** in order
-    /// for this API to not error on creation.
-    ///
-    /// By default, this is `disabled`.
-    pub const fn with_defer_task_run(mut self, enable: bool) -> Self {
-        self.defer_task_run = enable;
         self
     }
 
@@ -374,10 +349,6 @@ impl I2o2Builder {
 
         if let Some(pin_cpu) = self.sqe_poll_cpu {
             params.sq_thread_cpu = pin_cpu;
-        }
-
-        if self.defer_task_run {
-            params.flags |= IORING_SETUP_DEFER_TASKRUN;
         }
 
         if self.coop_task_run {

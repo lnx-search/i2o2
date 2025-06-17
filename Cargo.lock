@@ -74,7 +74,8 @@ checksum = "ace50bade8e6234aa140d9a2f552bbee1db4d353f69b8217bc503490fc1a9f26"
 [[package]]
 name = "axboe-liburing"
 version = "2.11.0"
-source = "git+https://github.com/cmazakas/liburing.git?rev=8ce8811#8ce88119ca15a5de6fbbf66f6f5c1a1218b066c2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06fbf17555205e22187d2eaf8b3d844a4865adfb822b65e6afb3815c861e6a47"
 dependencies = [
  "bindgen",
 ]

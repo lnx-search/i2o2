@@ -48,10 +48,6 @@ use crate::I2o2Builder;
     crate::builder()
         .with_sqe_polling_pin_cpu(0)
 )]
-#[case::with_defer_task_run(
-    crate::builder()
-        .with_defer_task_run(true)
-)]
 #[case::with_queue_size(
     crate::builder()
         .with_queue_size(64)
@@ -124,11 +120,6 @@ use crate::I2o2Builder;
         .with_sqe_size128(true)
         .with_sqe_polling_pin_cpu(0)
 )]
-#[case::with_size128_defer_task_run(
-    crate::builder()
-        .with_sqe_size128(true)
-        .with_defer_task_run(true)
-)]
 #[case::with_size128_queue_size(
     crate::builder()
         .with_sqe_size128(true)
@@ -169,15 +160,6 @@ fn test_scheduler_creation(#[case] builder: I2o2Builder) {
 #[case::failpoint_kernel_v5_19_sqe_polling(crate::builder().with_sqe_polling(true))]
 #[case::failpoint_kernel_v6_0_sqe_polling(crate::builder().with_sqe_polling(true))]
 #[case::failpoint_kernel_v6_1_sqe_polling(crate::builder().with_sqe_polling(true))]
-#[should_panic]
-#[case::failpoint_kernel_v5_13_defer_task_run(crate::builder().with_defer_task_run(true))]
-#[should_panic]
-#[case::failpoint_kernel_v5_15_defer_task_run(crate::builder().with_defer_task_run(true))]
-#[should_panic]
-#[case::failpoint_kernel_v5_19_defer_task_run(crate::builder().with_defer_task_run(true))]
-#[should_panic]
-#[case::failpoint_kernel_v6_0_defer_task_run(crate::builder().with_defer_task_run(true))]
-#[case::failpoint_kernel_v6_1_defer_task_run(crate::builder().with_defer_task_run(true))]
 #[should_panic]
 #[case::failpoint_kernel_v5_13_defer_task_run(crate::builder().with_coop_task_run(true))]
 #[should_panic]
@@ -223,15 +205,6 @@ fn test_scheduler_creation(#[case] builder: I2o2Builder) {
 #[case::size128_failpoint_kernel_v5_19_defer_task_run(crate::builder().with_sqe_size128(true).with_coop_task_run(true))]
 #[case::size128_failpoint_kernel_v6_0_defer_task_run(crate::builder().with_sqe_size128(true).with_coop_task_run(true))]
 #[case::size128_failpoint_kernel_v6_1_defer_task_run(crate::builder().with_sqe_size128(true).with_coop_task_run(true))]
-#[should_panic]
-#[case::size128_failpoint_kernel_v5_13_defer_task_run(crate::builder().with_sqe_size128(true).with_defer_task_run(true))]
-#[should_panic]
-#[case::size128_failpoint_kernel_v5_15_defer_task_run(crate::builder().with_sqe_size128(true).with_defer_task_run(true))]
-#[should_panic]
-#[case::size128_failpoint_kernel_v5_19_defer_task_run(crate::builder().with_sqe_size128(true).with_defer_task_run(true))]
-#[should_panic]
-#[case::size128_failpoint_kernel_v6_0_defer_task_run(crate::builder().with_sqe_size128(true).with_defer_task_run(true))]
-#[case::size128_failpoint_kernel_v6_1_defer_task_run(crate::builder().with_sqe_size128(true).with_defer_task_run(true))]
 #[should_panic]
 #[case::size128_failpoint_kernel_v5_13_registered_files(crate::builder().with_sqe_size128(true).with_num_registered_files(8))]
 #[case::size128_failpoint_kernel_v5_15_registered_files(crate::builder().with_sqe_size128(true).with_num_registered_files(8))]

@@ -228,12 +228,12 @@ impl<'ring> Iterator for CqeIterator<'ring> {
             if !did_read {
                 None
             } else {
+                let entry = CqeEntry {
+                    result: (*cqe).res,
+                    user_data: (*cqe).user_data,
+                };
                 self.ring.advance_seen_cqe(cqe);
-                let cqe = cqe.as_mut()?;
-                Some(CqeEntry {
-                    result: cqe.res,
-                    user_data: cqe.user_data,
-                })
+                Some(entry)
             }
         }
     }
