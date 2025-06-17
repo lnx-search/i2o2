@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use glommio::Placement;
 use humansize::DECIMAL;
+use i2o2::DynamicGuard;
 use memmap2::Advice;
 use tokio::task::JoinSet;
 
@@ -42,14 +43,14 @@ fn main() -> Result<()> {
     let mut results = BenchmarkRandomReadResults::default();
 
     tracing::info!(run_id = %run_id, "starting benchmark");
-    // run_std_benches(&mut file_manger, &mut results)?;
-    // std::thread::sleep(Duration::from_secs(5));
-    // 
-    // run_glommio_benches(&mut file_manger, &mut results)?;
-    // std::thread::sleep(Duration::from_secs(5));
-
     run_i2o2_benches(&mut file_manger, &mut results)?;
-    std::thread::sleep(Duration::from_secs(5));
+    std::thread::sleep(Duration::from_secs(20));
+
+    run_std_benches(&mut file_manger, &mut results)?;
+    std::thread::sleep(Duration::from_secs(20));
+
+    run_glommio_benches(&mut file_manger, &mut results)?;
+    std::thread::sleep(Duration::from_secs(20));
 
     tracing::info!("done!");
 
@@ -120,7 +121,7 @@ fn run_glommio_benches(
     Ok(())
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn run_i2o2_benches(
     file_manager: &mut FileManager,
     results: &mut BenchmarkRandomReadResults,
@@ -270,36 +271,58 @@ async fn execute_i2o2_bench(
     let num_blocks = file_size / BUFFER_SIZE;
 
     let (scheduler_handle, handle) = i2o2::builder()
-        .with_ring_depth(128)
-        .with_queue_size(1024)
+        .with_queue_size((concurrency * 2) as u32)
         .with_sqe_polling(true)
         .with_sqe_polling_timeout(Duration::from_millis(500))
+        .with_sqe_polling_pin_cpu(4)
         .with_num_registered_files(1)
-        .try_spawn::<()>()?;
+        .with_num_registered_buffers(concurrency as u32)
+        .try_spawn::<DynamicGuard>()?;
 
     let file_id = handle.register_file_async(file.as_raw_fd(), None).await?;
 
     let total_op_count = Arc::new(AtomicUsize::new(0));
 
-    let mut handles = JoinSet::new();
+    let mut buffers: Vec<(u32, BufRef)> = Vec::new();
     for _ in 0..concurrency {
+        let mut buffer = memmap2::MmapOptions::new().len(BUFFER_SIZE).map_anon()?;
+        buffer.advise(Advice::DontFork)?;
+        assert_eq!(buffer.as_ptr() as u64 % 512, 0);
+
+        let buf_ptr = buffer.as_mut_ptr();
+        let buf_len = buffer.len();
+
+        let id = unsafe {
+            handle
+                .register_buffer_async(
+                    buf_ptr,
+                    buf_len,
+                    Some(Box::new(buffer) as DynamicGuard),
+                )
+                .await?
+        };
+
+        buffers.push((id, BufRef(buf_ptr, buf_len)));
+    }
+
+    let mut handles = JoinSet::new();
+    for (buf_index, buf_ref) in buffers {
         let total_op_count = total_op_count.clone();
         let handle = handle.clone();
 
         handles.spawn(async move {
-            let mut buffer = memmap2::MmapOptions::new().len(BUFFER_SIZE).map_anon()?;
-            buffer.advise(Advice::DontFork)?;
-            assert_eq!(buffer.as_ptr() as u64 % 512, 0);
+            let buf_ref = buf_ref;
 
             let now = Instant::now();
             while now.elapsed() < RUN_DURATION {
                 let block_id = fastrand::usize(0..num_blocks);
                 let offset = block_id * BUFFER_SIZE;
 
-                let op = i2o2::opcode::Read::new(
+                let op = i2o2::opcode::ReadFixed::new(
                     i2o2::types::Fixed(file_id),
-                    buffer.as_mut_ptr(),
-                    buffer.len(),
+                    buf_ref.0,
+                    buf_ref.1,
+                    buf_index,
                     offset as u64,
                 );
 
@@ -328,3 +351,7 @@ async fn execute_i2o2_bench(
 
     Ok(())
 }
+
+struct BufRef(*mut u8, usize);
+
+unsafe impl Send for BufRef {}

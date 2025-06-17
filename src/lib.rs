@@ -29,7 +29,7 @@ compiler_error!(
 );
 
 /// A guard type that can be any object.
-pub type DynamicGuard = Box<dyn Any>;
+pub type DynamicGuard = Box<dyn Any + Send>;
 
 pub(crate) const MAGIC_ERRNO_NO_CAPACITY: i32 = -999;
 pub(crate) const MAGIC_ERRNO_NOT_SIZE128: i32 = -1000;

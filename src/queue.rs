@@ -108,7 +108,7 @@ pub struct SchedulerReceiver<T> {
 impl<T> SchedulerReceiver<T> {
     /// Pop an item from the queue.
     pub fn pop(&self) -> Option<T> {
-        self.inner.queue.try_pop()
+        self.inner.queue.pop()
     }
 
     /// Wake all pending senders.
@@ -145,7 +145,7 @@ impl<T> Drop for SchedulerReceiver<T> {
 }
 
 struct Inner<T> {
-    queue: atomicring::AtomicRingBuffer<T>,
+    queue: crossbeam_queue::ArrayQueue<T>,
     notify: tokio::sync::Notify,
     receiver_disconnected: AtomicBool,
 }
@@ -153,7 +153,7 @@ struct Inner<T> {
 impl<T> Inner<T> {
     fn new(size: usize) -> Self {
         Self {
-            queue: atomicring::AtomicRingBuffer::with_capacity(size),
+            queue: crossbeam_queue::ArrayQueue::new(size),
             notify: tokio::sync::Notify::new(),
             receiver_disconnected: AtomicBool::new(false),
         }
@@ -164,7 +164,7 @@ impl<T> Inner<T> {
             return Err(TrySendError::Disconnected(value));
         }
 
-        if let Err(v) = self.queue.try_push(value) {
+        if let Err(v) = self.queue.push(value) {
             Err(TrySendError::Full(v))
         } else {
             Ok(())
