@@ -153,7 +153,7 @@ fn execute_std_bench(
 ) -> Result<()> {
     tracing::info!(
         concurrency = concurrency,
-        file_size = humansize::format_size(file_size, DECIMAL),
+        file_size = %humansize::format_size(file_size, DECIMAL),
         "starting std::fs::File run"
     );
 
@@ -207,7 +207,7 @@ async fn execute_glommio_bench(
 ) -> Result<()> {
     tracing::info!(
         concurrency = concurrency,
-        file_size = humansize::format_size(file_size, DECIMAL),
+        file_size = %humansize::format_size(file_size, DECIMAL),
         "starting glommio::io::DmaFile run"
     );
 
@@ -264,7 +264,7 @@ async fn execute_i2o2_bench(
 ) -> Result<()> {
     tracing::info!(
         concurrency = concurrency,
-        file_size = humansize::format_size(file_size, DECIMAL),
+        file_size = %humansize::format_size(file_size, DECIMAL),
         "starting i2o2 run"
     );
 
