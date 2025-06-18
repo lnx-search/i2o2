@@ -1,4 +1,4 @@
-use std::io;
+use std::{io, mem, ptr};
 use std::io::ErrorKind;
 
 use liburing_rs::*;
@@ -40,7 +40,7 @@ impl IoRing {
 
         probe.validate_ring_setup_flags(params.flags)?;
 
-        let mut ring = unsafe { std::mem::zeroed::<io_uring>() };
+        let mut ring = unsafe { mem::zeroed::<io_uring>() };
 
         let result = unsafe {
             io_uring_queue_init_params(queue_size, &raw mut ring, &raw mut params)
@@ -178,6 +178,14 @@ impl IoRing {
         }
     }
 
+    /// Returns whether the ring has completions available.
+    pub(super) fn has_completions_ready(&mut self) -> bool {
+        unsafe {
+            let mut cqe = ptr::null_mut::<io_uring_cqe>();
+            io_uring_peek_cqe(&raw mut self.ring, &raw mut cqe) == 0
+        }
+    }
+    
     /// Advances the CQEs seen in the queue.
     pub(self) fn advance_seen_cqe(&mut self, cqe: *mut io_uring_cqe) {
         unsafe { io_uring_cqe_seen(&raw mut self.ring, cqe) }

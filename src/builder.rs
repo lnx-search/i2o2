@@ -35,8 +35,8 @@ pub struct I2o2Builder {
     ring_depth: u32,
     io_poll: bool,
     size128: bool,
-    sqe_poll: Option<Duration>,
-    sqe_poll_cpu: Option<u32>,
+    sq_poll: Option<Duration>,
+    sq_poll_cpu: Option<CpuSet>,
     coop_task_run: bool,
     num_registered_files: u32,
     num_registered_buffers: u32,
@@ -55,8 +55,8 @@ impl I2o2Builder {
             ring_depth: 128,
             io_poll: false,
             size128: false,
-            sqe_poll: None,
-            sqe_poll_cpu: None,
+            sq_poll: None,
+            sq_poll_cpu: None,
             coop_task_run: false,
             num_registered_buffers: 0,
             num_registered_files: 0,
@@ -168,9 +168,9 @@ impl I2o2Builder {
     /// this value using [I2o2Builder::with_sq_polling_timeout].
     pub const fn with_sq_polling(mut self, enable: bool) -> Self {
         if enable {
-            self.sqe_poll = Some(Duration::from_millis(20));
+            self.sq_poll = Some(Duration::from_millis(20));
         } else {
-            self.sqe_poll = None;
+            self.sq_poll = None;
         }
         self
     }
@@ -183,7 +183,7 @@ impl I2o2Builder {
     ///
     /// NOTE: `with_sqe_polling` must be enabled first before calling this method.
     pub const fn with_sq_polling_timeout(mut self, timeout: Duration) -> Self {
-        if self.sqe_poll.is_none() {
+        if self.sq_poll.is_none() {
             panic!(
                 "submission queue polling is not already enabled at the time of calling this method"
             );
@@ -193,24 +193,24 @@ impl I2o2Builder {
             "timeout has gone beyond sane levels"
         );
 
-        self.sqe_poll = Some(timeout);
+        self.sq_poll = Some(timeout);
         self
     }
 
-    /// Set cpu core the polling thread should be pinned to.
+    /// Set cpu set the polling thread should be pinned to.
     ///
     /// Sets `IORING_SETUP_SQ_AFF`
     ///
     /// <https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html>
     ///
     /// NOTE: `with_sqe_polling` must be enabled first before calling this method.
-    pub const fn with_sq_polling_pin_cpu(mut self, cpu: u32) -> Self {
-        if self.sqe_poll.is_none() {
+    pub const fn with_sq_polling_affinity(mut self, cpu_set: CpuSet) -> Self {
+        if self.sq_poll.is_none() {
             panic!(
                 "submission queue polling is not already enabled at the time of calling this method"
             );
         }
-        self.sqe_poll_cpu = Some(cpu);
+        self.sq_poll_cpu = Some(cpu_set);
         self
     }
 
@@ -260,12 +260,12 @@ impl I2o2Builder {
     /// current configuration and pin the thread to a specific CPU.
     pub fn try_spawn_and_pin<G>(
         self,
-        cpu_affinity: u32,
+        cpu_set: CpuSet,
     ) -> io::Result<(std::thread::JoinHandle<io::Result<()>>, I2o2Handle<G>)>
     where
         G: Send + 'static,
     {
-        self.try_spawn_inner(Some(cpu_affinity))
+        self.try_spawn_inner(Some(cpu_set))
     }
 
     fn try_create_inner<G>(self) -> io::Result<(I2o2Scheduler<G>, I2o2Handle<G>)> {
@@ -307,7 +307,7 @@ impl I2o2Builder {
 
     fn try_spawn_inner<G>(
         self,
-        cpu_affinity: Option<u32>,
+        cpu_set: Option<CpuSet>,
     ) -> io::Result<(SchedulerThreadHandle, I2o2Handle<G>)>
     where
         G: Send + 'static,
@@ -315,8 +315,8 @@ impl I2o2Builder {
         let (tx, rx) = flume::bounded(1);
 
         let task = move || {
-            if let Some(cpu) = cpu_affinity {
-                let success = set_current_thread_affinity(cpu);
+            if let Some(set) = cpu_set {
+                let success = set.set_current_thread();
                 tracing::debug!(success, "set scheduler thread affinity");
             }
 
@@ -363,19 +363,19 @@ impl I2o2Builder {
             params.flags |= IORING_SETUP_IOPOLL;
         }
 
-        if let Some(idle) = self.sqe_poll {
+        if let Some(idle) = self.sq_poll {
             params.flags |= IORING_SETUP_SQPOLL;
             params.sq_thread_idle = idle.as_millis() as u32;
         }
 
-        if let Some(pin_cpu) = self.sqe_poll_cpu {
-            params.sq_thread_cpu = pin_cpu;
+        if let Some(_pin_cpu) = self.sq_poll_cpu.clone() {
+            // params.sq_thread_cpu = pin_cpu.0;
         }
 
         if self.coop_task_run {
             params.flags |= IORING_SETUP_COOP_TASKRUN;
         }
-
+    
         ring::IoRing::new(self.ring_depth, params)
     }
 
@@ -400,21 +400,29 @@ impl I2o2Builder {
     }
 }
 
-/// Set the current thread's affinity to a specific core.
-fn set_current_thread_affinity(core_id: u32) -> bool {
-    // Turn `core_id` into a `libc::cpu_set_t` with only
-    // one core active.
-    let mut set = unsafe { mem::zeroed::<libc::cpu_set_t>() };
+#[derive(Debug, Clone)]
+/// The cpu set restricts what CPU cores the thread can run on.
+pub struct CpuSet(libc::cpu_set_t);
 
-    unsafe { CPU_SET(core_id as usize, &mut set) };
+impl CpuSet {
+    /// Creates a blank [CpuSet] with no cores set.
+    pub fn blank() -> Self {
+        Self(unsafe { mem::zeroed::<libc::cpu_set_t>() })
+    }
 
-    // Set the current thread's core affinity.
-    let res = unsafe {
-        sched_setaffinity(
-            0, // Defaults to current thread
-            size_of::<libc::cpu_set_t>(),
-            &set,
-        )
-    };
-    res == 0
+    /// Set the target `cpu_id` in the CPU set.
+    pub fn set(&mut self, cpu_id: usize) {
+        unsafe { CPU_SET(cpu_id, &mut self.0) };
+    }
+
+    fn set_current_thread(&self) -> bool {
+        let res = unsafe {
+            sched_setaffinity(
+                0, // Defaults to current thread
+                size_of::<libc::cpu_set_t>(),
+                &self.0,
+            )
+        };
+        res == 0
+    }
 }
