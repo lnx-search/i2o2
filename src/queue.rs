@@ -82,7 +82,7 @@ impl<T> SchedulerSender<T> {
             Ok(()) => return Ok(()),
         }
 
-        for _ in 0..5 {
+        for _ in 0..10 {
             match self.inner.try_send(value) {
                 Err(TrySendError::Disconnected(value)) => {
                     return Err(TrySendError::Disconnected(value));
@@ -109,6 +109,13 @@ impl<T> SchedulerReceiver<T> {
     /// Pop an item from the queue.
     pub fn pop(&self) -> Option<T> {
         self.inner.queue.pop()
+    }
+
+    /// Wake all pending senders.
+    pub fn wake_n(&self, n: usize) {
+        for _ in 0..n {
+            self.inner.notify.notify_one();
+        }
     }
 
     /// Wake all pending senders.
