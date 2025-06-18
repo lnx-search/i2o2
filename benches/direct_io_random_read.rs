@@ -69,6 +69,8 @@ fn main() -> Result<()> {
 
     info!("running w/SQPOLL, w/pinning");
     let base = i2o2::builder()
+        // .with_ring_depth(256)
+        // .with_coop_task_run(true)
         .with_sq_polling(true)
         .with_sq_polling_timeout(Duration::from_millis(500))
         .with_sq_polling_pin_cpu(4);
