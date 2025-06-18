@@ -21,19 +21,20 @@ use humansize::DECIMAL;
 use i2o2::DynamicGuard;
 use memmap2::Advice;
 use tokio::task::JoinSet;
+use tracing::info;
 
 use crate::io_shared::{BenchmarkRandomReadResults, FileManager};
 
 mod io_shared;
 
-static BASE_PATH: &str = "./benchmark-data";
+static BASE_PATH: &str = "./benchmark-data/benchmark-xfs";
 const BUFFER_SIZE: usize = 8 << 10;
 const RUN_DURATION: Duration = Duration::from_secs(15);
 const THREADED_CONCURRENCY_LEVELS: [usize; 4] = [1, 64, 256, 512];
-const ASYNC_CONCURRENCY_LEVELS: [usize; 5] = [1, 64, 512, 1024, 2048];
+const ASYNC_CONCURRENCY_LEVELS: [usize; 3] = [1, 64, 1024];
 
-const SIZE_1GB: usize = 1 << 30;
-const SIZE_10GB: usize = 10 << 30;
+const PIN_SCHEDULER_THREAD_TO_CORE: u32 = 5;
+const SIZE_100GB: usize = 100 << 30;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -43,14 +44,48 @@ fn main() -> Result<()> {
     let mut results = BenchmarkRandomReadResults::default();
 
     tracing::info!(run_id = %run_id, "starting benchmark");
-    run_i2o2_benches(&mut file_manger, &mut results)?;
+
+    info!("running wo/SQPOLL wo/pinning");
+    let base = i2o2::builder();
+    run_i2o2_benches(
+        "wo/SQPOLL wo/pinning",
+        &mut file_manger,
+        &mut results,
+        base,
+        false,
+    )?;
     std::thread::sleep(Duration::from_secs(20));
 
-    run_std_benches(&mut file_manger, &mut results)?;
+    info!("running wo/SQPOLL, w/pinning");
+    let base = i2o2::builder();
+    run_i2o2_benches(
+        "wo/SQPOLL w/pinning",
+        &mut file_manger,
+        &mut results,
+        base,
+        true,
+    )?;
     std::thread::sleep(Duration::from_secs(20));
 
-    run_glommio_benches(&mut file_manger, &mut results)?;
+    info!("running w/SQPOLL, w/pinning");
+    let base = i2o2::builder()
+        .with_sq_polling(true)
+        .with_sq_polling_timeout(Duration::from_millis(500))
+        .with_sq_polling_pin_cpu(4);
+    run_i2o2_benches(
+        "w/SQPOLL w/pinning",
+        &mut file_manger,
+        &mut results,
+        base,
+        true,
+    )?;
     std::thread::sleep(Duration::from_secs(20));
+
+    // run_std_benches(&mut file_manger, &mut results)?;
+    // std::thread::sleep(Duration::from_secs(20));
+    //
+    // run_glommio_benches(&mut file_manger, &mut results)?;
+    // std::thread::sleep(Duration::from_secs(20));
 
     tracing::info!("done!");
 
@@ -63,19 +98,12 @@ fn run_std_benches(
     file_manager: &mut FileManager,
     results: &mut BenchmarkRandomReadResults,
 ) -> Result<()> {
-    let file_1gb = file_manager
-        .create_random_file(SIZE_1GB, true)
-        .map(Arc::new)?;
-    for concurrency in THREADED_CONCURRENCY_LEVELS {
-        execute_std_bench(file_1gb.clone(), results, concurrency, SIZE_1GB)?;
-    }
-    drop(file_1gb);
-
     let file_10gb = file_manager
-        .create_random_file(SIZE_10GB, true)
+        .create_random_file(SIZE_100GB, true)
         .map(Arc::new)?;
     for concurrency in THREADED_CONCURRENCY_LEVELS {
-        execute_std_bench(file_10gb.clone(), results, concurrency, SIZE_10GB)?;
+        execute_std_bench(file_10gb.clone(), results, concurrency, SIZE_100GB)?;
+        std::thread::sleep(Duration::from_secs(5));
     }
     drop(file_10gb);
 
@@ -92,26 +120,15 @@ fn run_glommio_benches(
         .unwrap();
 
     executor.run(async move {
-        let fp = file_manager.get_random_file_path(SIZE_1GB);
-        let file = glommio::io::DmaFile::open(fp)
-            .await
-            .map_err(io::Error::from)?;
-        let file_1gb = Rc::new(file);
-
-        for concurrency in ASYNC_CONCURRENCY_LEVELS {
-            execute_glommio_bench(file_1gb.clone(), results, concurrency, SIZE_1GB)
-                .await?;
-        }
-        drop(file_1gb);
-
-        let fp = file_manager.get_random_file_path(SIZE_10GB);
+        let fp = file_manager.get_random_file_path(SIZE_100GB);
         let file = glommio::io::DmaFile::open(fp)
             .await
             .map_err(io::Error::from)?;
         let file_10gb = Rc::new(file);
         for concurrency in ASYNC_CONCURRENCY_LEVELS {
-            execute_glommio_bench(file_10gb.clone(), results, concurrency, SIZE_10GB)
+            execute_glommio_bench(file_10gb.clone(), results, concurrency, SIZE_100GB)
                 .await?;
+            glommio::timer::sleep(Duration::from_secs(5)).await;
         }
         drop(file_10gb);
 
@@ -123,22 +140,27 @@ fn run_glommio_benches(
 
 #[tokio::main]
 async fn run_i2o2_benches(
+    suffix: &str,
     file_manager: &mut FileManager,
     results: &mut BenchmarkRandomReadResults,
+    base: i2o2::I2o2Builder,
+    pinning: bool,
 ) -> Result<()> {
-    let file_1gb = file_manager
-        .create_random_file(SIZE_1GB, true)
-        .map(Arc::new)?;
-    for concurrency in ASYNC_CONCURRENCY_LEVELS {
-        execute_i2o2_bench(file_1gb.clone(), results, concurrency, SIZE_1GB).await?;
-    }
-    drop(file_1gb);
-
     let file_10gb = file_manager
-        .create_random_file(SIZE_10GB, true)
+        .create_random_file(SIZE_100GB, true)
         .map(Arc::new)?;
     for concurrency in ASYNC_CONCURRENCY_LEVELS {
-        execute_i2o2_bench(file_10gb.clone(), results, concurrency, SIZE_10GB).await?;
+        execute_i2o2_bench(
+            suffix,
+            file_10gb.clone(),
+            results,
+            concurrency,
+            SIZE_100GB,
+            base.clone(),
+            pinning,
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
     drop(file_10gb);
 
@@ -257,10 +279,13 @@ async fn execute_glommio_bench(
 }
 
 async fn execute_i2o2_bench(
+    suffix: &str,
     file: Arc<std::fs::File>,
     results: &mut BenchmarkRandomReadResults,
     concurrency: usize,
     file_size: usize,
+    base_builder: i2o2::I2o2Builder,
+    pin_thread: bool,
 ) -> Result<()> {
     tracing::info!(
         concurrency = concurrency,
@@ -270,14 +295,16 @@ async fn execute_i2o2_bench(
 
     let num_blocks = file_size / BUFFER_SIZE;
 
-    let (scheduler_handle, handle) = i2o2::builder()
+    let builder = base_builder
         .with_queue_size((concurrency * 2) as u32)
-        .with_sqe_polling(true)
-        .with_sqe_polling_timeout(Duration::from_millis(500))
-        .with_sqe_polling_pin_cpu(4)
         .with_num_registered_files(1)
-        .with_num_registered_buffers(concurrency as u32)
-        .try_spawn::<DynamicGuard>()?;
+        .with_num_registered_buffers(concurrency as u32);
+
+    let (scheduler_handle, handle) = if pin_thread {
+        builder.try_spawn_and_pin::<DynamicGuard>(PIN_SCHEDULER_THREAD_TO_CORE)?
+    } else {
+        builder.try_spawn::<DynamicGuard>()?
+    };
 
     let file_id = handle.register_file_async(file.as_raw_fd(), None).await?;
 
@@ -344,7 +371,13 @@ async fn execute_i2o2_bench(
     let total_ops = total_op_count.load(Ordering::Relaxed);
     let iops = total_ops as f32 / RUN_DURATION.as_secs_f32();
 
-    results.push("i2o2", file_size, concurrency, BUFFER_SIZE, iops);
+    results.push(
+        &format!("i2o2 {suffix}"),
+        file_size,
+        concurrency,
+        BUFFER_SIZE,
+        iops,
+    );
 
     drop(handle);
     scheduler_handle.join().unwrap()?;

@@ -1,6 +1,7 @@
-use std::io;
 use std::time::Duration;
+use std::{io, mem};
 
+use libc::{CPU_SET, sched_setaffinity};
 use liburing_rs::*;
 
 use crate::handle::I2o2Handle;
@@ -20,8 +21,8 @@ type SchedulerThreadHandle = std::thread::JoinHandle<io::Result<()>>;
 ///
 /// let (scheduler, handle) = i2o2::I2o2Builder::default()
 ///     .with_io_polling(true)
-///     .with_sqe_polling(true)
-///     .with_sqe_polling_timeout(Duration::from_millis(100))
+///     .with_sq_polling(true)
+///     .with_sq_polling_timeout(Duration::from_millis(100))
 ///     .try_create::<()>()?;
 ///
 /// // ... do work
@@ -164,8 +165,8 @@ impl I2o2Builder {
     /// > doing a single system call.
     ///
     /// By default, the system will use a `10ms` idle timeout, you can configure
-    /// this value using [I2o2Builder::with_sqe_polling_timeout].
-    pub const fn with_sqe_polling(mut self, enable: bool) -> Self {
+    /// this value using [I2o2Builder::with_sq_polling_timeout].
+    pub const fn with_sq_polling(mut self, enable: bool) -> Self {
         if enable {
             self.sqe_poll = Some(Duration::from_millis(20));
         } else {
@@ -181,7 +182,7 @@ impl I2o2Builder {
     /// This overwrites the default timeout value I2o2 sets of `10ms`.
     ///
     /// NOTE: `with_sqe_polling` must be enabled first before calling this method.
-    pub const fn with_sqe_polling_timeout(mut self, timeout: Duration) -> Self {
+    pub const fn with_sq_polling_timeout(mut self, timeout: Duration) -> Self {
         if self.sqe_poll.is_none() {
             panic!(
                 "submission queue polling is not already enabled at the time of calling this method"
@@ -203,7 +204,7 @@ impl I2o2Builder {
     /// <https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html>
     ///
     /// NOTE: `with_sqe_polling` must be enabled first before calling this method.
-    pub const fn with_sqe_polling_pin_cpu(mut self, cpu: u32) -> Self {
+    pub const fn with_sq_polling_pin_cpu(mut self, cpu: u32) -> Self {
         if self.sqe_poll.is_none() {
             panic!(
                 "submission queue polling is not already enabled at the time of calling this method"
@@ -252,7 +253,19 @@ impl I2o2Builder {
     where
         G: Send + 'static,
     {
-        self.try_spawn_inner()
+        self.try_spawn_inner(None)
+    }
+
+    /// Attempt to create the scheduler and run it in a background thread using the
+    /// current configuration and pin the thread to a specific CPU.
+    pub fn try_spawn_and_pin<G>(
+        self,
+        cpu_affinity: u32,
+    ) -> io::Result<(std::thread::JoinHandle<io::Result<()>>, I2o2Handle<G>)>
+    where
+        G: Send + 'static,
+    {
+        self.try_spawn_inner(Some(cpu_affinity))
     }
 
     fn try_create_inner<G>(self) -> io::Result<(I2o2Scheduler<G>, I2o2Handle<G>)> {
@@ -292,13 +305,21 @@ impl I2o2Builder {
         Ok((scheduler, handle))
     }
 
-    fn try_spawn_inner<G>(self) -> io::Result<(SchedulerThreadHandle, I2o2Handle<G>)>
+    fn try_spawn_inner<G>(
+        self,
+        cpu_affinity: Option<u32>,
+    ) -> io::Result<(SchedulerThreadHandle, I2o2Handle<G>)>
     where
         G: Send + 'static,
     {
         let (tx, rx) = flume::bounded(1);
 
         let task = move || {
+            if let Some(cpu) = cpu_affinity {
+                let success = set_current_thread_affinity(cpu);
+                tracing::debug!(success, "set scheduler thread affinity");
+            }
+
             let (scheduler, handle) = self.try_create_inner()?;
 
             if tx.send(handle).is_err() {
@@ -377,4 +398,23 @@ impl I2o2Builder {
 
         Ok(())
     }
+}
+
+/// Set the current thread's affinity to a specific core.
+fn set_current_thread_affinity(core_id: u32) -> bool {
+    // Turn `core_id` into a `libc::cpu_set_t` with only
+    // one core active.
+    let mut set = unsafe { mem::zeroed::<libc::cpu_set_t>() };
+
+    unsafe { CPU_SET(core_id as usize, &mut set) };
+
+    // Set the current thread's core affinity.
+    let res = unsafe {
+        sched_setaffinity(
+            0, // Defaults to current thread
+            size_of::<libc::cpu_set_t>(),
+            &set,
+        )
+    };
+    res == 0
 }

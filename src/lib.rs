@@ -95,10 +95,9 @@ where
 /// use std::time::Duration;
 ///
 /// let (scheduler, handle) = i2o2::builder()
-///     .with_defer_task_run(false)
 ///     .with_io_polling(true)
-///     .with_sqe_polling(true)
-///     .with_sqe_polling_timeout(Duration::from_millis(100))
+///     .with_sq_polling(true)
+///     .with_sq_polling_timeout(Duration::from_millis(100))
 ///     .try_create::<()>()?;
 ///
 /// // ... do work
@@ -163,7 +162,7 @@ impl<G> I2o2Scheduler<G> {
                 break;
             }
 
-            for _ in 0..5 {
+            for _ in 0..50 {
                 self.drain_incoming_io()?;
                 self.drain_completions()?;
             }
@@ -182,6 +181,7 @@ impl<G> I2o2Scheduler<G> {
         #[cfg(feature = "trace-hotpath")]
         tracing::trace!(pop_n = pop_n, "attempting to draining incoming IO ops");
 
+        let mut n_read = 0;
         for _ in 0..pop_n {
             let Some(sqe) = self.ring.get_available_sqe() else {
                 break;
@@ -194,6 +194,8 @@ impl<G> I2o2Scheduler<G> {
                     break;
                 },
             };
+
+            n_read += 1;
 
             if msg.entry.requires_size128() && !self.ring_size128 {
                 #[cfg(feature = "trace-hotpath")]
@@ -209,7 +211,10 @@ impl<G> I2o2Scheduler<G> {
         }
 
         let result = self.ring.submit();
-        self.incoming_ops.wake_all();
+
+        if self.incoming_ops.is_empty() {
+            self.incoming_ops.wake_n(n_read);
+        }
 
         result?;
 
