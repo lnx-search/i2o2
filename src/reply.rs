@@ -182,8 +182,13 @@ struct Inner {
 mod tests {
     use std::time::Duration;
 
-    use super::{Cancelled, TryGetResultError};
+    use super::{Cancelled, ReplyNotify, TryGetResultError};
 
+    #[test]
+    fn foo() {
+        dbg!(size_of::<ReplyNotify>());
+    }
+    
     #[tokio::test]
     async fn test_normal_notify() {
         let (tx, rx) = super::new();

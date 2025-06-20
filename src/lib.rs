@@ -1,14 +1,16 @@
 #![doc = include_str!("../README.md")]
 
 use std::any::Any;
+use std::ffi::c_void;
 use std::io;
-
-use liburing_rs::{io_uring_sqe, io_uring_sqe_set_data64};
-
+use std::mem::MaybeUninit;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use liburing_rs::*;
+use parking_lot::Mutex;
 use crate::opcode::sealed::RegisterOp;
 
 mod builder;
-mod flags;
 mod handle;
 pub mod opcode;
 mod queue;
@@ -109,27 +111,28 @@ pub const fn builder() -> I2o2Builder {
     I2o2Builder::const_default()
 }
 
-/// The [I2o2Scheduler] runs an io_uring ring in the current thread and submits
-/// IO events from the handle into the ring.
-///
-/// Communication between the handles and the scheduler can be done both synchronously
-/// and asynchronously.
-pub struct I2o2Scheduler<G = DynamicGuard> {
+
+struct SubmissionWorker<G> {
     ring: ring::IoRing,
     ring_size128: bool,
-    state: TrackedState<G>,
     /// A waker handle for triggering a completion event on `self`
     /// intern causing events to be processed.
     waker_controller: wake::RingWakerController,
     /// A stream of incoming IO events to process.
-    incoming_ops: queue::SchedulerReceiver<Packaged<opcode::AnyOp, G>>,
+    incoming_ops: queue::SchedulerReceiver<Packaged<opcode::AnyOp, G>>,    
     /// A stream of incoming resource events to process.
     incoming_resources: queue::SchedulerReceiver<ResourceMessage<G>>,
-    /// A null pointer used to prevent people from sending the scheduler across threads.
-    _anti_send_ptr: *mut u8,
+    /// A set of operations enqueued with the kernel.
+    enqueued_ops: EnqueuedOps<G>,
+    /// The pre-defined number of declared buffers the ring can register.
+    resource_declared_num_buffers: usize,
+    /// The pre-defined number of declared files the ring can register.
+    resource_declared_num_files: usize,
+    /// The slab used for holding onto resource guards until the resource is no longer used.
+    resource_guards: Arc<Mutex<slab::Slab<G>>>,
 }
 
-impl<G> I2o2Scheduler<G> {
+impl<G> SubmissionWorker<G> {
     /// Run the scheduler in the current thread until it is shut down.
     ///
     /// This will wait for all remaining tasks to complete.
@@ -149,7 +152,7 @@ impl<G> I2o2Scheduler<G> {
         if let Err(e) = self.unregister_resources() {
             tracing::warn!(error = ?e, "scheduler failed to gracefully unregister resources");
         }
-
+        
         self.wait_for_remaining()?;
         tracing::debug!("scheduler shutting down");
 
@@ -164,9 +167,8 @@ impl<G> I2o2Scheduler<G> {
 
             for _ in 0..50 {
                 self.drain_incoming_io()?;
-                self.drain_completions()?;
             }
-
+            
             self.drain_incoming_resources()?;
             self.maybe_wait_for_events();
         }
@@ -174,6 +176,18 @@ impl<G> I2o2Scheduler<G> {
         Ok(())
     }
 
+    fn unregister_resources(&mut self) -> io::Result<()> {
+        if self.resource_declared_num_files {
+            self.ring.unregister_files()?;
+        }
+        
+        if self.resource_declared_num_buffers {
+            self.ring.unregister_buffers()?;
+        }
+        
+        Ok(())
+    }
+    
     /// Attempts to drain all incoming IO ops and submit them to the ring.
     fn drain_incoming_io(&mut self) -> io::Result<()> {
         let pop_n = self.incoming_ops.len();
@@ -190,7 +204,7 @@ impl<G> I2o2Scheduler<G> {
             let msg = match self.incoming_ops.pop() {
                 Some(msg) => msg,
                 None => {
-                    write_filler_op(sqe);
+                    self.enqueued_ops.push_nop_enqueue_ring(sqe);
                     break;
                 },
             };
@@ -202,19 +216,16 @@ impl<G> I2o2Scheduler<G> {
                 tracing::trace!(
                     "rejecting op because size128 is required but not active"
                 );
-                write_filler_op(sqe);
+                self.enqueued_ops.push_nop_enqueue_ring(sqe);
                 let _ = msg.reply.set_result(MAGIC_ERRNO_NOT_SIZE128);
                 continue;
             }
-
-            self.state.register(sqe, msg);
+            
+            self.enqueued_ops.push_io_enqueue_ring(sqe, msg);
         }
 
         let result = self.ring.submit();
-
-        if self.incoming_ops.is_empty() {
-            self.incoming_ops.wake_n(n_read);
-        }
+        self.incoming_ops.wake_n(n_read);
 
         result?;
 
@@ -249,40 +260,6 @@ impl<G> I2o2Scheduler<G> {
         Ok(())
     }
 
-    /// Processes all completion events from the ring.
-    fn drain_completions(&mut self) -> io::Result<()> {
-        #[cfg(feature = "trace-hotpath")]
-        tracing::trace!("draining completion events");
-        
-        while self.ring.has_completions_ready() {
-            for cqe in self.ring.iter_completions() {
-                let (flag, reply_idx, guard_idx) = flags::unpack(cqe.user_data);
-
-                #[cfg(feature = "trace-hotpath")]
-                tracing::trace!(flag = ?flag, task_id = reply_idx, result = cqe.result, "completion");
-
-                match flag {
-                    flags::Flag::FillerOp | flags::Flag::EventFdWaker => {},
-                    flags::Flag::Guarded => {
-                        self.state.acknowledge_reply(reply_idx, cqe.result);
-                        self.state.drop_guard_if_exists(guard_idx);
-                    },
-                    flags::Flag::Unguarded => {
-                        self.state.acknowledge_reply(reply_idx, cqe.result);
-                    },
-                    flags::Flag::GuardedResourceBuffer => {
-                        self.state.drop_buffer_guard(guard_idx);
-                    },
-                    flags::Flag::GuardedResourceFile => {
-                        self.state.drop_file_guard(guard_idx);
-                    },
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     /// Wait for events if there is no outstanding work to be done.
     fn maybe_wait_for_events(&mut self) {
         if !self.has_outstanding_work() {
@@ -299,224 +276,101 @@ impl<G> I2o2Scheduler<G> {
         }
     }
 
-    /// Waits for remaining inflight operations to complete.
-    fn wait_for_remaining(&mut self) -> io::Result<()> {
-        #[cfg(feature = "trace-hotpath")]
-        tracing::debug!("scheduler is draining remaining events");
-
-        while !self.incoming_ops.is_empty() || self.state.remaining_tasks() > 0 {
-            self.drain_incoming_io()?;
-            self.drain_completions()?;
-            self.maybe_wait_for_events();
-        }
-
-        #[cfg(feature = "trace-hotpath")]
-        tracing::debug!("scheduler has drained all events");
-
-        Ok(())
-    }
-
-    /// Unregisters any resources currently tied to the ring.
-    fn unregister_resources(&mut self) -> io::Result<()> {
-        if !self.state.resource_buffer_guards.is_empty() {
-            self.ring.unregister_buffers()?;
-        }
-
-        if !self.state.resource_file_guards.is_empty() {
-            self.ring.unregister_files()?;
-        }
-
-        Ok(())
-    }
-
-    /// Registers a new resource with the ring providing there is capacity.
-    fn handle_resource_register_op(&mut self, op: Packaged<Resource, G>) {
-        let Packaged {
-            entry,
-            reply,
-            guard,
-        } = op;
-
-        let result = if entry.is_buffer() {
-            self.state.register_buffer_guard(guard)
-        } else {
-            self.state.register_file_guard(guard)
-        };
-
-        let (tag, offset) = match result {
-            None => {
-                reply.set_result(MAGIC_ERRNO_NO_CAPACITY);
-                return;
-            },
-            Some(offset) if entry.is_buffer() => {
-                let packed = flags::pack(flags::Flag::GuardedResourceBuffer, 0, offset);
-                (packed, offset)
-            },
-            Some(offset) => {
-                let packed = flags::pack(flags::Flag::GuardedResourceFile, 0, offset);
-                (packed, offset)
-            },
-        };
-
-        let result = match entry {
-            Resource::Buffer(iovec) => self.ring.register_buffer(offset, iovec, tag),
-            Resource::File(fd) => self.ring.register_file(offset, fd, tag),
-        };
-
-        if result.is_ok() {
-            // This can never wrap because `offset` is only ever 32 bits.
-            reply.set_result(offset as i32);
-            return;
-        }
-
-        // We have to ensure we don't leak mem if there is an error.
-        if entry.is_buffer() {
-            self.state.drop_buffer_guard(offset);
-        } else {
-            self.state.drop_file_guard(offset);
-        };
-
-        let err = result.unwrap_err();
-        reply.set_result(err.raw_os_error().unwrap());
-    }
-
-    /// Unregisters a resource tied to the ring.
-    ///
-    /// Cleanup of guards, etc... Will be handled on the completion event triggered
-    /// when the resource is no longer required by the ring.
-    fn handle_resource_unregister_op(&mut self, op: Packaged<ResourceIndex, G>) {
-        let Packaged { entry, reply, .. } = op;
-
-        let result = match entry {
-            ResourceIndex::File(id) => self.ring.unregister_file(id),
-        };
-
-        if let Err(err) = result {
-            reply.set_result(err.raw_os_error().unwrap());
-        } else {
-            reply.set_result(0);
-        }
-    }
-
     fn has_outstanding_work(&self) -> bool {
         !self.incoming_ops.is_empty()
-            || !self.incoming_resources.is_empty()
             // incoming_ops & incoming_resources lifetimes are tied together, we only need to check 1 atomic.
             || self.incoming_ops.is_disconnected()
     }
+    
 }
 
-fn write_filler_op(sqe: &mut io_uring_sqe) {
-    let user_data = flags::pack(flags::Flag::FillerOp, 0, 0);
-    let op = opcode::Nop::new();
-    op.register_with_sqe(sqe);
-    unsafe { io_uring_sqe_set_data64(sqe, user_data) }
+
+struct EnqueuedOps<G> {
+    size: usize,
+    /// A buffer of ops that have been submitted to the kernel
+    /// and have yet to be completed. 
+    ///
+    /// This is used as a mini-allocator to hold the inflight entries
+    /// which can then be processed by the consumer worker.
+    enqueued_ops: Box<[MaybeUninit<EnqueuedEntry<G>>]>,
+    /// A queue of free slots available to overwrite entries in the `enqueued_ops`.
+    free_slots: crossbeam_queue::ArrayQueue<usize>,
 }
 
-struct TrackedState<G> {
-    free_registered_files: u32,
-    free_registered_buffers: u32,
-    /// Guards for allocated registered files.
-    resource_file_guards: slab::Slab<Option<G>>,
-    /// Guards for allocated registered buffers.
-    resource_buffer_guards: slab::Slab<Option<G>>,
-    /// A set of guards that should be kept alive as long as the ring requires.
-    guards: slab::Slab<G>,
-    /// A slab of reply handles for scheduled tasks.
-    replies: slab::Slab<reply::ReplyNotify>,
-}
-
-impl<G> TrackedState<G> {
-    fn new(free_registered_files: u32, free_registered_buffers: u32) -> Self {
+impl<G> EnqueuedOps<G> {
+    /// Creates a new [EnqueuedOps] buffer with a given capacity.
+    /// 
+    /// This may grow to larger than this value depending on pressure.
+    fn new(size: usize) -> Self {
         Self {
-            free_registered_files,
-            free_registered_buffers,
-            resource_file_guards: slab::Slab::with_capacity(
-                free_registered_files as usize,
-            ),
-            resource_buffer_guards: slab::Slab::with_capacity(
-                free_registered_buffers as usize,
-            ),
-            guards: slab::Slab::default(),
-            replies: slab::Slab::default(),
+            size,
+            enqueued_ops: Box::new_uninit_slice(size),
+            free_slots: crossbeam_queue::ArrayQueue::new(size),
         }
     }
 
-    fn remaining_tasks(&self) -> usize {
-        self.replies.len()
+    
+    /// Pushes the entry into the enqueued ops buffer.
+    pub(self) fn push(&mut self, entry: EnqueuedEntry<G>) -> *mut EnqueuedEntry<G> {
+        if let Some(slot) = self.free_slots.pop() {
+            self.enqueued_ops[slot].write(entry);
+            (&raw mut self.enqueued_ops[slot]) as *mut EnqueuedEntry<G>    
+        } else {
+            tracing::error!("system ran out of space in the enqueued entries ring");
+            std::process::abort();
+        }           
     }
 
-    fn register(&mut self, free_sqe: &mut io_uring_sqe, op: Packaged<opcode::AnyOp, G>) {
+    fn push_io_enqueue_ring(&mut self, free_sqe: &mut io_uring_sqe, op: Packaged<opcode::AnyOp, G>) {
         let Packaged {
             entry,
             reply,
             guard,
         } = op;
 
-        let reply_idx = self.replies.insert(reply);
+        let enqueued = EnqueuedEntry::IoOp(IoOpEntry {
+            reply,
+            guard,
+        });
 
-        let flag = if guard.is_none() {
-            flags::Flag::Unguarded
-        } else {
-            flags::Flag::Guarded
-        };
-
-        let guard_idx = guard.map(|g| self.register_guard(g)).unwrap_or(0);
+        let ptr = self.push(enqueued);
 
         #[cfg(feature = "trace-hotpath")]
-        tracing::trace!(task_id = reply_idx, flag = ?flag, "registered entry");
-
-        let user_data = flags::pack(flag, reply_idx as u32, guard_idx);
+        tracing::trace!(task_id = ptr.addr(), "registered entry");
 
         // Write the entry to the SQE in the ring.
         entry.register_with_sqe(free_sqe);
-        unsafe { io_uring_sqe_set_data64(free_sqe, user_data) };
+        unsafe { io_uring_sqe_set_data(free_sqe, ptr as *mut c_void) };
     }
 
-    fn register_guard(&mut self, guard: G) -> u32 {
-        self.guards.insert(guard) as u32
-    }
+    fn push_nop_enqueue_ring(&mut self, free_sqe: &mut io_uring_sqe) {
+        let ptr = self.push(EnqueuedEntry::Nop);
 
-    fn acknowledge_reply(&mut self, reply_idx: u32, result: i32) {
-        let reply = self.replies.remove(reply_idx as usize);
-        reply.set_result(result);
-    }
+        #[cfg(feature = "trace-hotpath")]
+        tracing::trace!(task_id = ptr.addr(), "registered nop");
 
-    fn drop_guard_if_exists(&mut self, guard_idx: u32) {
-        drop(self.guards.try_remove(guard_idx as usize));
+        // Write the entry to the SQE in the ring.
+        let op = opcode::Nop::new();
+        op.register_with_sqe(free_sqe);
+        unsafe { io_uring_sqe_set_data(free_sqe, ptr as *mut c_void) };
     }
+}
 
-    fn register_buffer_guard(&mut self, guard: Option<G>) -> Option<u32> {
-        if self.free_registered_buffers > 0 {
-            self.free_registered_buffers -= 1;
-            Some(self.resource_buffer_guards.insert(guard) as u32)
-        } else {
-            None
-        }
-    }
 
-    fn drop_buffer_guard(&mut self, guard_idx: u32) {
-        let value = self.resource_buffer_guards.try_remove(guard_idx as usize);
-        if value.is_some() {
-            self.free_registered_buffers += 1;
-        }
-    }
+#[repr(align(32))]
+enum EnqueuedEntry<G> {
+    /// The op is a nop and should be ignored.
+    Nop,
+    /// The entry is an IO op.
+    IoOp(IoOpEntry<G>),
+    /// The entry is part of a resource, this is triggered
+    /// from being deallocated.
+    ResourceOp(usize),
+}
 
-    fn register_file_guard(&mut self, guard: Option<G>) -> Option<u32> {
-        if self.free_registered_files > 0 {
-            self.free_registered_files -= 1;
-            Some(self.resource_file_guards.insert(guard) as u32)
-        } else {
-            None
-        }
-    }
-
-    fn drop_file_guard(&mut self, guard_idx: u32) {
-        let value = self.resource_file_guards.try_remove(guard_idx as usize);
-        if value.is_some() {
-            self.free_registered_files += 1;
-        }
-    }
+struct IoOpEntry<G> {
+    reply: reply::ReplyNotify,
+    guard: Option<G>,
 }
 
 enum ResourceMessage<G> {
