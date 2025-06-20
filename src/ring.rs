@@ -1,6 +1,6 @@
 use std::{io, mem, ptr};
 use std::io::ErrorKind;
-
+use std::sync::Arc;
 use liburing_rs::*;
 
 use crate::opcode::RingProbe;
@@ -15,16 +15,17 @@ macro_rules! check_err {
     }};
 }
 
+
 pub(super) struct IoRing {
-    ring: io_uring,
-    probe: RingProbe,
-    closed: bool,
+    ring_guard: Arc<RingHandle>,
+    ring: *mut io_uring,
+    probe: Arc<RingProbe>,
 }
 
 impl IoRing {
     #[cfg(test)]
     pub(super) fn for_test(queue_size: u32) -> io::Result<Self> {
-        Self::new(queue_size, unsafe { std::mem::zeroed() })
+        Self::new(queue_size, unsafe { mem::zeroed() })
     }
 
     /// Creates a new ring using the given queue size and flags.
@@ -40,28 +41,44 @@ impl IoRing {
 
         probe.validate_ring_setup_flags(params.flags)?;
 
-        let mut ring = unsafe { mem::zeroed::<io_uring>() };
+        let mut ring_guard = Arc::new(RingHandle::zeroed());
+        let ring = Arc::as_ptr(&ring_guard) as *mut io_uring;
 
         let result = unsafe {
-            io_uring_queue_init_params(queue_size, &raw mut ring, &raw mut params)
+            io_uring_queue_init_params(queue_size, ring, &raw mut params)
         };
         check_err!(result)?;
 
         if probe.is_kernel_v5_18_or_newer() {
-            let result = unsafe { io_uring_register_ring_fd(&raw mut ring) };
+            let result = unsafe { io_uring_register_ring_fd(ring) };
             check_err!(result)?;
         }
 
         Ok(Self {
+            ring_guard,
             ring,
-            probe,
-            closed: false,
+            probe: Arc::new(probe),
         })
+    }
+    
+    /// Creates a (dangerous) clone of the ring reference allowing
+    /// two threads to interact with the same ring.
+    /// 
+    /// # Safety
+    /// 
+    /// Great care must be taken to ensure the operations performed on the
+    /// ring by each thread are separate and do not conflict in any way.
+    pub(super) unsafe fn clone_ref(&self) -> Self {
+        Self {
+            ring_guard: self.ring_guard.clone(),
+            ring: self.ring,
+            probe: self.probe.clone(),
+        }
     }
 
     /// Register an eventfd with the ring.
     pub(super) fn register_eventfd(&mut self, fd: libc::c_int) -> io::Result<()> {
-        let result = unsafe { io_uring_register_eventfd(&raw mut self.ring, fd) };
+        let result = unsafe { io_uring_register_eventfd(self.ring, fd) };
         check_err!(result)
     }
 
@@ -70,13 +87,13 @@ impl IoRing {
     /// The number of files must be provided upfront.
     pub(super) fn register_files_sparse(&mut self, num_files: u32) -> io::Result<()> {
         let result = if self.probe.is_kernel_v5_19_or_newer() {
-            unsafe { io_uring_register_files_sparse(&raw mut self.ring, num_files) }
+            unsafe { io_uring_register_files_sparse(self.ring, num_files) }
         } else {
             let files = vec![-1; num_files as usize];
             let tags = vec![0; num_files as usize];
             unsafe {
                 io_uring_register_files_tags(
-                    &raw mut self.ring,
+                    self.ring,
                     files.as_ptr(),
                     tags.as_ptr(),
                     num_files,
@@ -97,7 +114,7 @@ impl IoRing {
         let tags = [tag];
         let result = unsafe {
             io_uring_register_files_update_tag(
-                &raw mut self.ring,
+                self.ring,
                 slot,
                 fds.as_ptr(),
                 tags.as_ptr(),
@@ -111,14 +128,14 @@ impl IoRing {
     pub(super) fn unregister_file(&mut self, slot: u32) -> io::Result<()> {
         let fds = [-1];
         let result = unsafe {
-            io_uring_register_files_update(&raw mut self.ring, slot, fds.as_ptr(), 1)
+            io_uring_register_files_update(self.ring, slot, fds.as_ptr(), 1)
         };
         check_err!(result)
     }
 
     /// Unregister all files on the ring.
     pub(super) fn unregister_files(&mut self) -> io::Result<()> {
-        let result = unsafe { io_uring_unregister_files(&raw mut self.ring) };
+        let result = unsafe { io_uring_unregister_files(self.ring) };
         check_err!(result)
     }
 
@@ -128,7 +145,7 @@ impl IoRing {
         num_buffers: u32,
     ) -> io::Result<()> {
         let result =
-            unsafe { io_uring_register_buffers_sparse(&raw mut self.ring, num_buffers) };
+            unsafe { io_uring_register_buffers_sparse(self.ring, num_buffers) };
         check_err!(result)
     }
 
@@ -143,7 +160,7 @@ impl IoRing {
         let tags = [tag];
         let result = unsafe {
             io_uring_register_buffers_update_tag(
-                &raw mut self.ring,
+                self.ring,
                 slot,
                 buffers.as_ptr(),
                 tags.as_ptr(),
@@ -155,7 +172,7 @@ impl IoRing {
 
     /// Unregister all buffers on the ring.
     pub(super) fn unregister_buffers(&mut self) -> io::Result<()> {
-        let result = unsafe { io_uring_unregister_buffers(&raw mut self.ring) };
+        let result = unsafe { io_uring_unregister_buffers(self.ring) };
         check_err!(result)
     }
 
@@ -164,14 +181,14 @@ impl IoRing {
     /// Returns `None` if the queue is full.
     pub(super) fn get_available_sqe(&mut self) -> Option<&mut io_uring_sqe> {
         unsafe {
-            let sqe = io_uring_get_sqe(&raw mut self.ring);
+            let sqe = io_uring_get_sqe(self.ring);
             sqe.as_mut()
         }
     }
 
     /// Iterates over the available CQEs in the queue.
     pub(super) fn iter_completions(&mut self) -> CqeIterator<'_> {
-        let cqe = unsafe { io_uring_cqe_iter_init(&raw mut self.ring) };
+        let cqe = unsafe { io_uring_cqe_iter_init(self.ring) };
         CqeIterator {
             ring: self,
             iter: cqe,
@@ -182,18 +199,18 @@ impl IoRing {
     pub(super) fn has_completions_ready(&mut self) -> bool {
         unsafe {
             let mut cqe = ptr::null_mut::<io_uring_cqe>();
-            io_uring_peek_cqe(&raw mut self.ring, &raw mut cqe) == 0
+            io_uring_peek_cqe(self.ring, &raw mut cqe) == 0
         }
     }
     
     /// Advances the CQEs seen in the queue.
     pub(self) fn advance_seen_cqe(&mut self, cqe: *mut io_uring_cqe) {
-        unsafe { io_uring_cqe_seen(&raw mut self.ring, cqe) }
+        unsafe { io_uring_cqe_seen(self.ring, cqe) }
     }
 
     /// Submit any outstanding submissions to the kernel.
     pub(super) fn submit(&mut self) -> io::Result<usize> {
-        let result = unsafe { io_uring_submit(&raw mut self.ring) };
+        let result = unsafe { io_uring_submit(self.ring) };
         check_err!(result)?;
         Ok(result as usize)
     }
@@ -202,21 +219,26 @@ impl IoRing {
     /// Submit any outstanding submissions to the kernel and wait for at least
     /// 1 completion event to be ready.
     pub(super) fn submit_and_wait_one(&mut self) -> io::Result<()> {
-        let result = unsafe { io_uring_submit_and_wait(&raw mut self.ring, 1) };
+        let result = unsafe { io_uring_submit_and_wait(self.ring, 1) };
         check_err!(result)
     }
 }
 
-impl Drop for IoRing {
+#[repr(transparent)]
+struct RingHandle(io_uring);
+
+impl RingHandle {
+    fn zeroed() -> Self {
+        Self(unsafe { mem::zeroed::<io_uring>() })
+    }
+}
+
+impl Drop for RingHandle {
     fn drop(&mut self) {
-        if !self.closed {
-            let result = unsafe { io_uring_close_ring_fd(&raw mut self.ring) };
-            if result < 0 {
-                let err = io::Error::from_raw_os_error(-result);
-                tracing::error!(error = %err, "cannot shutdown ring");
-            } else {
-                self.closed = true;
-            }
+        let result = unsafe { io_uring_close_ring_fd(&raw mut self.0) };
+        if result < 0 {
+            let err = io::Error::from_raw_os_error(-result);
+            tracing::error!(error = %err, "cannot shutdown ring");
         }
     }
 }
