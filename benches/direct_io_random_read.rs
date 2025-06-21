@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use glommio::{CpuSet, Placement};
+use glommio::Placement;
 use humansize::DECIMAL;
 use i2o2::DynamicGuard;
 use memmap2::Advice;
@@ -30,13 +30,8 @@ static BASE_PATH: &str = "./benchmark-data/benchmark-xfs";
 const BUFFER_SIZE: usize = 8 << 10;
 const RUN_DURATION: Duration = Duration::from_secs(15);
 const THREADED_CONCURRENCY_LEVELS: [usize; 4] = [1, 64, 256, 512];
-const ASYNC_CONCURRENCY_LEVELS: [usize; 3] = [
-    // 1,
-    // 64,
-    1024, 2048, 4096,
-];
+const ASYNC_CONCURRENCY_LEVELS: [usize; 5] = [1, 64, 1024, 2048, 4096];
 
-const PIN_SCHEDULER_THREAD_TO_CORE: u32 = 5;
 const SIZE_100GB: usize = 100 << 30;
 
 fn main() -> Result<()> {
@@ -51,11 +46,11 @@ fn main() -> Result<()> {
     run_i2o2_benches(&mut file_manger, &mut results)?;
     std::thread::sleep(Duration::from_secs(20));
 
-    // run_std_benches(&mut file_manger, &mut results)?;
-    // std::thread::sleep(Duration::from_secs(20));
-    //
-    // run_glommio_benches(&mut file_manger, &mut results)?;
-    // std::thread::sleep(Duration::from_secs(20));
+    run_std_benches(&mut file_manger, &mut results)?;
+    std::thread::sleep(Duration::from_secs(20));
+
+    run_glommio_benches(&mut file_manger, &mut results)?;
+    std::thread::sleep(Duration::from_secs(20));
 
     tracing::info!("done!");
 
@@ -249,9 +244,6 @@ async fn execute_i2o2_bench(
     );
 
     let num_blocks = file_size / BUFFER_SIZE;
-
-    let mut cpu_set = i2o2::CpuSet::blank();
-    cpu_set.set(8);
 
     let (scheduler_handle, handle) = i2o2::builder()
         .with_queue_size((concurrency * 2) as u32)

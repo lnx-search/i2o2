@@ -146,12 +146,6 @@ impl IoRing {
         check_err!(result)
     }
 
-    /// Unregister all files on the ring.
-    pub(super) fn unregister_files(&mut self) -> io::Result<()> {
-        let result = unsafe { io_uring_unregister_files(self.ring) };
-        check_err!(result)
-    }
-
     /// Preallocate a sparse set of buffers.
     pub(super) fn register_buffers_sparse(
         &mut self,
@@ -179,12 +173,6 @@ impl IoRing {
                 1,
             )
         };
-        check_err!(result)
-    }
-
-    /// Unregister all buffers on the ring.
-    pub(super) fn unregister_buffers(&mut self) -> io::Result<()> {
-        let result = unsafe { io_uring_unregister_buffers(self.ring) };
         check_err!(result)
     }
 
@@ -259,11 +247,6 @@ impl IoRing {
         unsafe { io_uring_cqe_seen(self.ring, cqe) }
     }
 
-    /// Advances the CQEs seen in the queue.
-    pub(crate) fn num_cqe_available(&mut self) -> usize {
-        unsafe { io_uring_cq_ready(self.ring) as usize }
-    }
-
     /// Submit any outstanding submissions to the kernel.
     pub(super) fn submit(&mut self) -> io::Result<usize> {
         #[cfg(feature = "trace-hotpath")]
@@ -274,20 +257,12 @@ impl IoRing {
         Ok(result as usize)
     }
 
-    /// Submit any outstanding submissions to the kernel.
-    pub(super) fn submit_and_wait_n(&mut self, n: u32) -> io::Result<usize> {
-        #[cfg(feature = "trace-hotpath")]
-        tracing::trace!(n = n, "submitting to kernel and waiting for N results");
-        let result = unsafe { io_uring_submit_and_wait(self.ring, n) };
-        check_err!(result)?;
-        Ok(result as usize)
-    }
-
     #[cfg(test)]
     /// Submit any outstanding submissions to the kernel and wait for at least
     /// 1 completion event to be ready.
     pub(super) fn submit_and_wait_one(&mut self) -> io::Result<()> {
-        self.submit_and_wait_n(1)?;
+        let result = unsafe { io_uring_submit_and_wait(self.ring, 1) };
+        check_err!(result)?;
         Ok(())
     }
 }
@@ -369,8 +344,6 @@ mod tests {
         ring.register_file(0, file.as_raw_fd(), 1)
             .expect("registering file should succeed");
 
-        ring.unregister_files().expect("unregister files");
-
         scenario.teardown();
     }
 
@@ -391,8 +364,6 @@ mod tests {
             1,
         )
         .expect("registering file should succeed");
-
-        ring.unregister_buffers().expect("unregister buffers");
 
         drop(buffer);
     }

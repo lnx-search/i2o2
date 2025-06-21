@@ -13,14 +13,7 @@ fn main() -> io::Result<()> {
 
     let concurrency_levels = [1usize, 8, 16, 32];
 
-    let configs = [
-        ("default config", i2o2::builder()),
-        (
-            "SQ polling w/default timeout",
-            i2o2::builder().with_sq_polling(true),
-        ),
-        ("COOP task run", i2o2::builder().with_coop_task_run(true)),
-    ];
+    let configs = [("default config", i2o2::builder())];
 
     let mut results = no_op_shared::BenchmarkResults::default();
 
@@ -74,14 +67,15 @@ fn bench_with_config(
 
     let start = Instant::now();
     for worker in worker_handles {
-        worker.join()?;
+        worker.join()??;
     }
+
     let elapsed = start.elapsed();
     let total_ops = num_workers * NUM_OPS_PER_WORKER;
     let ops_per_sec = total_ops as f32 / elapsed.as_secs_f32();
     drop(scheduler_handle);
 
-    thread_handle.join().expect("executor panicked")?;
+    thread_handle.join()?;
 
     Ok((elapsed, total_ops, ops_per_sec))
 }

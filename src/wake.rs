@@ -53,7 +53,6 @@ pub(super) fn new() -> io::Result<(RingWaker, RingWakerController)> {
     };
 
     let controller = RingWakerController {
-        value: 0,
         is_set: false,
         inner: waker_ref,
     };
@@ -103,7 +102,6 @@ impl Drop for WakeOnDrop {
 }
 
 pub(super) struct RingWakerController {
-    value: u64,
     is_set: bool,
     inner: Arc<WakerInner>,
 }
