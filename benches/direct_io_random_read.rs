@@ -49,7 +49,7 @@ fn main() -> Result<()> {
 
     // run_std_benches(&mut file_manger, &mut results)?;
     // std::thread::sleep(Duration::from_secs(20));
-    // 
+    //
     // run_glommio_benches(&mut file_manger, &mut results)?;
     // std::thread::sleep(Duration::from_secs(20));
 
@@ -248,7 +248,7 @@ async fn execute_i2o2_bench(
 
     let mut cpu_set = i2o2::CpuSet::blank();
     cpu_set.set(8);
-    
+
     let (scheduler_handle, handle) = i2o2::builder()
         .with_sq_polling(true)
         .with_sq_polling_timeout(Duration::from_millis(100))
@@ -322,13 +322,7 @@ async fn execute_i2o2_bench(
     let total_ops = total_op_count.load(Ordering::Relaxed);
     let iops = total_ops as f32 / RUN_DURATION.as_secs_f32();
 
-    results.push(
-        "i2o2",
-        file_size,
-        concurrency,
-        BUFFER_SIZE,
-        iops,
-    );
+    results.push("i2o2", file_size, concurrency, BUFFER_SIZE, iops);
 
     drop(handle);
     scheduler_handle.join().unwrap()?;

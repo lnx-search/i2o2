@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 use std::{io, mem};
 
@@ -5,10 +6,19 @@ use libc::{CPU_SET, sched_setaffinity};
 use liburing_rs::*;
 
 use crate::handle::I2o2Handle;
+use crate::inventory::InflightInventory;
 use crate::opcode::RingProbe;
-use crate::{I2o2Scheduler, TrackedState, ring, wake};
+use crate::{
+    I2o2CompletionWorker,
+    I2o2SchedulerThreadHandle,
+    I2o2SubmissionWorker,
+    RegisteredResources,
+    dms,
+    ring,
+    wake,
+};
 
-type SchedulerThreadHandle = std::thread::JoinHandle<io::Result<()>>;
+const MAX_SAFE_IDX: u32 = 1 << 30;
 
 #[derive(Debug, Clone)]
 /// A set of configuration options for customising the [I2o2Scheduler] scheduler.
@@ -19,10 +29,9 @@ type SchedulerThreadHandle = std::thread::JoinHandle<io::Result<()>>;
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// use std::time::Duration;
 ///
-/// let (scheduler, handle) = i2o2::I2o2Builder::default()
-///     .with_io_polling(true)
-///     .with_sq_polling(true)
-///     .with_sq_polling_timeout(Duration::from_millis(100))
+/// let (submission_worker, completion_worker, handle) = i2o2::I2o2Builder::default()
+///     .with_queue_size(256)
+///     .with_num_registered_files(4)
 ///     .try_create::<()>()?;
 ///
 /// // ... do work
@@ -35,9 +44,7 @@ pub struct I2o2Builder {
     ring_depth: u32,
     io_poll: bool,
     size128: bool,
-    sq_poll: Option<Duration>,
-    sq_poll_cpu: Option<CpuSet>,
-    coop_task_run: bool,
+    defer_task_run: bool,
     num_registered_files: u32,
     num_registered_buffers: u32,
 }
@@ -55,9 +62,7 @@ impl I2o2Builder {
             ring_depth: 128,
             io_poll: false,
             size128: false,
-            sq_poll: None,
-            sq_poll_cpu: None,
-            coop_task_run: false,
+            defer_task_run: false,
             num_registered_buffers: 0,
             num_registered_files: 0,
         }
@@ -108,7 +113,7 @@ impl I2o2Builder {
     /// By default, this is `0`.
     pub const fn with_num_registered_buffers(mut self, size: u32) -> Self {
         assert!(
-            size <= super::flags::MAX_SAFE_IDX,
+            size <= MAX_SAFE_IDX,
             "total number of registered buffers exceeds maximum allowance"
         );
         self.num_registered_buffers = size;
@@ -124,7 +129,7 @@ impl I2o2Builder {
     /// By default, this is `0`.
     pub const fn with_num_registered_files(mut self, size: u32) -> Self {
         assert!(
-            size <= super::flags::MAX_SAFE_IDX,
+            size MAX_SAFE_IDX,
             "total number of registered files exceeds maximum allowance"
         );
         self.num_registered_files = size;
@@ -149,139 +154,67 @@ impl I2o2Builder {
         self
     }
 
-    /// Enables/disables submission queue polling by the kernel.
-    ///
-    /// Sets `IORING_SETUP_SQPOLL`
-    ///
-    /// <https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html>
-    ///
-    /// > When this flag is specified, a kernel thread is created to
-    /// > perform submission queue polling.  An io_uring instance
-    /// > configured in this way enables an application to issue I/O
-    /// > without ever context switching into the kernel.  By using
-    /// > the submission queue to fill in new submission queue
-    /// > entries and watching for completions on the completion
-    /// > queue, the application can submit and reap I/Os without
-    /// > doing a single system call.
-    ///
-    /// By default, the system will use a `10ms` idle timeout, you can configure
-    /// this value using [I2o2Builder::with_sq_polling_timeout].
-    pub const fn with_sq_polling(mut self, enable: bool) -> Self {
-        if enable {
-            self.sq_poll = Some(Duration::from_millis(20));
-        } else {
-            self.sq_poll = None;
-        }
-        self
-    }
-
-    /// Set the submission queue polling idle timeout.
-    ///
-    /// <https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html>
-    ///
-    /// This overwrites the default timeout value I2o2 sets of `10ms`.
-    ///
-    /// NOTE: `with_sqe_polling` must be enabled first before calling this method.
-    pub const fn with_sq_polling_timeout(mut self, timeout: Duration) -> Self {
-        if self.sq_poll.is_none() {
-            panic!(
-                "submission queue polling is not already enabled at the time of calling this method"
-            );
-        }
-        assert!(
-            timeout.as_secs_f32() <= 10.0,
-            "timeout has gone beyond sane levels"
-        );
-
-        self.sq_poll = Some(timeout);
-        self
-    }
-
-    /// Set cpu set the polling thread should be pinned to.
-    ///
-    /// Sets `IORING_SETUP_SQ_AFF`
-    ///
-    /// <https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html>
-    ///
-    /// NOTE: `with_sqe_polling` must be enabled first before calling this method.
-    pub const fn with_sq_polling_affinity(mut self, cpu_set: CpuSet) -> Self {
-        if self.sq_poll.is_none() {
-            panic!(
-                "submission queue polling is not already enabled at the time of calling this method"
-            );
-        }
-        self.sq_poll_cpu = Some(cpu_set);
-        self
-    }
-
-    /// Enables/disables the coop task run io_uring flag.
-    ///
-    /// Sets `IORING_SETUP_COOP_TASKRUN`
-    ///
-    /// <https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html>
-    ///
-    /// > By default, io_uring will interrupt a task running in userspace when a completion event comes in.
-    /// > This is to ensure that completions run in a timely manner. For a lot of use cases,
-    /// > this is overkill and can cause reduced performance from both the inter-processor interrupt
-    /// > used to do this, the kernel/user transition, the needless interruption of the tasks userspace
-    /// > activities, and reduced batching if completions come in at a rapid rate. Most applications
-    /// > don't need the forceful interruption, as the events are processed at any kernel/user
-    /// > transition. The exception are setups where the application uses multiple threads
-    /// > operating on the same ring, where the application waiting on completions isn't
-    /// > the one that submitted them. For most other use cases, setting this flag will
-    /// > improve performance.
-    ///
-    /// WARNING: You must have a kernel version **5.19+** in order
-    /// for this API to not error on creation.
-    ///
-    /// By default, this is `disabled`.
-    pub const fn with_coop_task_run(mut self, enable: bool) -> Self {
-        self.coop_task_run = enable;
-        self
-    }
-
     /// Attempt to create the scheduler using the current configuration.
-    pub fn try_create<G>(self) -> io::Result<(I2o2Scheduler<G>, I2o2Handle<G>)> {
+    pub fn try_create<G>(
+        self,
+    ) -> io::Result<(
+        I2o2SubmissionWorker<G>,
+        I2o2CompletionWorker<G>,
+        I2o2Handle<G>,
+    )> {
         self.try_create_inner()
     }
 
     /// Attempt to create the scheduler and run it in a background thread using the
     /// current configuration.
-    pub fn try_spawn<G>(
-        self,
-    ) -> io::Result<(std::thread::JoinHandle<io::Result<()>>, I2o2Handle<G>)>
+    pub fn try_spawn<G>(self) -> io::Result<(I2o2SchedulerThreadHandle, I2o2Handle<G>)>
     where
         G: Send + 'static,
     {
-        self.try_spawn_inner(None)
+        self.try_spawn_inner(None, None)
     }
 
     /// Attempt to create the scheduler and run it in a background thread using the
     /// current configuration and pin the thread to a specific CPU.
     pub fn try_spawn_and_pin<G>(
         self,
-        cpu_set: CpuSet,
-    ) -> io::Result<(std::thread::JoinHandle<io::Result<()>>, I2o2Handle<G>)>
+        submission_cpu_set: CpuSet,
+        completion_cpu_set: CpuSet,
+    ) -> io::Result<(I2o2SchedulerThreadHandle, I2o2Handle<G>)>
     where
         G: Send + 'static,
     {
-        self.try_spawn_inner(Some(cpu_set))
+        self.try_spawn_inner(Some(submission_cpu_set), Some(completion_cpu_set))
     }
 
-    fn try_create_inner<G>(self) -> io::Result<(I2o2Scheduler<G>, I2o2Handle<G>)> {
+    fn try_create_inner<G>(
+        self,
+    ) -> io::Result<(
+        I2o2SubmissionWorker<G>,
+        I2o2CompletionWorker<G>,
+        I2o2Handle<G>,
+    )> {
         #[cfg(test)]
         fail::fail_point!("scheduler_create_fail", |_| {
-            eprintln!("invoked???");
             Err(io::Error::other("test error triggered by failpoints"))
         });
 
+        let switch = dms::DeadMansSwitch::default();
         let (io_queue_tx, io_queue_rx) = super::queue::new(self.queue_size as usize);
         let (resource_queue_tx, resource_queue_rx) = super::queue::new(32);
 
-        let (waker, controller) = wake::new()?;
+        let (waker, waker_controller) = wake::new()?;
+        let resources = Arc::new(RegisteredResources::new(
+            self.num_registered_files,
+            self.num_registered_buffers,
+        ));
+
+        let inventory_size = (self.queue_size * 4)
+            + self.num_registered_files
+            + self.num_registered_buffers;
+        let inventory = InflightInventory::new(inventory_size as usize);
 
         let mut ring = self.setup_io_ring()?;
-        ring.register_eventfd(controller.fd())?;
         tracing::debug!("ring created");
 
         self.setup_registered_resources(&mut ring)?;
@@ -289,66 +222,92 @@ impl I2o2Builder {
 
         let handle = I2o2Handle::new(io_queue_tx, resource_queue_tx, waker);
 
-        let scheduler = I2o2Scheduler {
-            ring,
-            ring_size128: self.size128,
-            state: TrackedState::new(
-                self.num_registered_files,
-                self.num_registered_buffers,
-            ),
-            waker_controller: controller,
-            incoming_ops: io_queue_rx,
+        let submission = I2o2SubmissionWorker {
+            ring: unsafe { ring.clone_ref() },
+            switch: switch.clone(),
+            waker_controller,
+            incoming_io: io_queue_rx,
             incoming_resources: resource_queue_rx,
-            _anti_send_ptr: std::ptr::null_mut(),
+            inflight_inventory: inventory.clone(),
+            resources: resources.clone(),
+            op_counter_io: 0,
+            op_counter_resource: 0,
+            op_counter_nop: 0,
         };
 
-        Ok((scheduler, handle))
+        let completion = I2o2CompletionWorker {
+            ring,
+            switch,
+            inflight_inventory: inventory,
+            resources,
+        };
+
+        Ok((submission, completion, handle))
     }
 
     fn try_spawn_inner<G>(
         self,
-        cpu_set: Option<CpuSet>,
-    ) -> io::Result<(SchedulerThreadHandle, I2o2Handle<G>)>
+        submission_cpu_set: Option<CpuSet>,
+        completion_cpu_set: Option<CpuSet>,
+    ) -> io::Result<(I2o2SchedulerThreadHandle, I2o2Handle<G>)>
     where
         G: Send + 'static,
     {
-        let (tx, rx) = flume::bounded(1);
+        let (submission_worker, completion_worker, handle) = self.try_create_inner()?;
 
-        let task = move || {
-            if let Some(set) = cpu_set {
+        let switch = submission_worker.switch.clone().into_weak();
+
+        let submission_task = move || {
+            if let Some(set) = submission_cpu_set {
                 let success = set.set_current_thread();
-                tracing::debug!(success, "set scheduler thread affinity");
+                tracing::debug!(
+                    success,
+                    "set scheduler submission worker thread affinity"
+                );
             }
 
-            let (scheduler, handle) = self.try_create_inner()?;
+            submission_worker.run()?;
 
-            if tx.send(handle).is_err() {
-                return Ok(());
-            }
-
-            scheduler.run()?;
             Ok::<_, io::Error>(())
         };
 
-        let scheduler_thread_handle = std::thread::Builder::new()
-            .name("i2o2-scheduler-thread".to_string())
-            .spawn(task)
+        let completion_task = move || {
+            if let Some(set) = completion_cpu_set {
+                let success = set.set_current_thread();
+                tracing::debug!(
+                    success,
+                    "set scheduler submission worker thread affinity"
+                );
+            }
+
+            completion_worker.run()?;
+
+            Ok::<_, io::Error>(())
+        };
+
+        let submission_worker = std::thread::Builder::new()
+            .name("i2o2-submission-thread".to_string())
+            .spawn(submission_task)
             .expect("spawn background worker thread");
 
-        if let Ok(handle) = rx.recv() {
-            Ok((scheduler_thread_handle, handle))
-        } else {
-            let error = scheduler_thread_handle.join().unwrap().expect_err(
-                "thread aborted before sending handle back but still returns Ok(())",
-            );
-            Err(error)
-        }
+        let completion_worker = std::thread::Builder::new()
+            .name("i2o2-completion-thread".to_string())
+            .spawn(completion_task)
+            .expect("spawn background worker thread");
+
+        let thread_handle = I2o2SchedulerThreadHandle {
+            switch,
+            submission_worker,
+            completion_worker,
+        };
+
+        Ok((thread_handle, handle))
     }
 
     fn setup_io_ring(&self) -> io::Result<ring::IoRing> {
         let probe = RingProbe::new()?;
 
-        let mut params: io_uring_params = unsafe { std::mem::zeroed() };
+        let mut params: io_uring_params = unsafe { mem::zeroed() };
 
         if self.size128 {
             params.flags |= IORING_SETUP_SQE128;
@@ -363,19 +322,6 @@ impl I2o2Builder {
             params.flags |= IORING_SETUP_IOPOLL;
         }
 
-        if let Some(idle) = self.sq_poll {
-            params.flags |= IORING_SETUP_SQPOLL;
-            params.sq_thread_idle = idle.as_millis() as u32;
-        }
-
-        if let Some(_pin_cpu) = self.sq_poll_cpu.clone() {
-            // params.sq_thread_cpu = pin_cpu.0;
-        }
-
-        if self.coop_task_run {
-            params.flags |= IORING_SETUP_COOP_TASKRUN;
-        }
-    
         ring::IoRing::new(self.ring_depth, params)
     }
 

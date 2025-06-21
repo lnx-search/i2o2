@@ -40,8 +40,8 @@ pub enum RegisterError {
 /// The [I2o2Handle] allows you to interact with the [I2o2Scheduler](crate::I2o2Scheduler) and
 /// submit IO events to it.
 pub struct I2o2Handle<G = DynamicGuard> {
-    ops_queue: super::queue::SchedulerSender<Packaged<opcode::AnyOp, G>>,
-    resource_queue: super::queue::SchedulerSender<ResourceMessage<G>>,
+    ops_queue: super::queue::Sender<Packaged<opcode::AnyOp, G>>,
+    resource_queue: super::queue::Sender<ResourceMessage<G>>,
     waker: super::wake::RingWaker,
 }
 
@@ -57,8 +57,8 @@ impl<G> Clone for I2o2Handle<G> {
 
 impl<G> I2o2Handle<G> {
     pub(super) fn new(
-        ops_queue: super::queue::SchedulerSender<Packaged<opcode::AnyOp, G>>,
-        resource_queue: super::queue::SchedulerSender<ResourceMessage<G>>,
+        ops_queue: super::queue::Sender<Packaged<opcode::AnyOp, G>>,
+        resource_queue: super::queue::Sender<ResourceMessage<G>>,
         waker: super::wake::RingWaker,
     ) -> Self {
         Self {
@@ -95,7 +95,7 @@ where
     /// use std::io;   
     ///
     /// fn main() -> io::Result<()> {
-    ///     let (scheduler, scheduler_handle) = i2o2::create_for_current_thread::<()>()?;
+    ///     let (scheduler, scheduler_handle) = i2o2::create_and_spawn::<()>()?;
     ///     let op = i2o2::opcode::Nop::new();
     ///     
     ///     let reply = unsafe {
@@ -105,11 +105,12 @@ where
     ///     };    
     ///     
     ///     drop(scheduler_handle);
-    ///     scheduler.run()?;
     ///     
     ///     let result = reply.wait();
     ///     assert_eq!(result, Ok(0));
     ///     
+    ///     scheduler.join()?;
+    ///
     ///     Ok(())
     /// }
     /// ```
@@ -150,7 +151,7 @@ where
     ///
     /// #[tokio::main]
     /// async fn main() -> io::Result<()> {
-    ///     let (thread_handle, scheduler_handle) = i2o2::create_and_spawn::<()>()?;
+    ///     let (scheduler, scheduler_handle) = i2o2::create_and_spawn::<()>()?;
     ///     let op = i2o2::opcode::Nop::new();
     ///     
     ///     let reply = unsafe {
@@ -164,7 +165,7 @@ where
     ///     assert_eq!(result, Ok(0));
     ///
     ///     drop(scheduler_handle);
-    ///     thread_handle.join().unwrap()?;
+    ///     scheduler.join()?;
     ///
     ///     Ok(())
     /// }
