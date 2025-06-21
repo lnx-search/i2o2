@@ -19,7 +19,7 @@ fn test_sync_buffered_file_io_write_size64() {
         .unwrap();
 
     write_file(&file, 13, handle);
-    
+
     tracing::info!("waiting for exit :)");
     scheduler.join().unwrap();
 }
@@ -28,10 +28,8 @@ fn test_sync_buffered_file_io_write_size64() {
 fn test_sync_buffered_file_io_write_size128() {
     super::try_init_logging();
 
-    let (scheduler, handle) = crate::builder()
-        .with_sqe_size128(true)
-        .try_spawn()
-        .unwrap();
+    let (scheduler, handle) =
+        crate::builder().with_sqe_size128(true).try_spawn().unwrap();
 
     let tmp_file = tempfile::NamedTempFile::new().unwrap();
     let file = std::fs::File::options()
@@ -41,7 +39,7 @@ fn test_sync_buffered_file_io_write_size128() {
         .unwrap();
 
     write_file(&file, 13, handle);
-    
+
     scheduler.join().unwrap();
 }
 
@@ -68,10 +66,8 @@ fn test_sync_direct_io_file_io_write_size64() {
 fn test_sync_direct_io_file_io_write_size128() {
     super::try_init_logging();
 
-    let (scheduler, handle) = crate::builder()
-        .with_sqe_size128(true)
-        .try_spawn()
-        .unwrap();
+    let (scheduler, handle) =
+        crate::builder().with_sqe_size128(true).try_spawn().unwrap();
 
     let tmp_file = tempfile::NamedTempFile::new().unwrap();
     let file = std::fs::File::options()
@@ -162,11 +158,7 @@ async fn test_async_direct_io_file_io_write_size128() {
     scheduler.join().unwrap();
 }
 
-fn write_file(
-    file: &std::fs::File,
-    buffer_size: usize,
-    handle: I2o2Handle<()>,
-) {
+fn write_file(file: &std::fs::File, buffer_size: usize, handle: I2o2Handle<()>) {
     let sample = vec![1; buffer_size];
 
     let op = opcode::Write::new(

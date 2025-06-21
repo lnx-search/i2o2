@@ -2,6 +2,7 @@
 
 use std::any::Any;
 use std::ffi::c_void;
+use std::fmt::{Debug, Formatter};
 use std::mem::MaybeUninit;
 use std::sync::Arc;
 use std::{cmp, io, ptr};
@@ -11,17 +12,18 @@ use liburing_rs::*;
 use crate::inventory::InflightInventory;
 use crate::opcode::sealed::RegisterOp;
 use crate::ring::CqeEntry;
+use crate::wake::WakeOnDrop;
 
 mod builder;
+mod dms;
 mod handle;
+mod inventory;
 pub mod opcode;
 mod queue;
 mod reply;
 mod ring;
-#[cfg(test)] 
+#[cfg(test)]
 mod tests;
-mod dms;
-mod inventory;
 mod wake;
 
 pub use self::builder::{CpuSet, I2o2Builder};
@@ -129,10 +131,20 @@ pub struct I2o2SchedulerThreadHandle {
     completion_worker: std::thread::JoinHandle<io::Result<()>>,
 }
 
+impl Debug for I2o2SchedulerThreadHandle {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "I2o2SchedulerThreadHandle(running={})",
+            self.is_running()
+        )
+    }
+}
+
 impl I2o2SchedulerThreadHandle {
     /// Returns if the scheduler is currently running or not.
     pub fn is_running(&self) -> bool {
-        !self.switch.is_set()
+        self.submission_worker.is_finished() && self.completion_worker.is_finished()
     }
 
     /// Set the flag to shut down the scheduler.
@@ -179,6 +191,10 @@ pub struct I2o2SubmissionWorker<G> {
 }
 
 impl<G> I2o2SubmissionWorker<G> {
+    #[cfg_attr(
+        feature = "trace-hotpath",
+        tracing::instrument("i2o2-submission", skip_all)
+    )]
     /// Run the submission worker.
     fn run(mut self) -> io::Result<()> {
         tracing::debug!("submission worker running");
@@ -256,8 +272,10 @@ impl<G> I2o2SubmissionWorker<G> {
     fn drain_remaining(&mut self) -> io::Result<()> {
         // Only drain IO ops, resources will be immediately dropped anyway.
         while !self.incoming_io.is_empty() {
-            self.ring.wait_for_sq_capacity();
-            self.process_incoming_io()?;
+            let num_consumed = self.process_incoming_io()?;
+            if num_consumed == 0 {
+                self.ring.wait_for_sq_capacity();
+            }
         }
 
         Ok(())
@@ -463,6 +481,10 @@ impl<G> I2o2SubmissionWorker<G> {
 pub struct I2o2CompletionWorker<G> {
     ring: ring::IoRing,
     switch: dms::DeadMansSwitch,
+    #[allow(unused)]
+    /// A guard waker that ensures the submission worker is woken if the completion
+    /// worker shuts down.
+    submission_worker_waker: WakeOnDrop,
     event_fd: EventFdWaiter,
     inflight_inventory: Arc<InflightInventory<InflightEntry<G>>>,
 
@@ -471,6 +493,10 @@ pub struct I2o2CompletionWorker<G> {
 }
 
 impl<G> I2o2CompletionWorker<G> {
+    #[cfg_attr(
+        feature = "trace-hotpath",
+        tracing::instrument("i2o2-completion", skip_all)
+    )]
     /// Run the completion worker.
     fn run(mut self) -> io::Result<()> {
         tracing::debug!("completion worker running");
@@ -514,8 +540,10 @@ impl<G> I2o2CompletionWorker<G> {
 
     fn drain_remaining(&mut self) -> io::Result<()> {
         while self.inflight_inventory.num_inflight() > 0 {
-            self.process_completions();
-            self.event_fd.wait_for_events();
+            let consumed = self.process_completions();
+            if consumed == 0 {
+                self.event_fd.wait_for_events();
+            }
         }
 
         Ok(())
@@ -534,8 +562,7 @@ impl<G> I2o2CompletionWorker<G> {
 
     fn process_completion(&mut self, cqe: CqeEntry) {
         let entry = unsafe { ptr::read(cqe.user_data as *mut InflightEntry<G>) };
-        entry.print();
-        
+
         match entry {
             InflightEntry::Nop => {},
             InflightEntry::ResourceOp(entry) => {
@@ -547,7 +574,7 @@ impl<G> I2o2CompletionWorker<G> {
                 match entry.resource_type {
                     ResourceType::File => self.resources.free_file(entry.resource_id),
                     ResourceType::Buffer => {
-                        self.resources.free_buffer(entry.resource_id)
+                        self.resources.free_buffer(entry.resource_id);
                     },
                 }
             },
@@ -649,16 +676,6 @@ enum InflightEntry<G> {
     Nop,
     ResourceOp(ResourceOpEntry<G>),
     IoOp(IoOpEntry<G>),
-}
-
-impl<G> InflightEntry<G> {
-    fn print(&self) {
-        match self {
-            InflightEntry::Nop => tracing::info!("nop"),
-            InflightEntry::ResourceOp(_) => tracing::info!("resource"),
-            InflightEntry::IoOp(_) => tracing::info!("io"),
-        }
-    }
 }
 
 struct ResourceOpEntry<G> {

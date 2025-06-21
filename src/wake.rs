@@ -51,6 +51,17 @@ impl RingWaker {
     }
 }
 
+/// A waker that automatically wakes the ring on drop.
+pub(super) struct WakeOnDrop {
+    inner: Arc<WakerInner>,
+}
+
+impl Drop for WakeOnDrop {
+    fn drop(&mut self) {
+        self.inner.wake();
+    }
+}
+
 pub(super) struct RingWakerController {
     value: u64,
     is_set: bool,
@@ -70,7 +81,16 @@ impl RingWakerController {
         waker.wants_wake.store(false, Ordering::SeqCst);
     }
 
+    pub(super) fn wake_on_drop(&self) -> WakeOnDrop {
+        WakeOnDrop {
+            inner: self.inner.clone(),
+        }
+    }
+
     pub(super) fn wait_for_events(&mut self) {
+        #[cfg(feature = "trace-hotpath")]
+        tracing::trace!("waiting for event fd");
+
         unsafe {
             libc::eventfd_read(self.inner.fd, &raw mut self.value);
         }

@@ -6,4 +6,4 @@ if [ -z "$NEXTEST_ENV" ]; then
 fi
 
 # Write out an environment variable to $NEXTEST_ENV.
-echo "FAILPOINTS=scheduler_run_fail=return" >> "$NEXTEST_ENV"
+echo "FAILPOINTS=submission_worker_run_fail=return" >> "$NEXTEST_ENV"

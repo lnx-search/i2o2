@@ -202,6 +202,8 @@ impl I2o2Builder {
         let (resource_queue_tx, resource_queue_rx) = super::queue::new(32);
 
         let (waker, waker_controller) = wake::new()?;
+        let wake_on_drop = waker_controller.wake_on_drop();
+
         let resources = Arc::new(RegisteredResources::new(
             self.num_registered_files,
             self.num_registered_buffers,
@@ -244,6 +246,7 @@ impl I2o2Builder {
         let completion = I2o2CompletionWorker {
             ring,
             switch,
+            submission_worker_waker: wake_on_drop,
             event_fd: event_fd_waker,
             inflight_inventory: inventory,
             resources,
@@ -274,10 +277,16 @@ impl I2o2Builder {
             let (submission_worker, completion_worker, handle) =
                 self.try_create_inner()?;
 
+            #[cfg(test)]
+            fail::fail_point!("scheduler_spawn_fail", |_| {
+                Err(io::Error::other("test error triggered by failpoints"))
+            });
+
             tx.send((completion_worker, handle)).unwrap();
 
             if let Err(e) = submission_worker.run() {
                 tracing::error!(error = %e, "submission worker aborted early");
+                return Err(e);
             }
 
             Ok::<_, io::Error>(())
@@ -309,6 +318,7 @@ impl I2o2Builder {
 
             if let Err(e) = completion_worker.run() {
                 tracing::error!(error = %e, "completion worker aborted early");
+                return Err(e);
             }
 
             Ok::<_, io::Error>(())
@@ -345,7 +355,7 @@ impl I2o2Builder {
         if self.io_poll {
             params.flags |= IORING_SETUP_IOPOLL;
         }
-        
+
         if probe.is_kernel_v5_19_or_newer() {
             params.flags |= IORING_SETUP_COOP_TASKRUN;
         }

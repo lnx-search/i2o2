@@ -25,12 +25,21 @@ filter = "test(/failpoint_kernel_v6_1_/)"
 setup = "failpoint_kernel_v6_1"
 
 [[profile.default.scripts]]
-filter = "test(/failpoint_scheduler_run_fail_/)"
-setup = "failpoint_scheduler_run_fail"
+filter = "test(/failpoint_scheduler_spawn_fail_/)"
+setup = "failpoint_scheduler_spawn_fail"
 
 [[profile.default.scripts]]
 filter = "test(/failpoint_scheduler_create_fail_/)"
 setup = "failpoint_scheduler_create_fail"
+
+[[profile.default.scripts]]
+filter = "test(/failpoint_submission_worker_run_fail_/)"
+setup = "failpoint_submission_worker_run_fail"
+
+[[profile.default.scripts]]
+filter = "test(/failpoint_completion_worker_run_fail_/)"
+setup = "failpoint_completion_worker_run_fail"
+
 
 [script.failpoint_kernel_v5_13]
 command = ".config/scripts/failpoint_kernel_v5_13.sh"
@@ -50,8 +59,14 @@ command = ".config/scripts/failpoint_kernel_v6_0.sh"
 [script.failpoint_kernel_v6_1]
 command = ".config/scripts/failpoint_kernel_v6_1.sh"
 
-[script.failpoint_scheduler_run_fail]
-command = ".config/scripts/failpoint_scheduler_run_fail.sh"
+[script.failpoint_scheduler_spawn_fail]
+command = ".config/scripts/failpoint_scheduler_spawn_fail.sh"
 
 [script.failpoint_scheduler_create_fail]
 command = ".config/scripts/failpoint_scheduler_create_fail.sh"
+
+[script.failpoint_submission_worker_run_fail]
+command = ".config/scripts/failpoint_submission_worker_run_fail.sh"
+
+[script.failpoint_completion_worker_run_fail]
+command = ".config/scripts/failpoint_completion_worker_run_fail.sh"

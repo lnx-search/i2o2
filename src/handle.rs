@@ -1,3 +1,4 @@
+use std::fmt::{Debug, Formatter};
 use std::io;
 use std::io::ErrorKind;
 
@@ -71,6 +72,12 @@ impl<G> I2o2Handle<G> {
             resource_queue,
             waker,
         }
+    }
+}
+
+impl<G> Debug for I2o2Handle<G> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "I2o2Handle(dms={})", self.switch.is_set())
     }
 }
 
