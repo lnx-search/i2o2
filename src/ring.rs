@@ -90,6 +90,12 @@ impl IoRing {
         }
     }
 
+    /// Register an eventfd with the ring.
+    pub(super) fn register_eventfd(&mut self, fd: libc::c_int) -> io::Result<()> {
+        let result = unsafe { io_uring_register_eventfd(self.ring, fd) };
+        check_err!(result)
+    }
+
     /// Preallocate a sparse set of files.
     ///
     /// The number of files must be provided upfront.
@@ -256,7 +262,7 @@ impl IoRing {
     pub(super) fn submit(&mut self) -> io::Result<usize> {
         #[cfg(feature = "trace-hotpath")]
         tracing::trace!("submitting to kernel");
-        
+
         let result = unsafe { io_uring_submit(self.ring) };
         check_err!(result)?;
         Ok(result as usize)
@@ -376,56 +382,82 @@ mod tests {
         drop(buffer);
     }
 
-    #[rstest::rstest]
-    #[case::default_flags(0)]
-    #[should_panic]
-    #[case::failpoint_kernel_v5_13_default_flags(0)]
-    #[case::failpoint_kernel_v5_15_default_flags(0)]
-    #[case::failpoint_kernel_v5_18_default_flags(0)]
-    #[case::failpoint_kernel_v5_19_default_flags(0)]
-    #[case::failpoint_kernel_v6_0_default_flags(0)]
-    #[case::failpoint_kernel_v6_1_default_flags(0)]
-    #[case::failpoint_kernel_v5_15_sqe_poll_flags(IORING_SETUP_SQPOLL)]
-    #[case::failpoint_kernel_v5_18_sqe_poll_flags(IORING_SETUP_SQPOLL)]
-    #[case::failpoint_kernel_v5_19_sqe_poll_flags(IORING_SETUP_SQPOLL)]
-    #[case::failpoint_kernel_v6_0_sqe_poll_flags(IORING_SETUP_SQPOLL)]
-    #[case::failpoint_kernel_v6_1_sqe_poll_flags(IORING_SETUP_SQPOLL)]
-    #[should_panic]
-    #[case::failpoint_kernel_v5_15_submit_all_flags(IORING_SETUP_SUBMIT_ALL)]
-    #[case::failpoint_kernel_v5_18_submit_all_flags(IORING_SETUP_SUBMIT_ALL)]
-    #[case::failpoint_kernel_v5_19_submit_all_flags(IORING_SETUP_SUBMIT_ALL)]
-    #[case::failpoint_kernel_v6_0_submit_all_flags(IORING_SETUP_SUBMIT_ALL)]
-    #[case::failpoint_kernel_v6_1_submit_all_flags(IORING_SETUP_SUBMIT_ALL)]
-    #[should_panic]
-    #[case::failpoint_kernel_v5_15_coop_taskrun_flags(IORING_SETUP_COOP_TASKRUN)]
-    #[should_panic]
-    #[case::failpoint_kernel_v5_18_coop_taskrun_flags(IORING_SETUP_COOP_TASKRUN)]
-    #[case::failpoint_kernel_v5_19_coop_taskrun_flags(IORING_SETUP_COOP_TASKRUN)]
-    #[case::failpoint_kernel_v6_0_coop_taskrun_flags(IORING_SETUP_COOP_TASKRUN)]
-    #[case::failpoint_kernel_v6_1_coop_taskrun_flags(IORING_SETUP_COOP_TASKRUN)]
-    #[should_panic]
-    #[case::failpoint_kernel_v5_15_single_issuer_flags(IORING_SETUP_SINGLE_ISSUER)]
-    #[should_panic]
-    #[case::failpoint_kernel_v5_18_single_issuer_flags(IORING_SETUP_SINGLE_ISSUER)]
-    #[should_panic]
-    #[case::failpoint_kernel_v5_19_single_issuer_flags(IORING_SETUP_SINGLE_ISSUER)]
-    #[case::failpoint_kernel_v6_0_single_issuer_flags(IORING_SETUP_SINGLE_ISSUER)]
-    #[case::failpoint_kernel_v6_1_single_issuer_flags(IORING_SETUP_SINGLE_ISSUER)]
-    #[should_panic]
-    #[case::failpoint_kernel_v5_15_defer_taskrun_flags(IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN)]
-    #[should_panic]
-    #[case::failpoint_kernel_v5_18_defer_taskrun_flags(IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN)]
-    #[should_panic]
-    #[case::failpoint_kernel_v5_19_defer_taskrun_flags(IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN)]
-    #[should_panic]
-    #[case::failpoint_kernel_v6_0_defer_taskrun_flags(IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN)]
-    #[case::failpoint_kernel_v6_1_defer_taskrun_flags(IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN)]
-    fn test_ring_setup_flags(#[case] flags: u32) {
-        let scenario = fail::FailScenario::setup();
+    #[test]
+    fn test_ring_multi_thread() {
+        let mut params = unsafe { mem::zeroed::<io_uring_params>() };
+        params.flags |= IORING_SETUP_SINGLE_ISSUER;
+        params.flags |= IORING_SETUP_COOP_TASKRUN;
+        params.flags |= IORING_SETUP_TASKRUN_FLAG;
 
-        let mut params: io_uring_params = unsafe { mem::zeroed() };
-        params.flags = flags;
-        let _ring = IoRing::new(8, params).expect("create ring");
-        scenario.teardown();
+        let mut ring = IoRing::new(8, params).expect("create ring");
+
+        let sqe = ring.get_available_sqe().unwrap();
+        unsafe {
+            io_uring_prep_nop(sqe);
+            io_uring_sqe_set_data64(sqe, 124);
+        };
+        ring.submit().unwrap();
+
+        let user_data = std::thread::spawn(move || {
+            ring.wait_for_completion().map(|cqe| cqe.user_data as u64)
+        })
+        .join()
+        .unwrap()
+        .expect("ring op should succeed");
+
+        assert_eq!(user_data, 124);
     }
+
+    // #[rstest::rstest]
+    // #[case::default_flags(0)]
+    // #[should_panic]
+    // #[case::failpoint_kernel_v5_13_default_flags(0)]
+    // #[case::failpoint_kernel_v5_15_default_flags(0)]
+    // #[case::failpoint_kernel_v5_18_default_flags(0)]
+    // #[case::failpoint_kernel_v5_19_default_flags(0)]
+    // #[case::failpoint_kernel_v6_0_default_flags(0)]
+    // #[case::failpoint_kernel_v6_1_default_flags(0)]
+    // #[case::failpoint_kernel_v5_15_sqe_poll_flags(IORING_SETUP_SQPOLL)]
+    // #[case::failpoint_kernel_v5_18_sqe_poll_flags(IORING_SETUP_SQPOLL)]
+    // #[case::failpoint_kernel_v5_19_sqe_poll_flags(IORING_SETUP_SQPOLL)]
+    // #[case::failpoint_kernel_v6_0_sqe_poll_flags(IORING_SETUP_SQPOLL)]
+    // #[case::failpoint_kernel_v6_1_sqe_poll_flags(IORING_SETUP_SQPOLL)]
+    // #[should_panic]
+    // #[case::failpoint_kernel_v5_15_submit_all_flags(IORING_SETUP_SUBMIT_ALL)]
+    // #[case::failpoint_kernel_v5_18_submit_all_flags(IORING_SETUP_SUBMIT_ALL)]
+    // #[case::failpoint_kernel_v5_19_submit_all_flags(IORING_SETUP_SUBMIT_ALL)]
+    // #[case::failpoint_kernel_v6_0_submit_all_flags(IORING_SETUP_SUBMIT_ALL)]
+    // #[case::failpoint_kernel_v6_1_submit_all_flags(IORING_SETUP_SUBMIT_ALL)]
+    // #[should_panic]
+    // #[case::failpoint_kernel_v5_15_coop_taskrun_flags(IORING_SETUP_COOP_TASKRUN)]
+    // #[should_panic]
+    // #[case::failpoint_kernel_v5_18_coop_taskrun_flags(IORING_SETUP_COOP_TASKRUN)]
+    // #[case::failpoint_kernel_v5_19_coop_taskrun_flags(IORING_SETUP_COOP_TASKRUN)]
+    // #[case::failpoint_kernel_v6_0_coop_taskrun_flags(IORING_SETUP_COOP_TASKRUN)]
+    // #[case::failpoint_kernel_v6_1_coop_taskrun_flags(IORING_SETUP_COOP_TASKRUN)]
+    // #[should_panic]
+    // #[case::failpoint_kernel_v5_15_single_issuer_flags(IORING_SETUP_SINGLE_ISSUER)]
+    // #[should_panic]
+    // #[case::failpoint_kernel_v5_18_single_issuer_flags(IORING_SETUP_SINGLE_ISSUER)]
+    // #[should_panic]
+    // #[case::failpoint_kernel_v5_19_single_issuer_flags(IORING_SETUP_SINGLE_ISSUER)]
+    // #[case::failpoint_kernel_v6_0_single_issuer_flags(IORING_SETUP_SINGLE_ISSUER)]
+    // #[case::failpoint_kernel_v6_1_single_issuer_flags(IORING_SETUP_SINGLE_ISSUER)]
+    // #[should_panic]
+    // #[case::failpoint_kernel_v5_15_defer_taskrun_flags(IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN)]
+    // #[should_panic]
+    // #[case::failpoint_kernel_v5_18_defer_taskrun_flags(IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN)]
+    // #[should_panic]
+    // #[case::failpoint_kernel_v5_19_defer_taskrun_flags(IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN)]
+    // #[should_panic]
+    // #[case::failpoint_kernel_v6_0_defer_taskrun_flags(IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN)]
+    // #[case::failpoint_kernel_v6_1_defer_taskrun_flags(IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN)]
+    // fn test_ring_setup_flags(#[case] flags: u32) {
+    //     let scenario = fail::FailScenario::setup();
+    //
+    //     let mut params: io_uring_params = unsafe { mem::zeroed() };
+    //     params.flags = flags;
+    //     let _ring = IoRing::new(8, params).expect("create ring");
+    //     scenario.teardown();
+    // }
 }

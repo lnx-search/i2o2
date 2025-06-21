@@ -129,8 +129,8 @@ unsafe impl<T: Send> Send for SendPtrWrapper<T> {}
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
     use std::ptr;
+    use std::time::Duration;
 
     use super::*;
 

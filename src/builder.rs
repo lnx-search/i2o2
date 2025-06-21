@@ -8,6 +8,7 @@ use crate::handle::I2o2Handle;
 use crate::inventory::InflightInventory;
 use crate::opcode::RingProbe;
 use crate::{
+    EventFdWaiter,
     I2o2CompletionWorker,
     I2o2SchedulerThreadHandle,
     I2o2SubmissionWorker,
@@ -217,6 +218,9 @@ impl I2o2Builder {
         self.setup_registered_resources(&mut ring)?;
         tracing::debug!("successfully registered resources with ring");
 
+        let event_fd_waker = EventFdWaiter::new();
+        ring.register_eventfd(event_fd_waker.fd)?;
+
         let handle = I2o2Handle::new(
             switch.clone().into_weak(),
             io_queue_tx,
@@ -240,6 +244,7 @@ impl I2o2Builder {
         let completion = I2o2CompletionWorker {
             ring,
             switch,
+            event_fd: event_fd_waker,
             inflight_inventory: inventory,
             resources,
         };
@@ -255,9 +260,7 @@ impl I2o2Builder {
     where
         G: Send + 'static,
     {
-        let (submission_worker, completion_worker, handle) = self.try_create_inner()?;
-
-        let switch = submission_worker.switch.clone().into_weak();
+        let (tx, rx) = flume::bounded(1);
 
         let submission_task = move || {
             if let Some(set) = submission_cpu_set {
@@ -268,12 +271,32 @@ impl I2o2Builder {
                 );
             }
 
+            let (submission_worker, completion_worker, handle) =
+                self.try_create_inner()?;
+
+            tx.send((completion_worker, handle)).unwrap();
+
             if let Err(e) = submission_worker.run() {
-                tracing::error!(error = %e, "submission worker aborted early");                
+                tracing::error!(error = %e, "submission worker aborted early");
             }
 
             Ok::<_, io::Error>(())
         };
+
+        let submission_worker = std::thread::Builder::new()
+            .name("i2o2-submission-thread".to_string())
+            .spawn(submission_task)
+            .expect("spawn background worker thread");
+
+        let (completion_worker, handle) = match rx.recv() {
+            Ok(pair) => pair,
+            Err(_) => {
+                submission_worker.join().unwrap()?;
+                unreachable!("worker exited, this can never be reached");
+            },
+        };
+
+        let switch = completion_worker.switch.clone().into_weak();
 
         let completion_task = move || {
             if let Some(set) = completion_cpu_set {
@@ -290,11 +313,6 @@ impl I2o2Builder {
 
             Ok::<_, io::Error>(())
         };
-
-        let submission_worker = std::thread::Builder::new()
-            .name("i2o2-submission-thread".to_string())
-            .spawn(submission_task)
-            .expect("spawn background worker thread");
 
         let completion_worker = std::thread::Builder::new()
             .name("i2o2-completion-thread".to_string())
@@ -327,6 +345,9 @@ impl I2o2Builder {
         if self.io_poll {
             params.flags |= IORING_SETUP_IOPOLL;
         }
+
+        params.flags |= IORING_SETUP_DEFER_TASKRUN;
+        params.flags |= IORING_SETUP_COOP_TASKRUN;
 
         ring::IoRing::new(self.ring_depth, params)
     }

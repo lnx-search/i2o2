@@ -180,7 +180,7 @@ pub struct I2o2SubmissionWorker<G> {
 
 impl<G> I2o2SubmissionWorker<G> {
     /// Run the submission worker.
-    pub fn run(mut self) -> io::Result<()> {
+    fn run(mut self) -> io::Result<()> {
         tracing::debug!("submission worker running");
 
         #[cfg(test)]
@@ -208,6 +208,10 @@ impl<G> I2o2SubmissionWorker<G> {
                     }
                 }
 
+                self.waker_controller.ask_for_wake();
+                if !self.incoming_io.is_empty() || !self.incoming_resources.is_empty() {
+                    continue;
+                }
                 self.waker_controller.wait_for_events();
             } else if n_consumed == 0 && self.ring.num_sqe_available() == 0 {
                 for _ in 0..50 {
@@ -218,10 +222,6 @@ impl<G> I2o2SubmissionWorker<G> {
                     }
                 }
 
-                self.waker_controller.ask_for_wake();
-                if !self.incoming_io.is_empty() || !self.incoming_resources.is_empty() {
-                    continue;
-                }
                 self.ring.wait_for_sq_capacity();
             }
         }
@@ -230,6 +230,7 @@ impl<G> I2o2SubmissionWorker<G> {
 
         self.unregister_resources()?;
         self.drain_remaining()?;
+        self.wake_consumer()?;
 
         tracing::debug!("submission worker closed");
 
@@ -259,6 +260,14 @@ impl<G> I2o2SubmissionWorker<G> {
             self.process_incoming_io()?;
         }
 
+        Ok(())
+    }
+
+    fn wake_consumer(&mut self) -> io::Result<()> {
+        self.ring.wait_for_sq_capacity();
+        let sqe = self.ring.get_available_sqe().unwrap();
+        self.write_nop(sqe);
+        self.ring.submit()?;
         Ok(())
     }
 
@@ -301,14 +310,9 @@ impl<G> I2o2SubmissionWorker<G> {
         }
 
         let result = self.ring.submit();
-        tracing::debug!("completed submit");
-        
         self.incoming_io.wake_n(n_read);
-        tracing::debug!(result = ?result, "completed wake");
+        result?;
 
-        let n = result?;
-        tracing::debug!(num_submitted = n, "completed op");
-        
         Ok(n_sqe_consumed)
     }
 
@@ -459,6 +463,7 @@ impl<G> I2o2SubmissionWorker<G> {
 pub struct I2o2CompletionWorker<G> {
     ring: ring::IoRing,
     switch: dms::DeadMansSwitch,
+    event_fd: EventFdWaiter,
     inflight_inventory: Arc<InflightInventory<InflightEntry<G>>>,
 
     /// Registered buffers and files
@@ -467,7 +472,7 @@ pub struct I2o2CompletionWorker<G> {
 
 impl<G> I2o2CompletionWorker<G> {
     /// Run the completion worker.
-    pub fn run(mut self) -> io::Result<()> {
+    fn run(mut self) -> io::Result<()> {
         tracing::debug!("completion worker running");
 
         #[cfg(test)]
@@ -475,6 +480,14 @@ impl<G> I2o2CompletionWorker<G> {
             Err(io::Error::other("test error triggered by failpoints"))
         });
 
+        let result = self.run_event_loop();
+
+        tracing::debug!("completion worker closed");
+
+        result
+    }
+
+    fn run_event_loop(&mut self) -> io::Result<()> {
         while !self.switch.is_set() {
             let num_consumed = self.process_completions();
 
@@ -485,7 +498,8 @@ impl<G> I2o2CompletionWorker<G> {
                         break;
                     }
                 }
-                self.ring.wait_for_completion()?;
+
+                self.event_fd.wait_for_events();
             }
         }
 
@@ -493,15 +507,12 @@ impl<G> I2o2CompletionWorker<G> {
 
         self.drain_remaining()?;
 
-        tracing::debug!("completion worker closed");
-
         Ok(())
     }
 
     fn drain_remaining(&mut self) -> io::Result<()> {
         while self.inflight_inventory.num_inflight() > 0 {
-            let cqe = self.ring.wait_for_completion()?;
-            self.process_completion(cqe);
+            self.event_fd.wait_for_events();
             self.process_completions();
         }
 
@@ -510,13 +521,16 @@ impl<G> I2o2CompletionWorker<G> {
 
     fn process_completions(&mut self) -> usize {
         #[cfg(feature = "trace-hotpath")]
-        tracing::trace!(inflight = self.inflight_inventory.num_inflight(), "cehcking CQE");
-        
+        tracing::trace!(
+            inflight = self.inflight_inventory.num_inflight(),
+            "cehcking CQE"
+        );
+
         let mut num_consumed = 0;
         while let Some(cqe) = self.ring.next_completions() {
             #[cfg(feature = "trace-hotpath")]
             tracing::trace!("got CQE");
-            
+
             self.process_completion(cqe);
             num_consumed += 1;
         }
@@ -608,6 +622,30 @@ impl RegisteredResources {
     fn free_buffer(&self, id: u32) {
         let mut lock = self.buffers.lock();
         lock.try_remove(id as usize);
+    }
+}
+
+struct EventFdWaiter {
+    fd: libc::c_int,
+    value: u64,
+}
+
+impl EventFdWaiter {
+    fn new() -> Self {
+        Self {
+            fd: unsafe { libc::eventfd(0, 0) },
+            value: 0,
+        }
+    }
+
+    fn wait_for_events(&mut self) {
+        unsafe { libc::eventfd_read(self.fd, &raw mut self.value) };
+    }
+}
+
+impl Drop for EventFdWaiter {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.fd) };
     }
 }
 
