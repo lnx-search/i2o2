@@ -18,8 +18,8 @@ pub mod opcode;
 mod queue;
 mod reply;
 mod ring;
-// #[cfg(test)]
-// mod tests;
+#[cfg(test)] 
+mod tests;
 mod dms;
 mod inventory;
 mod wake;
@@ -499,7 +499,9 @@ impl<G> I2o2CompletionWorker<G> {
                     }
                 }
 
-                self.event_fd.wait_for_events();
+                if !self.switch.is_set() {
+                    self.event_fd.wait_for_events();
+                }
             }
         }
 
@@ -512,25 +514,18 @@ impl<G> I2o2CompletionWorker<G> {
 
     fn drain_remaining(&mut self) -> io::Result<()> {
         while self.inflight_inventory.num_inflight() > 0 {
-            self.event_fd.wait_for_events();
             self.process_completions();
+            self.event_fd.wait_for_events();
         }
 
         Ok(())
     }
 
     fn process_completions(&mut self) -> usize {
-        #[cfg(feature = "trace-hotpath")]
-        tracing::trace!(
-            inflight = self.inflight_inventory.num_inflight(),
-            "cehcking CQE"
-        );
-
         let mut num_consumed = 0;
         while let Some(cqe) = self.ring.next_completions() {
             #[cfg(feature = "trace-hotpath")]
-            tracing::trace!("got CQE");
-
+            tracing::trace!(result = cqe.result, user_data = ?cqe.user_data, "got CQE");
             self.process_completion(cqe);
             num_consumed += 1;
         }
@@ -539,7 +534,8 @@ impl<G> I2o2CompletionWorker<G> {
 
     fn process_completion(&mut self, cqe: CqeEntry) {
         let entry = unsafe { ptr::read(cqe.user_data as *mut InflightEntry<G>) };
-
+        entry.print();
+        
         match entry {
             InflightEntry::Nop => {},
             InflightEntry::ResourceOp(entry) => {
@@ -653,6 +649,16 @@ enum InflightEntry<G> {
     Nop,
     ResourceOp(ResourceOpEntry<G>),
     IoOp(IoOpEntry<G>),
+}
+
+impl<G> InflightEntry<G> {
+    fn print(&self) {
+        match self {
+            InflightEntry::Nop => tracing::info!("nop"),
+            InflightEntry::ResourceOp(_) => tracing::info!("resource"),
+            InflightEntry::IoOp(_) => tracing::info!("io"),
+        }
+    }
 }
 
 struct ResourceOpEntry<G> {

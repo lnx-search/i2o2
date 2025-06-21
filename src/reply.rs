@@ -142,6 +142,9 @@ pub struct ReplyNotify {
 impl ReplyNotify {
     /// Set the result of the operation and notify the future.
     pub fn set_result(mut self, result: i32) {
+        #[cfg(feature = "trace-hotpath")]
+        tracing::trace!(result = result, "setting task result");
+        
         let inner = self.inner.as_ref();
         inner.result.store(result as i64, Ordering::SeqCst);
         self.has_set_result = true;

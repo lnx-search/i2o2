@@ -230,6 +230,7 @@ impl IoRing {
         }
     }
 
+    #[cfg(test)]
     /// Wait for at least one completion to be ready.
     pub(super) fn wait_for_completion(&mut self) -> io::Result<CqeEntry> {
         #[cfg(feature = "trace-hotpath")]

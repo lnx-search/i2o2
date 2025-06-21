@@ -345,9 +345,10 @@ impl I2o2Builder {
         if self.io_poll {
             params.flags |= IORING_SETUP_IOPOLL;
         }
-
-        params.flags |= IORING_SETUP_DEFER_TASKRUN;
-        params.flags |= IORING_SETUP_COOP_TASKRUN;
+        
+        if probe.is_kernel_v5_19_or_newer() {
+            params.flags |= IORING_SETUP_COOP_TASKRUN;
+        }
 
         ring::IoRing::new(self.ring_depth, params)
     }

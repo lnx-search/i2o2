@@ -32,7 +32,7 @@ fn test_register_buffers_sync() {
     drop(handle);
     drop(buffer);
 
-    scheduler.join().unwrap().unwrap();
+    scheduler.join().unwrap();
 }
 
 #[tokio::test]
@@ -65,7 +65,7 @@ async fn test_register_buffers_async() {
     drop(handle);
     drop(buffer);
 
-    scheduler.join().unwrap().unwrap();
+    scheduler.join().unwrap();
 }
 
 #[test]
@@ -109,7 +109,7 @@ fn test_register_files_sync() {
     drop(handle);
     drop(file);
 
-    scheduler.join().unwrap().unwrap();
+    scheduler.join().unwrap();
 }
 
 #[tokio::test]
@@ -156,5 +156,5 @@ async fn test_register_files_async() {
     drop(handle);
     drop(file);
 
-    scheduler.join().unwrap().unwrap();
+    scheduler.join().unwrap();
 }

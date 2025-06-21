@@ -5,15 +5,17 @@ use std::time::Duration;
 
 use fail::FailScenario;
 
-use crate::{I2o2Handle, I2o2Scheduler, SchedulerClosed, opcode};
+use crate::{SchedulerClosed, opcode, I2o2Builder};
 
 #[rstest::rstest]
-#[case::size64(crate::create_for_current_thread::<Arc<()>>().unwrap())]
-#[case::size128(crate::builder().with_sqe_size128(true).try_create::<Arc<()>>().unwrap())]
-fn test_scheduler_noop(#[case] pair: (I2o2Scheduler<Arc<()>>, I2o2Handle<Arc<()>>)) {
+#[case::size64(crate::builder())]
+#[case::size128(crate::builder().with_sqe_size128(true))]
+fn test_scheduler_noop(#[case] builder: I2o2Builder) {
     super::try_init_logging();
-
-    let (scheduler, handle) = pair;
+    
+    let (scheduler, handle) = builder
+        .try_spawn::<()>()
+        .unwrap();
     let handle2 = handle.clone();
 
     let op = opcode::Nop::new();
@@ -28,8 +30,6 @@ fn test_scheduler_noop(#[case] pair: (I2o2Scheduler<Arc<()>>, I2o2Handle<Arc<()>
     drop(handle);
     drop(handle2);
 
-    scheduler.run().expect("run scheduler");
-
     let result = reply.wait().expect("operation should complete");
     eprintln!("completed result: {result}");
     if result != 0 {
@@ -38,17 +38,19 @@ fn test_scheduler_noop(#[case] pair: (I2o2Scheduler<Arc<()>>, I2o2Handle<Arc<()>
             io::Error::from_raw_os_error(result)
         );
     }
+    
+    scheduler.join().unwrap();
 }
 
 #[rstest::rstest]
-#[case::size64(crate::create_for_current_thread::<Arc<()>>().unwrap())]
-#[case::size128(crate::builder().with_sqe_size128(true).try_create::<Arc<()>>().unwrap())]
-fn test_scheduler_noop_with_guard(
-    #[case] pair: (I2o2Scheduler<Arc<()>>, I2o2Handle<Arc<()>>),
-) {
+#[case::size64(crate::builder())]
+#[case::size128(crate::builder().with_sqe_size128(true))]
+fn test_scheduler_noop_with_guard(#[case] builder: I2o2Builder) {
     super::try_init_logging();
 
-    let (scheduler, handle) = pair;
+    let (scheduler, handle) = builder
+        .try_spawn()
+        .unwrap();
     let guard = Arc::new(());
 
     let op = opcode::Nop::new();
@@ -64,8 +66,6 @@ fn test_scheduler_noop_with_guard(
     eprintln!("completed submit");
     drop(handle);
 
-    scheduler.run().expect("run scheduler");
-    assert_eq!(Arc::strong_count(&guard), 1);
     eprintln!("got reply: {reply:?}");
 
     let result = reply.wait().expect("operation should complete");
@@ -77,6 +77,8 @@ fn test_scheduler_noop_with_guard(
         );
     }
     assert_eq!(Arc::strong_count(&guard), 1);
+    
+    scheduler.join().unwrap();
 }
 
 #[test]
@@ -96,7 +98,7 @@ fn failpoint_scheduler_run_fail_try_spawn() {
     let (scheduler, handle) = crate::create_and_spawn::<()>().unwrap();
 
     // Give it a moment to shut down...
-    while !scheduler.is_finished() {
+    while !scheduler.is_running() {
         std::thread::sleep(Duration::from_millis(10));
     }
 
@@ -104,7 +106,7 @@ fn failpoint_scheduler_run_fail_try_spawn() {
     let err = unsafe { handle.submit(op, None).unwrap_err() };
     assert!(matches!(err, SchedulerClosed));
 
-    let err = scheduler.join().unwrap().unwrap_err();
+    let err = scheduler.join().unwrap_err();
     assert_eq!(err.kind(), ErrorKind::Other);
     scenario.teardown();
 }
