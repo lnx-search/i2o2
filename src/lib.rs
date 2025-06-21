@@ -1,9 +1,14 @@
 #![doc = include_str!("../README.md")]
 
 use std::any::Any;
-use std::{io, ptr};
+use std::ffi::c_void;
+use std::mem::MaybeUninit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::{cmp, io, ptr};
+
+use liburing_rs::*;
+
 use crate::inventory::InflightInventory;
 use crate::opcode::sealed::RegisterOp;
 
@@ -15,9 +20,9 @@ mod reply;
 mod ring;
 // #[cfg(test)]
 // mod tests;
-mod wake;
-mod inventory;
 mod dms;
+mod inventory;
+mod wake;
 
 // pub use self::builder::{I2o2Builder, CpuSet};
 // pub use self::handle::{I2o2Handle, RegisterError, SchedulerClosed, SubmitResult};
@@ -34,6 +39,12 @@ pub type DynamicGuard = Box<dyn Any + Send>;
 
 pub(crate) const MAGIC_ERRNO_NO_CAPACITY: i32 = -999;
 pub(crate) const MAGIC_ERRNO_NOT_SIZE128: i32 = -1000;
+
+/// The maximum number of IO ops to schedule before checking
+/// if any resources are waiting to be registered.
+///
+/// This is used to prevent starvation of the resource queue.
+const MAX_IO_OPS_BEFORE_RESOURCE_CONSIDER: usize = 500;
 
 // /// Create a new [I2o2Scheduler] and [I2o2Handle] pair backed by io_uring.
 // ///
@@ -110,7 +121,6 @@ pub(crate) const MAGIC_ERRNO_NOT_SIZE128: i32 = -1000;
 //     I2o2Builder::const_default()
 // }
 
-
 /// The thread handles for the i2o2 scheduler worker threads.
 pub struct I2o2SchedulerThreadHandle {
     switch: dms::WeakDeadMansSwitch,
@@ -135,16 +145,11 @@ impl I2o2SchedulerThreadHandle {
     /// Join the scheduler threads and wait for them to complete, returning
     ///  the end result.
     pub fn join(self) -> io::Result<()> {
-        self.submission_worker
-            .join()
-            .unwrap()?;
-        self.completion_worker
-            .join()
-            .unwrap()?;
+        self.submission_worker.join().unwrap()?;
+        self.completion_worker.join().unwrap()?;
         Ok(())
     }
 }
-
 
 /// The submission half of the i2o2 scheduler.
 ///
@@ -156,46 +161,267 @@ impl I2o2SchedulerThreadHandle {
 pub struct I2o2SubmissionWorker<G> {
     ring: ring::IoRing,
     switch: dms::DeadMansSwitch,
-    incoming_io: queue::Receiver<()>,
-    incoming_resources: queue::Receiver<()>,
+    /// A waker handle for triggering a completion event on `self`
+    /// intern causing events to be processed.
+    waker_controller: wake::RingWakerController,
+    incoming_io: queue::Receiver<Packaged<opcode::AnyOp, G>>,
+    incoming_resources: queue::Receiver<ResourceMessage<G>>,
     inflight_inventory: Arc<InflightInventory<InflightEntry<G>>>,
+
+    /// Registered buffers and files
+    resources: Arc<RegisteredResources>,
+
+    // Op counters, mostly used for debugging.
+    op_counter_io: u64,
+    op_counter_resource: u64,
+    op_counter_nop: u64,
 }
 
 impl<G> I2o2SubmissionWorker<G> {
     /// Run the submission worker.
     pub fn run(mut self) -> io::Result<()> {
         tracing::debug!("submission worker running");
-        
-        while !self.should_close() {
-            
+
+        #[cfg(test)]
+        fail::fail_point!("submission_worker_run_fail", |_| {
+            Err(io::Error::other("test error triggered by failpoints"))
+        });
+
+        'event_loop: while !self.should_close() {
+            let n_consumed = self.process_incoming_io()?;
+            self.process_incoming_resources()?;
+
+            // If we haven't processed any entries then we should wait for new ops to come
+            // in if we've consumed all IO, or wait for submission queue entries to be
+            // available on the ring.
+            //
+            // We spin a little bit here to try and avoid stalls.
+            if !self.incoming_resources.is_empty() {
+                continue;
+            } else if n_consumed == 0 && self.incoming_io.is_empty() {
+                for _ in 0..50 {
+                    if !self.incoming_io.is_empty()
+                        || !self.incoming_resources.is_empty()
+                    {
+                        continue 'event_loop;
+                    }
+                }
+
+                self.waker_controller.wait_for_events();
+            } else if n_consumed == 0 && self.ring.num_sqe_available() == 0 {
+                for _ in 0..50 {
+                    if self.ring.num_sqe_available() > 0
+                        || !self.incoming_resources.is_empty()
+                    {
+                        continue 'event_loop;
+                    }
+                }
+
+                self.ring.wait_for_sq_capacity();
+            }
         }
-        
+
         tracing::debug!("submission worker draining remaining");
 
-        self.drain_remaining();
+        self.drain_remaining()?;
 
         tracing::debug!("submission worker closed");
-        
+
         Ok(())
     }
-    
+
     fn should_close(&self) -> bool {
-        self.switch.is_set()  || self.incoming_io.is_disconnected()
+        self.switch.is_set() || self.incoming_io.is_disconnected()
     }
-    
-    fn drain_remaining(&mut self) {
+
+    fn drain_remaining(&mut self) -> io::Result<()> {
         // Only drain IO ops, resources will be immediately dropped anyway.
-        while let Some(op) = self.incoming_io.pop() {
-            
+        while !self.incoming_io.is_empty() {
+            self.ring.wait_for_sq_capacity();
+            self.process_incoming_io()?;
+        }
+
+        Ok(())
+    }
+
+    fn process_incoming_io(&mut self) -> io::Result<usize> {
+        let mut pop_n =
+            cmp::min(self.incoming_io.len(), MAX_IO_OPS_BEFORE_RESOURCE_CONSIDER);
+
+        let mut n_read = 0;
+        let mut n_sqe_consumed = 0;
+        for _ in 0..pop_n {
+            let Some(sqe) = self.ring.get_available_sqe() else {
+                break;
+            };
+
+            n_sqe_consumed += 1;
+
+            let msg = match self.incoming_io.pop() {
+                Some(msg) => msg,
+                // Should never happen, but we need to handle it anyway
+                // to avoid replaying past events.
+                None => {
+                    self.write_nop(sqe);
+                    break;
+                },
+            };
+
+            n_read += 1;
+
+            if msg.entry.requires_size128() && !self.ring.is_size128() {
+                #[cfg(feature = "trace-hotpath")]
+                tracing::trace!(
+                    "rejecting op because size128 is required but not active"
+                );
+                self.write_nop(sqe);
+                let _ = msg.reply.set_result(MAGIC_ERRNO_NOT_SIZE128);
+                continue;
+            }
+
+            self.handle_io_op(sqe, msg);
+        }
+
+        let result = self.ring.submit();
+        self.incoming_io.wake_n(n_read);
+
+        result?;
+
+        Ok(n_sqe_consumed)
+    }
+
+    fn process_incoming_resources(&mut self) -> io::Result<()> {
+        while let Some(msg) = self.incoming_resources.pop() {
+            match msg {
+                ResourceMessage::RegisterResource(msg) => {
+                    self.handle_register_resource_op(msg)
+                },
+                ResourceMessage::UnregisterResource(msg) => {
+                    self.handle_unregister_resource_op(msg)
+                },
+            }
+        }
+
+        self.incoming_resources.wake_all();
+
+        Ok(())
+    }
+
+    fn handle_io_op(&mut self, sqe: &mut io_uring_sqe, msg: Packaged<opcode::AnyOp, G>) {
+        self.op_counter_io += 1;
+
+        let Packaged {
+            entry,
+            reply,
+            guard,
+        } = msg;
+        entry.register_with_sqe(sqe);
+
+        #[cfg(feature = "trace-hotpath")]
+        tracing::trace!(
+            io_id = self.op_counter_io,
+            has_guard = guard.is_some(),
+            "processing IO"
+        );
+
+        let entry = InflightEntry::IoOp(IoOpEntry {
+            io_id: self.op_counter_io,
+            reply,
+            guard,
+        });
+
+        let ptr = self.inflight_inventory.write_to_free_ptr(entry);
+        unsafe { io_uring_sqe_set_data(sqe, ptr as *mut c_void) };
+    }
+
+    fn handle_register_resource_op(&mut self, msg: Packaged<Resource, G>) {
+        self.op_counter_resource += 1;
+
+        let Packaged {
+            entry: resource,
+            reply,
+            guard,
+        } = msg;
+
+        let resource_type = resource.resource_type();
+
+        let maybe_resource_id = match resource_type {
+            ResourceType::File => self.resources.alloc_file(),
+            ResourceType::Buffer => self.resources.alloc_buffer(),
+        };
+
+        let resource_id = match maybe_resource_id {
+            Some(resource_id) => resource_id,
+            None => {
+                reply.set_result(MAGIC_ERRNO_NO_CAPACITY);
+                return;
+            },
+        };
+
+        #[cfg(feature = "trace-hotpath")]
+        tracing::trace!(
+            resource_type = ?resource_type,
+            resource_id = resource_id,
+            "processing resource"
+        );
+
+        let entry = InflightEntry::ResourceOp(ResourceOpEntry {
+            resource_id,
+            resource_type: resource.resource_type(),
+            guard,
+        });
+
+        let ptr = self.inflight_inventory.write_to_free_ptr(entry);
+        let tag = (ptr as *mut c_void) as u64;
+
+        let result = match resource {
+            Resource::Buffer(buf) => self.ring.register_buffer(resource_id, buf, tag),
+            Resource::File(fd) => self.ring.register_file(resource_id, fd, tag),
+        };
+
+        // Happy path, we can just reply and complete.
+        if result.is_ok() {
+            reply.set_result(resource_id as i32);
+            return;
+        }
+
+        // Sad path.
+        // We need to clean up the inventory entry as it will not be done
+        // by the completion worker due to the error.
+        unsafe { ptr::drop_in_place(ptr) };
+        self.inflight_inventory
+            .push_free_ptr(ptr as *mut MaybeUninit<G>);
+
+        let err = result.unwrap_err();
+        reply.set_result(err.raw_os_error().unwrap());
+    }
+
+    fn handle_unregister_resource_op(&mut self, op: Packaged<ResourceIndex, G>) {
+        let Packaged { entry, reply, .. } = op;
+
+        let result = match entry {
+            ResourceIndex::File(id) => self.ring.unregister_file(id),
+        };
+
+        if let Err(err) = result {
+            reply.set_result(err.raw_os_error().unwrap());
+        } else {
+            reply.set_result(0);
         }
     }
-    
-    fn process_incoming_io(&mut self) {
-        
-    }
-    
-    fn process_incoming_resources(&mut self) {
-        
+
+    fn write_nop(&mut self, sqe: &mut io_uring_sqe) {
+        self.op_counter_nop += 1;
+
+        #[cfg(feature = "trace-hotpath")]
+        tracing::trace!(nop_id = self.op_counter_nop, "processing nop");
+
+        let op = opcode::Nop::new();
+        op.register_with_sqe(sqe);
+        let ptr = self
+            .inflight_inventory
+            .write_to_free_ptr(InflightEntry::Nop);
+        unsafe { io_uring_sqe_set_data(sqe, ptr as *mut c_void) };
     }
 }
 
@@ -210,28 +436,36 @@ pub struct I2o2CompletionWorker<G> {
     ring: ring::IoRing,
     switch: dms::DeadMansSwitch,
     inflight_inventory: Arc<InflightInventory<InflightEntry<G>>>,
+
+    /// Registered buffers and files
+    resources: Arc<RegisteredResources>,
 }
 
 impl<G> I2o2CompletionWorker<G> {
     /// Run the completion worker.
     pub fn run(mut self) -> io::Result<()> {
         tracing::debug!("completion worker running");
-        
+
+        #[cfg(test)]
+        fail::fail_point!("completion_worker_run_fail", |_| {
+            Err(io::Error::other("test error triggered by failpoints"))
+        });
+
         let mut num_completions_available = self.ring.num_completions_available();
         while !self.switch.is_set() {
             if num_completions_available == 0 {
                 self.ring.wait_for_completion();
             }
-            
+
             self.process_completions();
         }
 
         tracing::debug!("completion worker draining remaining");
-        
+
         self.drain_remaining();
 
         tracing::debug!("completion worker closed");
-        
+
         Ok(())
     }
 
@@ -246,16 +480,22 @@ impl<G> I2o2CompletionWorker<G> {
         for cqe in self.ring.iter_completions() {
             let entry = unsafe { ptr::read(cqe.user_data as *mut InflightEntry<G>) };
             self.handle_entry_completion(entry, cqe.result);
+            self.inflight_inventory
+                .push_free_ptr(cqe.user_data as *mut MaybeUninit<_>);
         }
     }
-    
+
     fn handle_entry_completion(&mut self, entry: InflightEntry<G>, result: i32) {
         match entry {
             InflightEntry::Nop => {},
             InflightEntry::ResourceOp(entry) => {
                 #[cfg(feature = "trace-hotpath")]
-                tracing::debug!(resource_id = entry.resource_id, "completed resource op");
-                drop(entry);                
+                tracing::debug!(
+                    resource_id = entry.resource_id,
+                    "completed resource op"
+                );
+
+                entry.drop(entry);
             },
             InflightEntry::IoOp(entry) => {
                 #[cfg(feature = "trace-hotpath")]
@@ -266,6 +506,55 @@ impl<G> I2o2CompletionWorker<G> {
     }
 }
 
+struct RegisteredResources {
+    max_files: u32,
+    files: parking_lot::Mutex<slab::Slab<()>>,
+    max_buffers: u32,
+    buffers: parking_lot::Mutex<slab::Slab<()>>,
+}
+
+impl RegisteredResources {
+    fn new(num_files: u32, num_buffers: u32) -> Self {
+        Self {
+            max_files: num_files,
+            files: parking_lot::Mutex::new(slab::Slab::with_capacity(
+                num_files as usize,
+            )),
+            max_buffers: num_buffers,
+            buffers: parking_lot::Mutex::new(slab::Slab::with_capacity(
+                num_buffers as usize,
+            )),
+        }
+    }
+
+    fn alloc_file(&self) -> Option<u32> {
+        let mut lock = self.files.lock();
+        if lock.len() as u32 >= self.max_files {
+            None
+        } else {
+            Some(lock.insert(()) as u32)
+        }
+    }
+
+    fn alloc_buffer(&self) -> Option<u32> {
+        let mut lock = self.buffers.lock();
+        if lock.len() as u32 >= self.max_buffers {
+            None
+        } else {
+            Some(lock.insert(()) as u32)
+        }
+    }
+
+    fn free_file(&self, id: u32) {
+        let mut lock = self.files.lock();
+        lock.try_remove(id as usize);
+    }
+
+    fn free_buffer(&self, id: u32) {
+        let mut lock = self.buffers.lock();
+        lock.try_remove(id as usize);
+    }
+}
 
 enum InflightEntry<G> {
     Nop,
@@ -275,6 +564,7 @@ enum InflightEntry<G> {
 
 struct ResourceOpEntry<G> {
     resource_id: u32,
+    resource_type: ResourceType,
     guard: Option<G>,
 }
 
@@ -284,3 +574,43 @@ struct IoOpEntry<G> {
     guard: Option<G>,
 }
 
+#[derive(Copy, Clone, Debug)]
+enum ResourceType {
+    File,
+    Buffer,
+}
+
+enum ResourceMessage<G> {
+    /// Register a new resource to the ring.
+    RegisterResource(Packaged<Resource, G>),
+    /// Unregister an existing resource on the ring.
+    UnregisterResource(Packaged<ResourceIndex, G>),
+}
+
+#[repr(align(64))]
+struct Packaged<E, G> {
+    entry: E,
+    reply: reply::ReplyNotify,
+    guard: Option<G>,
+}
+
+enum Resource {
+    Buffer(iovec),
+    File(std::os::fd::RawFd),
+}
+
+impl Resource {
+    fn resource_type(&self) -> ResourceType {
+        match self {
+            Resource::Buffer(_) => ResourceType::Buffer,
+            Resource::File(_) => ResourceType::File,
+        }
+    }
+}
+
+// SAFETY: The handle ensures the buffers are safe to send across a thread boundary.
+unsafe impl Send for Resource {}
+
+enum ResourceIndex {
+    File(u32),
+}

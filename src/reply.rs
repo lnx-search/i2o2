@@ -188,7 +188,7 @@ mod tests {
     fn foo() {
         dbg!(size_of::<ReplyNotify>());
     }
-    
+
     #[tokio::test]
     async fn test_normal_notify() {
         let (tx, rx) = super::new();

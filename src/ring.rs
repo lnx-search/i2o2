@@ -1,7 +1,8 @@
-use std::{io, mem, ptr};
 use std::ffi::c_void;
 use std::io::ErrorKind;
 use std::sync::Arc;
+use std::{io, mem, ptr};
+
 use liburing_rs::*;
 
 use crate::opcode::RingProbe;
@@ -16,9 +17,9 @@ macro_rules! check_err {
     }};
 }
 
-
 pub(super) struct IoRing {
     ring_guard: Arc<RingHandle>,
+    ring_size128: bool,
     ring: *mut io_uring,
     probe: Arc<RingProbe>,
 }
@@ -46,10 +47,10 @@ impl IoRing {
 
         let mut ring_guard = Arc::new(RingHandle::zeroed());
         let ring = Arc::as_ptr(&ring_guard) as *mut io_uring;
+        let ring_size128 = params.flags & IORING_SETUP_SQE128 != 0;
 
-        let result = unsafe {
-            io_uring_queue_init_params(queue_size, ring, &raw mut params)
-        };
+        let result =
+            unsafe { io_uring_queue_init_params(queue_size, ring, &raw mut params) };
         check_err!(result)?;
 
         if probe.is_kernel_v5_18_or_newer() {
@@ -59,21 +60,29 @@ impl IoRing {
 
         Ok(Self {
             ring_guard,
+            ring_size128,
             ring,
             probe: Arc::new(probe),
         })
     }
-    
+
+    #[inline]
+    /// Is the ring using 128 byte SQE entries or not.
+    pub(super) fn is_size128(&self) -> bool {
+        self.ring_size128
+    }
+
     /// Creates a (dangerous) clone of the ring reference allowing
     /// two threads to interact with the same ring.
-    /// 
+    ///
     /// # Safety
-    /// 
+    ///
     /// Great care must be taken to ensure the operations performed on the
     /// ring by each thread are separate and do not conflict in any way.
     pub(super) unsafe fn clone_ref(&self) -> Self {
         Self {
             ring_guard: self.ring_guard.clone(),
+            ring_size128: self.ring_size128,
             ring: self.ring,
             probe: self.probe.clone(),
         }
@@ -130,9 +139,8 @@ impl IoRing {
     /// Unregister a single file slot.
     pub(super) fn unregister_file(&mut self, slot: u32) -> io::Result<()> {
         let fds = [-1];
-        let result = unsafe {
-            io_uring_register_files_update(self.ring, slot, fds.as_ptr(), 1)
-        };
+        let result =
+            unsafe { io_uring_register_files_update(self.ring, slot, fds.as_ptr(), 1) };
         check_err!(result)
     }
 
@@ -147,8 +155,7 @@ impl IoRing {
         &mut self,
         num_buffers: u32,
     ) -> io::Result<()> {
-        let result =
-            unsafe { io_uring_register_buffers_sparse(self.ring, num_buffers) };
+        let result = unsafe { io_uring_register_buffers_sparse(self.ring, num_buffers) };
         check_err!(result)
     }
 
@@ -189,6 +196,16 @@ impl IoRing {
         }
     }
 
+    /// Wait for the SQ to have capacity/free SQEs available.
+    pub(super) fn wait_for_sq_capacity(&mut self) {
+        unsafe { io_uring_sqring_wait(self.ring) }
+    }
+
+    /// Wait for the SQ to have capacity/free SQEs available.
+    pub(super) fn num_sqe_available(&mut self) -> usize {
+        unsafe { io_uring_sq_space_left(self.ring) as usize }
+    }
+
     /// Iterates over the available CQEs in the queue.
     pub(super) fn iter_completions(&mut self) -> CqeIterator<'_> {
         let cqe = unsafe { io_uring_cqe_iter_init(self.ring) };
@@ -207,7 +224,7 @@ impl IoRing {
     pub(super) fn wait_for_completion(&mut self) {
         unsafe { io_uring_wait_cqe(self.ring, ptr::null_mut()) }
     }
-    
+
     /// Advances the CQEs seen in the queue.
     pub(self) fn advance_seen_cqe(&mut self, cqe: *mut io_uring_cqe) {
         unsafe { io_uring_cqe_seen(self.ring, cqe) }

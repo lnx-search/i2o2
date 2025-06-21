@@ -30,7 +30,9 @@ impl<T> InflightInventory<T> {
         for i in 0..size {
             let free_ptr = unsafe { buffer_ptr.add(i) };
             if free_ptrs.push(SendPtrWrapper(free_ptr)).is_err() {
-                panic!("queue is full despite being in the process of setup, this should never happen");
+                panic!(
+                    "queue is full despite being in the process of setup, this should never happen"
+                );
             }
         }
 
@@ -41,7 +43,7 @@ impl<T> InflightInventory<T> {
             condvar: parking_lot::Condvar::new(),
         })
     }
-    
+
     /// Returns the number of ops current inflight on the ring.
     pub(super) fn num_inflight(&self) -> usize {
         self.buffer.len() - self.free_ptrs.len()
@@ -75,7 +77,7 @@ impl<T> InflightInventory<T> {
         #[cfg(feature = "trace-hotpath")]
         tracing::trace!("pointer has been marked as free for inventory");
     }
- 
+
     fn try_pop_free_ptr_spin(&self) -> Option<*mut MaybeUninit<T>> {
         if let Some(ptr) = self.free_ptrs.pop() {
             return Some(ptr.0);
@@ -112,7 +114,10 @@ impl<T> InflightInventory<T> {
     fn wake_if_needed(&self) -> bool {
         let did_wake = self.condvar.notify_one();
         #[cfg(feature = "trace-hotpath")]
-        tracing::trace!(did_wake = did_wake, "I attempted to wake an outstanding task if applicable");       
+        tracing::trace!(
+            did_wake = did_wake,
+            "I attempted to wake an outstanding task if applicable"
+        );
         did_wake
     }
 }
@@ -121,10 +126,10 @@ struct SendPtrWrapper<T>(*mut T);
 
 unsafe impl<T: Send> Send for SendPtrWrapper<T> {}
 
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -133,10 +138,14 @@ mod tests {
         assert_eq!(inventory.free_ptrs.len(), 2);
 
         let ptr1 = inventory.write_to_free_ptr(String::from("Hello, world!"));
-        unsafe { assert_eq!((*ptr1).as_str(), "Hello, world!"); };
+        unsafe {
+            assert_eq!((*ptr1).as_str(), "Hello, world!");
+        };
 
         let ptr2 = inventory.write_to_free_ptr(String::from("Hello, world 2"));
-        unsafe { assert_eq!((*ptr2).as_str(), "Hello, world 2"); };
+        unsafe {
+            assert_eq!((*ptr2).as_str(), "Hello, world 2");
+        };
         assert_eq!(inventory.free_ptrs.len(), 0);
 
         inventory.push_free_ptr(ptr1);
@@ -155,10 +164,14 @@ mod tests {
         assert_eq!(inventory.free_ptrs.len(), 2);
 
         let ptr1 = inventory.write_to_free_ptr(String::from("Hello, world!"));
-        unsafe { assert_eq!((*ptr1).as_str(), "Hello, world!"); };
+        unsafe {
+            assert_eq!((*ptr1).as_str(), "Hello, world!");
+        };
 
         let ptr2 = inventory.write_to_free_ptr(String::from("Hello, world 2"));
-        unsafe { assert_eq!((*ptr2).as_str(), "Hello, world 2"); };
+        unsafe {
+            assert_eq!((*ptr2).as_str(), "Hello, world 2");
+        };
         assert_eq!(inventory.free_ptrs.len(), 0);
 
         let inventory_copy = inventory.clone();
