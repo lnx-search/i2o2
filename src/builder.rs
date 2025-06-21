@@ -8,7 +8,6 @@ use crate::handle::I2o2Handle;
 use crate::inventory::InflightInventory;
 use crate::opcode::RingProbe;
 use crate::{
-    EventFdWaiter,
     I2o2CompletionWorker,
     I2o2SchedulerThreadHandle,
     I2o2SubmissionWorker,
@@ -201,18 +200,17 @@ impl I2o2Builder {
         let (io_queue_tx, io_queue_rx) = super::queue::new(self.queue_size as usize);
         let (resource_queue_tx, resource_queue_rx) = super::queue::new(32);
 
-        let (waker, waker_controller) = wake::new()?;
-        let wake_on_drop = waker_controller.wake_on_drop();
+        let (submission_waker, submission_wc) = wake::new()?;
+        let submission_wake_on_drop = submission_wc.make_wake_on_drop();
+
+        let (completion_waker, completion_wc) = wake::new()?;
 
         let resources = Arc::new(RegisteredResources::new(
             self.num_registered_files,
             self.num_registered_buffers,
         ));
 
-        let inventory_size = (self.queue_size * 4)
-            + self.num_registered_files
-            + self.num_registered_buffers;
-        let inventory = InflightInventory::new(inventory_size as usize);
+        let inventory = InflightInventory::new((self.queue_size * 4) as usize);
 
         let mut ring = self.setup_io_ring()?;
         tracing::debug!("ring created");
@@ -220,20 +218,20 @@ impl I2o2Builder {
         self.setup_registered_resources(&mut ring)?;
         tracing::debug!("successfully registered resources with ring");
 
-        let event_fd_waker = EventFdWaiter::new();
-        ring.register_eventfd(event_fd_waker.fd)?;
+        ring.register_eventfd(completion_wc.fd())?;
 
         let handle = I2o2Handle::new(
             switch.clone().into_weak(),
             io_queue_tx,
             resource_queue_tx,
-            waker,
+            submission_waker,
         );
 
         let submission = I2o2SubmissionWorker {
             ring: unsafe { ring.clone_ref() },
             switch: switch.clone(),
-            waker_controller,
+            waker_controller: submission_wc,
+            completion_waker,
             incoming_io: io_queue_rx,
             incoming_resources: resource_queue_rx,
             inflight_inventory: inventory.clone(),
@@ -246,8 +244,8 @@ impl I2o2Builder {
         let completion = I2o2CompletionWorker {
             ring,
             switch,
-            submission_worker_waker: wake_on_drop,
-            event_fd: event_fd_waker,
+            waker_controller: completion_wc,
+            submission_worker_waker: submission_wake_on_drop,
             inflight_inventory: inventory,
             resources,
         };
@@ -359,6 +357,10 @@ impl I2o2Builder {
         if probe.is_kernel_v5_19_or_newer() {
             params.flags |= IORING_SETUP_COOP_TASKRUN;
         }
+
+        params.cq_entries = self.ring_depth * 4;
+        params.features |= IORING_FEAT_NODROP;
+        params.features |= IORING_FEAT_FAST_POLL;
 
         ring::IoRing::new(self.ring_depth, params)
     }

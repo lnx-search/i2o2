@@ -30,7 +30,11 @@ static BASE_PATH: &str = "./benchmark-data/benchmark-xfs";
 const BUFFER_SIZE: usize = 8 << 10;
 const RUN_DURATION: Duration = Duration::from_secs(15);
 const THREADED_CONCURRENCY_LEVELS: [usize; 4] = [1, 64, 256, 512];
-const ASYNC_CONCURRENCY_LEVELS: [usize; 5] = [1, 64, 1024, 2048, 4096];
+const ASYNC_CONCURRENCY_LEVELS: [usize; 3] = [
+    // 1,
+    // 64,
+    1024, 2048, 4096,
+];
 
 const PIN_SCHEDULER_THREAD_TO_CORE: u32 = 5;
 const SIZE_100GB: usize = 100 << 30;
@@ -250,8 +254,6 @@ async fn execute_i2o2_bench(
     cpu_set.set(8);
 
     let (scheduler_handle, handle) = i2o2::builder()
-        .with_sq_polling(true)
-        .with_sq_polling_timeout(Duration::from_millis(100))
         .with_queue_size((concurrency * 2) as u32)
         .with_num_registered_files(1)
         .with_num_registered_buffers(concurrency as u32)
@@ -315,8 +317,8 @@ async fn execute_i2o2_bench(
         });
     }
 
-    for handle in handles.join_all().await {
-        handle?;
+    for result in handles.join_all().await {
+        result?;
     }
 
     let total_ops = total_op_count.load(Ordering::Relaxed);
@@ -325,7 +327,7 @@ async fn execute_i2o2_bench(
     results.push("i2o2", file_size, concurrency, BUFFER_SIZE, iops);
 
     drop(handle);
-    scheduler_handle.join().unwrap()?;
+    scheduler_handle.join()?;
 
     Ok(())
 }

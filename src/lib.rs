@@ -177,6 +177,9 @@ pub struct I2o2SubmissionWorker<G> {
     /// A waker handle for triggering a completion event on `self`
     /// intern causing events to be processed.
     waker_controller: wake::RingWakerController,
+    /// The waker event fd for the completion worker.
+    completion_waker: wake::RingWaker,
+
     incoming_io: queue::Receiver<Packaged<opcode::AnyOp, G>>,
     incoming_resources: queue::Receiver<ResourceMessage<G>>,
     inflight_inventory: Arc<InflightInventory<InflightEntry<G>>>,
@@ -244,9 +247,8 @@ impl<G> I2o2SubmissionWorker<G> {
 
         tracing::debug!("submission worker draining remaining");
 
-        self.unregister_resources()?;
         self.drain_remaining()?;
-        self.wake_consumer()?;
+        self.completion_waker.maybe_wake();
 
         tracing::debug!("submission worker closed");
 
@@ -257,18 +259,6 @@ impl<G> I2o2SubmissionWorker<G> {
         self.switch.is_set() || self.incoming_io.is_disconnected()
     }
 
-    fn unregister_resources(&mut self) -> io::Result<()> {
-        if self.resources.should_unregister_files() {
-            self.ring.unregister_files()?;
-        }
-
-        if self.resources.should_unregister_buffers() {
-            self.ring.unregister_buffers()?;
-        }
-
-        Ok(())
-    }
-
     fn drain_remaining(&mut self) -> io::Result<()> {
         // Only drain IO ops, resources will be immediately dropped anyway.
         while !self.incoming_io.is_empty() {
@@ -277,15 +267,6 @@ impl<G> I2o2SubmissionWorker<G> {
                 self.ring.wait_for_sq_capacity();
             }
         }
-
-        Ok(())
-    }
-
-    fn wake_consumer(&mut self) -> io::Result<()> {
-        self.ring.wait_for_sq_capacity();
-        let sqe = self.ring.get_available_sqe().unwrap();
-        self.write_nop(sqe);
-        self.ring.submit()?;
         Ok(())
     }
 
@@ -481,11 +462,13 @@ impl<G> I2o2SubmissionWorker<G> {
 pub struct I2o2CompletionWorker<G> {
     ring: ring::IoRing,
     switch: dms::DeadMansSwitch,
+    /// A waker handle for triggering a completion event on `self`
+    /// intern causing events to be processed.
+    waker_controller: wake::RingWakerController,
     #[allow(unused)]
     /// A guard waker that ensures the submission worker is woken if the completion
     /// worker shuts down.
     submission_worker_waker: WakeOnDrop,
-    event_fd: EventFdWaiter,
     inflight_inventory: Arc<InflightInventory<InflightEntry<G>>>,
 
     /// Registered buffers and files
@@ -518,15 +501,13 @@ impl<G> I2o2CompletionWorker<G> {
             let num_consumed = self.process_completions();
 
             if num_consumed == 0 {
-                for _ in 0..50 {
-                    let num_consumed = self.process_completions();
-                    if num_consumed != 0 {
-                        break;
-                    }
-                }
-
                 if !self.switch.is_set() {
-                    self.event_fd.wait_for_events();
+                    self.waker_controller.ask_for_wake();
+                    let num_consumed = self.process_completions();
+                    if self.switch.is_set() || num_consumed != 0 {
+                        continue;
+                    }
+                    self.waker_controller.wait_for_events();
                 }
             }
         }
@@ -539,10 +520,15 @@ impl<G> I2o2CompletionWorker<G> {
     }
 
     fn drain_remaining(&mut self) -> io::Result<()> {
-        while self.inflight_inventory.num_inflight() > 0 {
+        while self.inflight_inventory.num_inflight() > self.resources.total_resources() {
             let consumed = self.process_completions();
             if consumed == 0 {
-                self.event_fd.wait_for_events();
+                self.waker_controller.ask_for_wake();
+                let num_consumed = self.process_completions();
+                if num_consumed != 0 {
+                    continue;
+                }
+                self.waker_controller.wait_for_events();
             }
         }
 
@@ -611,12 +597,11 @@ impl RegisteredResources {
         }
     }
 
-    fn should_unregister_files(&self) -> bool {
-        self.max_files != 0
-    }
-
-    fn should_unregister_buffers(&self) -> bool {
-        self.max_buffers != 0
+    fn total_resources(&self) -> usize {
+        let mut total = 0;
+        total += self.files.lock().len();
+        total += self.buffers.lock().len();
+        total
     }
 
     fn alloc_file(&self) -> Option<u32> {
@@ -645,30 +630,6 @@ impl RegisteredResources {
     fn free_buffer(&self, id: u32) {
         let mut lock = self.buffers.lock();
         lock.try_remove(id as usize);
-    }
-}
-
-struct EventFdWaiter {
-    fd: libc::c_int,
-    value: u64,
-}
-
-impl EventFdWaiter {
-    fn new() -> Self {
-        Self {
-            fd: unsafe { libc::eventfd(0, 0) },
-            value: 0,
-        }
-    }
-
-    fn wait_for_events(&mut self) {
-        unsafe { libc::eventfd_read(self.fd, &raw mut self.value) };
-    }
-}
-
-impl Drop for EventFdWaiter {
-    fn drop(&mut self) {
-        unsafe { libc::close(self.fd) };
     }
 }
 

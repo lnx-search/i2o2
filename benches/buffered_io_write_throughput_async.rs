@@ -216,7 +216,7 @@ async fn sequential_write_repeating_ring(
     let elapsed = now.elapsed();
 
     drop(handle);
-    scheduler_thread_handle.join().unwrap()?;
+    scheduler_thread_handle.join()?;
 
     Ok(elapsed)
 }
@@ -284,7 +284,7 @@ async fn right_behind_write_repeating_ring(
     let elapsed = now.elapsed();
 
     drop(handle);
-    scheduler_thread_handle.join().unwrap()?;
+    scheduler_thread_handle.join()?;
 
     Ok(elapsed)
 }

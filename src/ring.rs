@@ -259,6 +259,11 @@ impl IoRing {
         unsafe { io_uring_cqe_seen(self.ring, cqe) }
     }
 
+    /// Advances the CQEs seen in the queue.
+    pub(crate) fn num_cqe_available(&mut self) -> usize {
+        unsafe { io_uring_cq_ready(self.ring) as usize }
+    }
+
     /// Submit any outstanding submissions to the kernel.
     pub(super) fn submit(&mut self) -> io::Result<usize> {
         #[cfg(feature = "trace-hotpath")]
@@ -269,12 +274,21 @@ impl IoRing {
         Ok(result as usize)
     }
 
+    /// Submit any outstanding submissions to the kernel.
+    pub(super) fn submit_and_wait_n(&mut self, n: u32) -> io::Result<usize> {
+        #[cfg(feature = "trace-hotpath")]
+        tracing::trace!(n = n, "submitting to kernel and waiting for N results");
+        let result = unsafe { io_uring_submit_and_wait(self.ring, n) };
+        check_err!(result)?;
+        Ok(result as usize)
+    }
+
     #[cfg(test)]
     /// Submit any outstanding submissions to the kernel and wait for at least
     /// 1 completion event to be ready.
     pub(super) fn submit_and_wait_one(&mut self) -> io::Result<()> {
-        let result = unsafe { io_uring_submit_and_wait(self.ring, 1) };
-        check_err!(result)
+        self.submit_and_wait_n(1)?;
+        Ok(())
     }
 }
 

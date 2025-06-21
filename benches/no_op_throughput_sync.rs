@@ -74,7 +74,7 @@ fn bench_with_config(
 
     let start = Instant::now();
     for worker in worker_handles {
-        worker.join().unwrap()?;
+        worker.join()?;
     }
     let elapsed = start.elapsed();
     let total_ops = num_workers * NUM_OPS_PER_WORKER;
