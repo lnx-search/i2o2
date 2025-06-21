@@ -4,6 +4,8 @@ use std::sync::Arc;
 #[cfg_attr(not(test), tokio::main)]
 #[cfg_attr(test, tokio::test)]
 async fn main() -> io::Result<()> {
+    let _ = tracing_subscriber::fmt::init();
+
     println!("creating our scheduler worker");
 
     // For most cases you can use `create_and_spawn` which uses a set of sane defaults.
@@ -46,9 +48,7 @@ async fn main() -> io::Result<()> {
     // Any outstanding tasks will finish gracefully.
     drop(scheduler_handle);
 
-    thread_handle
-        .join()
-        .expect("scheduler should never panic")?;
+    thread_handle.join()?;
 
     println!("scheduler shutdown complete!");
 

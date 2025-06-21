@@ -42,9 +42,7 @@ fn main() -> io::Result<()> {
     // Any outstanding tasks will finish gracefully.
     drop(scheduler_handle);
 
-    thread_handle
-        .join()
-        .expect("scheduler should never panic")?;
+    thread_handle.join()?;
 
     println!("scheduler shutdown complete!");
 

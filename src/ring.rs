@@ -194,6 +194,9 @@ impl IoRing {
 
     /// Wait for the SQ to have capacity/free SQEs available.
     pub(super) fn wait_for_sq_capacity(&mut self) {
+        #[cfg(feature = "trace-hotpath")]
+        tracing::trace!("waiting for submission capacity");
+
         unsafe { io_uring_sqring_wait(self.ring) };
     }
 
@@ -203,17 +206,45 @@ impl IoRing {
     }
 
     /// Iterates over the available CQEs in the queue.
-    pub(super) fn iter_completions(&mut self) -> CqeIterator<'_> {
-        let cqe = unsafe { io_uring_cqe_iter_init(self.ring) };
-        CqeIterator {
-            ring: self,
-            iter: cqe,
+    pub(super) fn next_completions(&mut self) -> Option<CqeEntry> {
+        let mut cqe = ptr::null_mut::<io_uring_cqe>();
+        unsafe { io_uring_peek_cqe(self.ring, &raw mut cqe) };
+
+        if cqe.is_null() {
+            None
+        } else {
+            unsafe {
+                let entry = CqeEntry {
+                    result: (*cqe).res,
+                    user_data: io_uring_cqe_get_data(cqe),
+                };
+                self.advance_seen_cqe(cqe);
+                Some(entry)
+            }
         }
     }
 
     /// Wait for at least one completion to be ready.
-    pub(super) fn wait_for_completion(&mut self) {
-        unsafe { io_uring_wait_cqe(self.ring, ptr::null_mut()) };
+    pub(super) fn wait_for_completion(&mut self) -> io::Result<CqeEntry> {
+        #[cfg(feature = "trace-hotpath")]
+        tracing::trace!("waiting for completions");
+
+        unsafe {
+            let mut cqe = ptr::null_mut::<io_uring_cqe>();
+            let res = io_uring_wait_cqe(self.ring, &raw mut cqe);
+            if res < 0 {
+                return Err(io::Error::from_raw_os_error(-res));
+            }
+
+            let entry = CqeEntry {
+                result: (*cqe).res,
+                user_data: io_uring_cqe_get_data(cqe),
+            };
+
+            self.advance_seen_cqe(cqe);
+
+            Ok(entry)
+        }
     }
 
     /// Advances the CQEs seen in the queue.
@@ -223,6 +254,9 @@ impl IoRing {
 
     /// Submit any outstanding submissions to the kernel.
     pub(super) fn submit(&mut self) -> io::Result<usize> {
+        #[cfg(feature = "trace-hotpath")]
+        tracing::trace!("submitting to kernel");
+        
         let result = unsafe { io_uring_submit(self.ring) };
         check_err!(result)?;
         Ok(result as usize)
@@ -252,32 +286,6 @@ impl Drop for RingHandle {
         if result < 0 {
             let err = io::Error::from_raw_os_error(-result);
             tracing::error!(error = %err, "cannot shutdown ring");
-        }
-    }
-}
-
-pub(super) struct CqeIterator<'ring> {
-    ring: &'ring mut IoRing,
-    iter: io_uring_cqe_iter,
-}
-
-impl<'ring> Iterator for CqeIterator<'ring> {
-    type Item = CqeEntry;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        unsafe {
-            let mut cqe = std::ptr::null_mut::<io_uring_cqe>();
-            let did_read = io_uring_cqe_iter_next(&raw mut self.iter, &raw mut cqe);
-            if !did_read {
-                None
-            } else {
-                let entry = CqeEntry {
-                    result: (*cqe).res,
-                    user_data: io_uring_cqe_get_data(cqe),
-                };
-                self.ring.advance_seen_cqe(cqe);
-                Some(entry)
-            }
         }
     }
 }
@@ -317,14 +325,13 @@ mod tests {
 
         ring.submit_and_wait_one().expect("submit should succeed");
 
-        let mut iter = ring.iter_completions();
-        let cqe = iter.next();
+        let cqe = ring.next_completions();
         assert!(cqe.is_some(), "expected completion entry to be available");
 
         let cqe = cqe.unwrap();
         let user_data = cqe.user_data;
         assert_eq!(user_data.addr(), 123);
-        assert!(iter.next().is_none());
+        assert!(ring.next_completions().is_none());
     }
 
     #[rstest::rstest]
@@ -416,7 +423,7 @@ mod tests {
     fn test_ring_setup_flags(#[case] flags: u32) {
         let scenario = fail::FailScenario::setup();
 
-        let mut params: io_uring_params = unsafe { std::mem::zeroed() };
+        let mut params: io_uring_params = unsafe { mem::zeroed() };
         params.flags = flags;
         let _ring = IoRing::new(8, params).expect("create ring");
         scenario.teardown();

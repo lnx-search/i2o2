@@ -268,7 +268,9 @@ impl I2o2Builder {
                 );
             }
 
-            submission_worker.run()?;
+            if let Err(e) = submission_worker.run() {
+                tracing::error!(error = %e, "submission worker aborted early");                
+            }
 
             Ok::<_, io::Error>(())
         };
@@ -282,7 +284,9 @@ impl I2o2Builder {
                 );
             }
 
-            completion_worker.run()?;
+            if let Err(e) = completion_worker.run() {
+                tracing::error!(error = %e, "completion worker aborted early");
+            }
 
             Ok::<_, io::Error>(())
         };

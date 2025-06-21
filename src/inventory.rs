@@ -1,5 +1,4 @@
 use std::mem::MaybeUninit;
-use std::ptr;
 use std::sync::Arc;
 
 /// The [InflightInventory] tracks state currently attached to ops being executed by the ring.
@@ -131,6 +130,7 @@ unsafe impl<T: Send> Send for SendPtrWrapper<T> {}
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+    use std::ptr;
 
     use super::*;
 

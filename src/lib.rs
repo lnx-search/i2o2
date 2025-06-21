@@ -10,6 +10,7 @@ use liburing_rs::*;
 
 use crate::inventory::InflightInventory;
 use crate::opcode::sealed::RegisterOp;
+use crate::ring::CqeEntry;
 
 mod builder;
 mod handle;
@@ -217,12 +218,17 @@ impl<G> I2o2SubmissionWorker<G> {
                     }
                 }
 
+                self.waker_controller.ask_for_wake();
+                if !self.incoming_io.is_empty() || !self.incoming_resources.is_empty() {
+                    continue;
+                }
                 self.ring.wait_for_sq_capacity();
             }
         }
 
         tracing::debug!("submission worker draining remaining");
 
+        self.unregister_resources()?;
         self.drain_remaining()?;
 
         tracing::debug!("submission worker closed");
@@ -232,6 +238,18 @@ impl<G> I2o2SubmissionWorker<G> {
 
     fn should_close(&self) -> bool {
         self.switch.is_set() || self.incoming_io.is_disconnected()
+    }
+
+    fn unregister_resources(&mut self) -> io::Result<()> {
+        if self.resources.should_unregister_files() {
+            self.ring.unregister_files()?;
+        }
+
+        if self.resources.should_unregister_buffers() {
+            self.ring.unregister_buffers()?;
+        }
+
+        Ok(())
     }
 
     fn drain_remaining(&mut self) -> io::Result<()> {
@@ -283,10 +301,14 @@ impl<G> I2o2SubmissionWorker<G> {
         }
 
         let result = self.ring.submit();
+        tracing::debug!("completed submit");
+        
         self.incoming_io.wake_n(n_read);
+        tracing::debug!(result = ?result, "completed wake");
 
-        result?;
-
+        let n = result?;
+        tracing::debug!(num_submitted = n, "completed op");
+        
         Ok(n_sqe_consumed)
     }
 
@@ -463,61 +485,71 @@ impl<G> I2o2CompletionWorker<G> {
                         break;
                     }
                 }
-                self.ring.wait_for_completion();
+                self.ring.wait_for_completion()?;
             }
         }
 
         tracing::debug!("completion worker draining remaining");
 
-        self.drain_remaining();
+        self.drain_remaining()?;
 
         tracing::debug!("completion worker closed");
 
         Ok(())
     }
 
-    fn drain_remaining(&mut self) {
+    fn drain_remaining(&mut self) -> io::Result<()> {
         while self.inflight_inventory.num_inflight() > 0 {
-            self.ring.wait_for_completion();
+            let cqe = self.ring.wait_for_completion()?;
+            self.process_completion(cqe);
             self.process_completions();
         }
+
+        Ok(())
     }
 
     fn process_completions(&mut self) -> usize {
+        #[cfg(feature = "trace-hotpath")]
+        tracing::trace!(inflight = self.inflight_inventory.num_inflight(), "cehcking CQE");
+        
         let mut num_consumed = 0;
-        for cqe in self.ring.iter_completions() {
-            let entry = unsafe { ptr::read(cqe.user_data as *mut InflightEntry<G>) };
-
-            match entry {
-                InflightEntry::Nop => {},
-                InflightEntry::ResourceOp(entry) => {
-                    #[cfg(feature = "trace-hotpath")]
-                    tracing::debug!(
-                        resource_id = entry.resource_id,
-                        "completed resource op"
-                    );
-                    match entry.resource_type {
-                        ResourceType::File => {
-                            self.resources.free_file(entry.resource_id)
-                        },
-                        ResourceType::Buffer => {
-                            self.resources.free_buffer(entry.resource_id)
-                        },
-                    }
-                },
-                InflightEntry::IoOp(entry) => {
-                    #[cfg(feature = "trace-hotpath")]
-                    tracing::debug!(io_id = entry.io_id, "completed IO op");
-                    entry.reply.set_result(cqe.result);
-                },
-            }
-
-            self.inflight_inventory
-                .push_free_ptr(cqe.user_data as *mut MaybeUninit<_>);
-
+        while let Some(cqe) = self.ring.next_completions() {
+            #[cfg(feature = "trace-hotpath")]
+            tracing::trace!("got CQE");
+            
+            self.process_completion(cqe);
             num_consumed += 1;
         }
         num_consumed
+    }
+
+    fn process_completion(&mut self, cqe: CqeEntry) {
+        let entry = unsafe { ptr::read(cqe.user_data as *mut InflightEntry<G>) };
+
+        match entry {
+            InflightEntry::Nop => {},
+            InflightEntry::ResourceOp(entry) => {
+                #[cfg(feature = "trace-hotpath")]
+                tracing::debug!(
+                    resource_id = entry.resource_id,
+                    "completed resource op"
+                );
+                match entry.resource_type {
+                    ResourceType::File => self.resources.free_file(entry.resource_id),
+                    ResourceType::Buffer => {
+                        self.resources.free_buffer(entry.resource_id)
+                    },
+                }
+            },
+            InflightEntry::IoOp(entry) => {
+                #[cfg(feature = "trace-hotpath")]
+                tracing::debug!(io_id = entry.io_id, "completed IO op");
+                entry.reply.set_result(cqe.result);
+            },
+        }
+
+        self.inflight_inventory
+            .push_free_ptr(cqe.user_data as *mut MaybeUninit<_>);
     }
 }
 
@@ -540,6 +572,14 @@ impl RegisteredResources {
                 num_buffers as usize,
             )),
         }
+    }
+
+    fn should_unregister_files(&self) -> bool {
+        self.max_files != 0
+    }
+
+    fn should_unregister_buffers(&self) -> bool {
+        self.max_buffers != 0
     }
 
     fn alloc_file(&self) -> Option<u32> {
