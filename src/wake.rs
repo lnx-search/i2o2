@@ -187,4 +187,17 @@ mod tests {
         }
         assert_eq!(value, 1);
     }
+
+    #[test]
+    fn test_wake_on_drop() {
+        let (_waker, controller) = super::new().expect("create eventfd");
+        let wake_on_drop = controller.wake_on_drop();
+        drop(wake_on_drop);
+
+        let mut value: u64 = 0;
+        unsafe {
+            libc::eventfd_read(controller.inner.fd, (&mut value) as *mut _);
+        }
+        assert_eq!(value, 1);
+    }
 }

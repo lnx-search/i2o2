@@ -78,8 +78,20 @@ mod tests {
         assert!(!switch.is_set());
 
         let handle = switch.clone().into_weak();
+        assert!(!handle.is_set());
         drop(handle);
 
         assert!(!switch.is_set());
+    }
+
+    #[test]
+    fn test_weak_dead_mans_switch_explicit() {
+        let switch = DeadMansSwitch::default();
+        assert!(!switch.is_set());
+
+        let handle = switch.clone().into_weak();
+        assert!(!handle.is_set());
+        handle.set();
+        assert!(switch.is_set());
     }
 }
