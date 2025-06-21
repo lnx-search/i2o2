@@ -70,10 +70,6 @@ impl RingWakerController {
         waker.wants_wake.store(false, Ordering::SeqCst);
     }
 
-    pub(super) fn fd(&self) -> libc::c_int {
-        self.inner.fd
-    }
-
     pub(super) fn wait_for_events(&mut self) {
         unsafe {
             libc::eventfd_read(self.inner.fd, &raw mut self.value);

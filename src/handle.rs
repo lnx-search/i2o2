@@ -8,6 +8,7 @@ use crate::{
     Resource,
     ResourceIndex,
     ResourceMessage,
+    dms,
     opcode,
     reply,
 };
@@ -40,6 +41,7 @@ pub enum RegisterError {
 /// The [I2o2Handle] allows you to interact with the [I2o2Scheduler](crate::I2o2Scheduler) and
 /// submit IO events to it.
 pub struct I2o2Handle<G = DynamicGuard> {
+    switch: dms::WeakDeadMansSwitch,
     ops_queue: super::queue::Sender<Packaged<opcode::AnyOp, G>>,
     resource_queue: super::queue::Sender<ResourceMessage<G>>,
     waker: super::wake::RingWaker,
@@ -48,6 +50,7 @@ pub struct I2o2Handle<G = DynamicGuard> {
 impl<G> Clone for I2o2Handle<G> {
     fn clone(&self) -> Self {
         Self {
+            switch: self.switch.clone(),
             ops_queue: self.ops_queue.clone(),
             resource_queue: self.resource_queue.clone(),
             waker: self.waker.clone(),
@@ -57,11 +60,13 @@ impl<G> Clone for I2o2Handle<G> {
 
 impl<G> I2o2Handle<G> {
     pub(super) fn new(
+        switch: dms::WeakDeadMansSwitch,
         ops_queue: super::queue::Sender<Packaged<opcode::AnyOp, G>>,
         resource_queue: super::queue::Sender<ResourceMessage<G>>,
         waker: super::wake::RingWaker,
     ) -> Self {
         Self {
+            switch,
             ops_queue,
             resource_queue,
             waker,
@@ -73,6 +78,13 @@ impl<G> I2o2Handle<G>
 where
     G: Send + 'static,
 {
+    /// Signal to the scheduler that it should shut down.
+    ///
+    /// This does not block, it is simple a signal to shut down _at some point in the near future._
+    pub fn shutdown(&self) {
+        self.switch.set()
+    }
+
     /// Submit an op to the scheduler.
     ///
     /// This may block if th scheduler queue is currently full.

@@ -45,6 +45,8 @@ impl IoRing {
 
         probe.validate_ring_setup_flags(params.flags)?;
 
+        // We have the `mut` here to show we have exclusive ownership.
+        #[allow(unused_mut)]
         let mut ring_guard = Arc::new(RingHandle::zeroed());
         let ring = Arc::as_ptr(&ring_guard) as *mut io_uring;
         let ring_size128 = params.flags & IORING_SETUP_SQE128 != 0;
@@ -86,12 +88,6 @@ impl IoRing {
             ring: self.ring,
             probe: self.probe.clone(),
         }
-    }
-
-    /// Register an eventfd with the ring.
-    pub(super) fn register_eventfd(&mut self, fd: libc::c_int) -> io::Result<()> {
-        let result = unsafe { io_uring_register_eventfd(self.ring, fd) };
-        check_err!(result)
     }
 
     /// Preallocate a sparse set of files.
@@ -189,16 +185,16 @@ impl IoRing {
     /// Retrieves the next available SQE in the ring which can be written to.
     ///
     /// Returns `None` if the queue is full.
-    pub(super) fn get_available_sqe(&mut self) -> Option<&mut io_uring_sqe> {
+    pub(super) fn get_available_sqe(&mut self) -> Option<*mut io_uring_sqe> {
         unsafe {
             let sqe = io_uring_get_sqe(self.ring);
-            sqe.as_mut()
+            if sqe.is_null() { None } else { Some(sqe) }
         }
     }
 
     /// Wait for the SQ to have capacity/free SQEs available.
     pub(super) fn wait_for_sq_capacity(&mut self) {
-        unsafe { io_uring_sqring_wait(self.ring) }
+        unsafe { io_uring_sqring_wait(self.ring) };
     }
 
     /// Wait for the SQ to have capacity/free SQEs available.
@@ -215,14 +211,9 @@ impl IoRing {
         }
     }
 
-    /// Returns the number of completions available currently.
-    pub(super) fn num_completions_available(&mut self) -> usize {
-        unsafe { io_uring_cq_ready(self.ring) as usize }
-    }
-
     /// Wait for at least one completion to be ready.
     pub(super) fn wait_for_completion(&mut self) {
-        unsafe { io_uring_wait_cqe(self.ring, ptr::null_mut()) }
+        unsafe { io_uring_wait_cqe(self.ring, ptr::null_mut()) };
     }
 
     /// Advances the CQEs seen in the queue.
@@ -319,8 +310,10 @@ mod tests {
         let sqe = ring.get_available_sqe().expect("sqe should be available");
 
         let op = crate::opcode::Nop::new();
-        op.register_with_sqe(sqe);
-        sqe.user_data = 123;
+        unsafe {
+            op.register_with_sqe(&mut (*sqe));
+            (*sqe).user_data = 123;
+        }
 
         ring.submit_and_wait_one().expect("submit should succeed");
 

@@ -34,12 +34,12 @@ impl DeadMansSwitch {
 impl Drop for DeadMansSwitch {
     fn drop(&mut self) {
         if !self.disabled {
-            self.inner.store(true, Ordering::Relaxed);
+            self.set();
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 /// A handle that can read and set the dead man's switch but does not set automatically
 /// on drop.
 pub struct WeakDeadMansSwitch {

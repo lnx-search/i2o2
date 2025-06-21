@@ -4,7 +4,6 @@ use std::any::Any;
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::{cmp, io, ptr};
 
 use liburing_rs::*;
@@ -109,10 +108,8 @@ where
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// use std::time::Duration;
 ///
-/// let (scheduler, handle) = i2o2::builder()
+/// let (submission_worker, completion_worker, handle) = i2o2::builder()
 ///     .with_io_polling(true)
-///     .with_sq_polling(true)
-///     .with_sq_polling_timeout(Duration::from_millis(100))
 ///     .try_create::<()>()?;
 ///
 /// // ... do work
@@ -248,7 +245,7 @@ impl<G> I2o2SubmissionWorker<G> {
     }
 
     fn process_incoming_io(&mut self) -> io::Result<usize> {
-        let mut pop_n =
+        let pop_n =
             cmp::min(self.incoming_io.len(), MAX_IO_OPS_BEFORE_RESOURCE_CONSIDER);
 
         let mut n_read = 0;
@@ -310,7 +307,7 @@ impl<G> I2o2SubmissionWorker<G> {
         Ok(())
     }
 
-    fn handle_io_op(&mut self, sqe: &mut io_uring_sqe, msg: Packaged<opcode::AnyOp, G>) {
+    fn handle_io_op(&mut self, sqe: *mut io_uring_sqe, msg: Packaged<opcode::AnyOp, G>) {
         self.op_counter_io += 1;
 
         let Packaged {
@@ -318,7 +315,8 @@ impl<G> I2o2SubmissionWorker<G> {
             reply,
             guard,
         } = msg;
-        entry.register_with_sqe(sqe);
+
+        unsafe { entry.register_with_sqe(&mut (*sqe)) };
 
         #[cfg(feature = "trace-hotpath")]
         tracing::trace!(
@@ -393,7 +391,7 @@ impl<G> I2o2SubmissionWorker<G> {
         // by the completion worker due to the error.
         unsafe { ptr::drop_in_place(ptr) };
         self.inflight_inventory
-            .push_free_ptr(ptr as *mut MaybeUninit<G>);
+            .push_free_ptr(ptr as *mut MaybeUninit<InflightEntry<G>>);
 
         let err = result.unwrap_err();
         reply.set_result(err.raw_os_error().unwrap());
@@ -413,14 +411,15 @@ impl<G> I2o2SubmissionWorker<G> {
         }
     }
 
-    fn write_nop(&mut self, sqe: &mut io_uring_sqe) {
+    fn write_nop(&mut self, sqe: *mut io_uring_sqe) {
         self.op_counter_nop += 1;
 
         #[cfg(feature = "trace-hotpath")]
         tracing::trace!(nop_id = self.op_counter_nop, "processing nop");
 
         let op = opcode::Nop::new();
-        op.register_with_sqe(sqe);
+        unsafe { op.register_with_sqe(&mut (*sqe)) };
+
         let ptr = self
             .inflight_inventory
             .write_to_free_ptr(InflightEntry::Nop);
@@ -454,13 +453,18 @@ impl<G> I2o2CompletionWorker<G> {
             Err(io::Error::other("test error triggered by failpoints"))
         });
 
-        let mut num_completions_available = self.ring.num_completions_available();
         while !self.switch.is_set() {
-            if num_completions_available == 0 {
+            let num_consumed = self.process_completions();
+
+            if num_consumed == 0 {
+                for _ in 0..50 {
+                    let num_consumed = self.process_completions();
+                    if num_consumed != 0 {
+                        break;
+                    }
+                }
                 self.ring.wait_for_completion();
             }
-
-            self.process_completions();
         }
 
         tracing::debug!("completion worker draining remaining");
@@ -479,33 +483,41 @@ impl<G> I2o2CompletionWorker<G> {
         }
     }
 
-    fn process_completions(&mut self) {
+    fn process_completions(&mut self) -> usize {
+        let mut num_consumed = 0;
         for cqe in self.ring.iter_completions() {
             let entry = unsafe { ptr::read(cqe.user_data as *mut InflightEntry<G>) };
-            self.handle_entry_completion(entry, cqe.result);
+
+            match entry {
+                InflightEntry::Nop => {},
+                InflightEntry::ResourceOp(entry) => {
+                    #[cfg(feature = "trace-hotpath")]
+                    tracing::debug!(
+                        resource_id = entry.resource_id,
+                        "completed resource op"
+                    );
+                    match entry.resource_type {
+                        ResourceType::File => {
+                            self.resources.free_file(entry.resource_id)
+                        },
+                        ResourceType::Buffer => {
+                            self.resources.free_buffer(entry.resource_id)
+                        },
+                    }
+                },
+                InflightEntry::IoOp(entry) => {
+                    #[cfg(feature = "trace-hotpath")]
+                    tracing::debug!(io_id = entry.io_id, "completed IO op");
+                    entry.reply.set_result(cqe.result);
+                },
+            }
+
             self.inflight_inventory
                 .push_free_ptr(cqe.user_data as *mut MaybeUninit<_>);
-        }
-    }
 
-    fn handle_entry_completion(&mut self, entry: InflightEntry<G>, result: i32) {
-        match entry {
-            InflightEntry::Nop => {},
-            InflightEntry::ResourceOp(entry) => {
-                #[cfg(feature = "trace-hotpath")]
-                tracing::debug!(
-                    resource_id = entry.resource_id,
-                    "completed resource op"
-                );
-
-                entry.drop(entry);
-            },
-            InflightEntry::IoOp(entry) => {
-                #[cfg(feature = "trace-hotpath")]
-                tracing::debug!(io_id = entry.io_id, "completed IO op");
-                entry.reply.set_result(result);
-            },
+            num_consumed += 1;
         }
+        num_consumed
     }
 }
 
@@ -568,12 +580,15 @@ enum InflightEntry<G> {
 struct ResourceOpEntry<G> {
     resource_id: u32,
     resource_type: ResourceType,
+    #[allow(unused)]
     guard: Option<G>,
 }
 
 struct IoOpEntry<G> {
+    #[allow(unused)]
     io_id: u64,
     reply: reply::ReplyNotify,
+    #[allow(unused)]
     guard: Option<G>,
 }
 

@@ -122,7 +122,9 @@ impl<T> InflightInventory<T> {
     }
 }
 
-struct SendPtrWrapper<T>(*mut T);
+unsafe impl<T: Send> Sync for InflightInventory<T> {}
+
+struct SendPtrWrapper<T: ?Sized>(*mut T);
 
 unsafe impl<T: Send> Send for SendPtrWrapper<T> {}
 
@@ -148,7 +150,7 @@ mod tests {
         };
         assert_eq!(inventory.free_ptrs.len(), 0);
 
-        inventory.push_free_ptr(ptr1);
+        inventory.push_free_ptr(ptr1 as *mut MaybeUninit<String>);
         assert_eq!(inventory.free_ptrs.len(), 1);
 
         let ptr3 = inventory.write_to_free_ptr(String::from("Hello, world 3"));
@@ -183,7 +185,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(10));
         assert!(!handle.is_finished());
 
-        inventory.push_free_ptr(ptr1);
+        inventory.push_free_ptr(ptr1 as *mut MaybeUninit<String>);
 
         let ptr3 = handle.join().unwrap().0;
         assert!(ptr::addr_eq(ptr1, ptr3));

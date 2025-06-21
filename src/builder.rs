@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Duration;
 use std::{io, mem};
 
 use libc::{CPU_SET, sched_setaffinity};
@@ -44,7 +43,6 @@ pub struct I2o2Builder {
     ring_depth: u32,
     io_poll: bool,
     size128: bool,
-    defer_task_run: bool,
     num_registered_files: u32,
     num_registered_buffers: u32,
 }
@@ -62,7 +60,6 @@ impl I2o2Builder {
             ring_depth: 128,
             io_poll: false,
             size128: false,
-            defer_task_run: false,
             num_registered_buffers: 0,
             num_registered_files: 0,
         }
@@ -129,7 +126,7 @@ impl I2o2Builder {
     /// By default, this is `0`.
     pub const fn with_num_registered_files(mut self, size: u32) -> Self {
         assert!(
-            size MAX_SAFE_IDX,
+            size <= MAX_SAFE_IDX,
             "total number of registered files exceeds maximum allowance"
         );
         self.num_registered_files = size;
@@ -220,7 +217,12 @@ impl I2o2Builder {
         self.setup_registered_resources(&mut ring)?;
         tracing::debug!("successfully registered resources with ring");
 
-        let handle = I2o2Handle::new(io_queue_tx, resource_queue_tx, waker);
+        let handle = I2o2Handle::new(
+            switch.clone().into_weak(),
+            io_queue_tx,
+            resource_queue_tx,
+            waker,
+        );
 
         let submission = I2o2SubmissionWorker {
             ring: unsafe { ring.clone_ref() },
@@ -346,7 +348,7 @@ impl I2o2Builder {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 /// The cpu set restricts what CPU cores the thread can run on.
 pub struct CpuSet(libc::cpu_set_t);
 
