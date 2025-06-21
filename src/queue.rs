@@ -2,14 +2,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Creates a new bounded queue.
-pub fn new<T>(size: usize) -> (SchedulerSender<T>, SchedulerReceiver<T>) {
+pub fn new<T>(size: usize) -> (Sender<T>, Receiver<T>) {
     let inner = Arc::new(Inner::new(size));
 
-    let tx = SchedulerSender {
+    let tx = Sender {
         inner: inner.clone(),
     };
 
-    let rx = SchedulerReceiver { inner };
+    let rx = Receiver { inner };
 
     (tx, rx)
 }
@@ -17,11 +17,11 @@ pub fn new<T>(size: usize) -> (SchedulerSender<T>, SchedulerReceiver<T>) {
 /// The scheduler queue is an abstraction over a FIFO concurrent queue.
 ///
 /// This is the sender half of the queue.
-pub struct SchedulerSender<T> {
+pub struct Sender<T> {
     inner: Arc<Inner<T>>,
 }
 
-impl<T> Clone for SchedulerSender<T> {
+impl<T> Clone for Sender<T> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -29,7 +29,7 @@ impl<T> Clone for SchedulerSender<T> {
     }
 }
 
-impl<T> SchedulerSender<T> {
+impl<T> Sender<T> {
     /// Send a new message to the scheduler.
     pub fn send(&self, mut value: T) -> Result<(), T> {
         match self.try_send_spin(value) {
@@ -101,11 +101,11 @@ impl<T> SchedulerSender<T> {
 /// The scheduler queue is an abstraction over a FIFO concurrent queue.
 ///
 /// This is the receiver half of the queue.
-pub struct SchedulerReceiver<T> {
+pub struct Receiver<T> {
     inner: Arc<Inner<T>>,
 }
 
-impl<T> SchedulerReceiver<T> {
+impl<T> Receiver<T> {
     /// Pop an item from the queue.
     pub fn pop(&self) -> Option<T> {
         self.inner.queue.pop()
@@ -143,7 +143,7 @@ impl<T> SchedulerReceiver<T> {
     }
 }
 
-impl<T> Drop for SchedulerReceiver<T> {
+impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         self.inner
             .receiver_disconnected

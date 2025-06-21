@@ -1,4 +1,5 @@
 use std::{io, mem, ptr};
+use std::ffi::c_void;
 use std::io::ErrorKind;
 use std::sync::Arc;
 use liburing_rs::*;
@@ -21,6 +22,8 @@ pub(super) struct IoRing {
     ring: *mut io_uring,
     probe: Arc<RingProbe>,
 }
+
+unsafe impl Send for IoRing {}
 
 impl IoRing {
     #[cfg(test)]
@@ -195,12 +198,14 @@ impl IoRing {
         }
     }
 
-    /// Returns whether the ring has completions available.
-    pub(super) fn has_completions_ready(&mut self) -> bool {
-        unsafe {
-            let mut cqe = ptr::null_mut::<io_uring_cqe>();
-            io_uring_peek_cqe(self.ring, &raw mut cqe) == 0
-        }
+    /// Returns the number of completions available currently.
+    pub(super) fn num_completions_available(&mut self) -> usize {
+        unsafe { io_uring_cq_ready(self.ring) as usize }
+    }
+
+    /// Wait for at least one completion to be ready.
+    pub(super) fn wait_for_completion(&mut self) {
+        unsafe { io_uring_wait_cqe(self.ring, ptr::null_mut()) }
     }
     
     /// Advances the CQEs seen in the queue.
@@ -260,7 +265,7 @@ impl<'ring> Iterator for CqeIterator<'ring> {
             } else {
                 let entry = CqeEntry {
                     result: (*cqe).res,
-                    user_data: (*cqe).user_data,
+                    user_data: io_uring_cqe_get_data(cqe),
                 };
                 self.ring.advance_seen_cqe(cqe);
                 Some(entry)
@@ -275,7 +280,7 @@ pub struct CqeEntry {
     /// The result of the syscall.
     pub result: i32,
     /// The user data tied to the OP when it was submitted.
-    pub user_data: u64,
+    pub user_data: *mut c_void,
 }
 
 #[cfg(test)]
@@ -308,7 +313,7 @@ mod tests {
 
         let cqe = cqe.unwrap();
         let user_data = cqe.user_data;
-        assert_eq!(user_data, 123);
+        assert_eq!(user_data.addr(), 123);
         assert!(iter.next().is_none());
     }
 

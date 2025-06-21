@@ -41,6 +41,11 @@ impl<T> InflightInventory<T> {
             condvar: parking_lot::Condvar::new(),
         })
     }
+    
+    /// Returns the number of ops current inflight on the ring.
+    pub(super) fn num_inflight(&self) -> usize {
+        self.buffer.len() - self.free_ptrs.len()
+    }
 
     /// Write a given `value` to the next available slot in the inventory.
     ///
@@ -63,16 +68,14 @@ impl<T> InflightInventory<T> {
 
     /// Push a pointer allocated by the inventory buffer back into the inventory
     /// allowing future tasks to write to it and reuse the allocation.
-    pub(super) fn push_free_ptr(&self, ptr: *mut T) {
-        // Drop the value the ptr holds so it is ready to be overwritten.
-        unsafe { ptr::drop_in_place(ptr) };
-        let _ = self.free_ptrs.push(SendPtrWrapper(ptr as *mut MaybeUninit<T>));
+    pub(super) fn push_free_ptr(&self, ptr: *mut MaybeUninit<T>) {
+        let _ = self.free_ptrs.push(SendPtrWrapper(ptr));
         self.wake_if_needed();
 
         #[cfg(feature = "trace-hotpath")]
         tracing::trace!("pointer has been marked as free for inventory");
     }
-
+ 
     fn try_pop_free_ptr_spin(&self) -> Option<*mut MaybeUninit<T>> {
         if let Some(ptr) = self.free_ptrs.pop() {
             return Some(ptr.0);
