@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use fail::FailScenario;
 
+use crate::opcode::RingOp;
 use crate::{I2o2Handle, I2o2Scheduler, SchedulerClosed, opcode};
 
 #[rstest::rstest]
@@ -107,4 +108,68 @@ fn failpoint_scheduler_run_fail_try_spawn() {
     let err = scheduler.join().unwrap().unwrap_err();
     assert_eq!(err.kind(), ErrorKind::Other);
     scenario.teardown();
+}
+
+#[test]
+fn test_io_prio() {
+    super::try_init_logging();
+
+    let (scheduler, handle) = crate::create_for_current_thread::<()>().unwrap();
+    let handle2 = handle.clone();
+
+    let mut op = opcode::Nop::new();
+    op.set_io_priority(0);
+    eprintln!("built op");
+
+    let reply = unsafe {
+        handle2
+            .submit(op, None)
+            .expect("scheduler should be running")
+    };
+    eprintln!("completed submit");
+    drop(handle);
+    drop(handle2);
+
+    scheduler.run().expect("run scheduler");
+
+    let result = reply.wait().expect("operation should complete");
+    eprintln!("completed result: {result}");
+    if result != 0 {
+        panic!(
+            "operation errored: {:?}",
+            io::Error::from_raw_os_error(-result)
+        );
+    }
+}
+
+#[test]
+fn test_will_block() {
+    super::try_init_logging();
+
+    let (scheduler, handle) = crate::create_for_current_thread::<()>().unwrap();
+    let handle2 = handle.clone();
+
+    let mut op = opcode::Nop::new();
+    op.will_block();
+    eprintln!("built op");
+
+    let reply = unsafe {
+        handle2
+            .submit(op, None)
+            .expect("scheduler should be running")
+    };
+    eprintln!("completed submit");
+    drop(handle);
+    drop(handle2);
+
+    scheduler.run().expect("run scheduler");
+
+    let result = reply.wait().expect("operation should complete");
+    eprintln!("completed result: {result}");
+    if result != 0 {
+        panic!(
+            "operation errored: {:?}",
+            io::Error::from_raw_os_error(-result)
+        );
+    }
 }
