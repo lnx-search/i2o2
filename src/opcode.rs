@@ -317,6 +317,7 @@ impl_from!(Write, AnyOp);
 impl_from!(WriteFixed, AnyOp);
 impl_from!(Madvise, AnyOp);
 
+#[derive(Default)]
 /// Invokes [IORING_OP_NOP](https://man.archlinux.org/man/io_uring_enter.2.en#IORING_OP_NOP).
 pub struct Nop {
     io_prio: u16,
@@ -799,9 +800,7 @@ impl sealed::RegisterOp for UringCmd80 {
 
         // Write the command bytes in the 64-byte void space between the current and next SQE.
         unsafe {
-            let data_ptr = (sqe as *mut io_uring_sqe)
-                .add(size_of::<io_uring_sqe>())
-                .cast::<[u8; 64]>();
+            let data_ptr = (sqe as *mut io_uring_sqe).add(1).cast::<[u8; 64]>();
             data_ptr.write(cmd2);
         }
     }
