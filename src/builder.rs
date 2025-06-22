@@ -1,4 +1,3 @@
-use std::time::Duration;
 use std::{io, mem};
 
 use libc::{CPU_SET, sched_setaffinity};
@@ -21,8 +20,6 @@ type SchedulerThreadHandle = std::thread::JoinHandle<io::Result<()>>;
 ///
 /// let (scheduler, handle) = i2o2::I2o2Builder::default()
 ///     .with_io_polling(true)
-///     .with_sq_polling(true)
-///     .with_sq_polling_timeout(Duration::from_millis(100))
 ///     .try_create::<()>()?;
 ///
 /// // ... do work
@@ -35,8 +32,6 @@ pub struct I2o2Builder {
     ring_depth: u32,
     io_poll: bool,
     size128: bool,
-    sq_poll: Option<Duration>,
-    sq_poll_cpu: Option<CpuSet>,
     coop_task_run: bool,
     num_registered_files: u32,
     num_registered_buffers: u32,
@@ -55,8 +50,6 @@ impl I2o2Builder {
             ring_depth: 128,
             io_poll: false,
             size128: false,
-            sq_poll: None,
-            sq_poll_cpu: None,
             coop_task_run: false,
             num_registered_buffers: 0,
             num_registered_files: 0,
@@ -146,71 +139,6 @@ impl I2o2Builder {
     /// By default, this is `disabled`.
     pub const fn with_io_polling(mut self, enable: bool) -> Self {
         self.io_poll = enable;
-        self
-    }
-
-    /// Enables/disables submission queue polling by the kernel.
-    ///
-    /// Sets `IORING_SETUP_SQPOLL`
-    ///
-    /// <https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html>
-    ///
-    /// > When this flag is specified, a kernel thread is created to
-    /// > perform submission queue polling.  An io_uring instance
-    /// > configured in this way enables an application to issue I/O
-    /// > without ever context switching into the kernel.  By using
-    /// > the submission queue to fill in new submission queue
-    /// > entries and watching for completions on the completion
-    /// > queue, the application can submit and reap I/Os without
-    /// > doing a single system call.
-    ///
-    /// By default, the system will use a `10ms` idle timeout, you can configure
-    /// this value using [I2o2Builder::with_sq_polling_timeout].
-    pub const fn with_sq_polling(mut self, enable: bool) -> Self {
-        if enable {
-            self.sq_poll = Some(Duration::from_millis(20));
-        } else {
-            self.sq_poll = None;
-        }
-        self
-    }
-
-    /// Set the submission queue polling idle timeout.
-    ///
-    /// <https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html>
-    ///
-    /// This overwrites the default timeout value I2o2 sets of `10ms`.
-    ///
-    /// NOTE: `with_sqe_polling` must be enabled first before calling this method.
-    pub const fn with_sq_polling_timeout(mut self, timeout: Duration) -> Self {
-        if self.sq_poll.is_none() {
-            panic!(
-                "submission queue polling is not already enabled at the time of calling this method"
-            );
-        }
-        assert!(
-            timeout.as_secs_f32() <= 10.0,
-            "timeout has gone beyond sane levels"
-        );
-
-        self.sq_poll = Some(timeout);
-        self
-    }
-
-    /// Set cpu set the polling thread should be pinned to.
-    ///
-    /// Sets `IORING_SETUP_SQ_AFF`
-    ///
-    /// <https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html>
-    ///
-    /// NOTE: `with_sqe_polling` must be enabled first before calling this method.
-    pub const fn with_sq_polling_affinity(mut self, cpu_set: CpuSet) -> Self {
-        if self.sq_poll.is_none() {
-            panic!(
-                "submission queue polling is not already enabled at the time of calling this method"
-            );
-        }
-        self.sq_poll_cpu = Some(cpu_set);
         self
     }
 
@@ -348,7 +276,7 @@ impl I2o2Builder {
     fn setup_io_ring(&self) -> io::Result<ring::IoRing> {
         let probe = RingProbe::new()?;
 
-        let mut params: io_uring_params = unsafe { std::mem::zeroed() };
+        let mut params: io_uring_params = unsafe { mem::zeroed() };
 
         if self.size128 {
             params.flags |= IORING_SETUP_SQE128;
@@ -363,19 +291,13 @@ impl I2o2Builder {
             params.flags |= IORING_SETUP_IOPOLL;
         }
 
-        if let Some(idle) = self.sq_poll {
-            params.flags |= IORING_SETUP_SQPOLL;
-            params.sq_thread_idle = idle.as_millis() as u32;
-        }
-
-        if let Some(_pin_cpu) = self.sq_poll_cpu.clone() {
-            // params.sq_thread_cpu = pin_cpu.0;
-        }
-
         if self.coop_task_run {
             params.flags |= IORING_SETUP_COOP_TASKRUN;
         }
-    
+
+        params.features |= IORING_FEAT_NODROP;
+        params.features |= IORING_FEAT_FAST_POLL;
+
         ring::IoRing::new(self.ring_depth, params)
     }
 

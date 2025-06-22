@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use glommio::{CpuSet, Placement};
+use glommio::Placement;
 use humansize::DECIMAL;
 use i2o2::DynamicGuard;
 use memmap2::Advice;
@@ -47,11 +47,11 @@ fn main() -> Result<()> {
     run_i2o2_benches(&mut file_manger, &mut results)?;
     std::thread::sleep(Duration::from_secs(20));
 
-    // run_std_benches(&mut file_manger, &mut results)?;
-    // std::thread::sleep(Duration::from_secs(20));
-    // 
-    // run_glommio_benches(&mut file_manger, &mut results)?;
-    // std::thread::sleep(Duration::from_secs(20));
+    run_std_benches(&mut file_manger, &mut results)?;
+    std::thread::sleep(Duration::from_secs(20));
+
+    run_glommio_benches(&mut file_manger, &mut results)?;
+    std::thread::sleep(Duration::from_secs(20));
 
     tracing::info!("done!");
 
@@ -247,12 +247,11 @@ async fn execute_i2o2_bench(
     let num_blocks = file_size / BUFFER_SIZE;
 
     let mut cpu_set = i2o2::CpuSet::blank();
-    cpu_set.set(8);
-    
+    cpu_set.set(PIN_SCHEDULER_THREAD_TO_CORE as usize);
+
     let (scheduler_handle, handle) = i2o2::builder()
-        .with_sq_polling(true)
-        .with_sq_polling_timeout(Duration::from_millis(100))
         .with_queue_size((concurrency * 2) as u32)
+        .with_coop_task_run(true)
         .with_num_registered_files(1)
         .with_num_registered_buffers(concurrency as u32)
         .try_spawn::<DynamicGuard>()?;
@@ -322,13 +321,7 @@ async fn execute_i2o2_bench(
     let total_ops = total_op_count.load(Ordering::Relaxed);
     let iops = total_ops as f32 / RUN_DURATION.as_secs_f32();
 
-    results.push(
-        "i2o2",
-        file_size,
-        concurrency,
-        BUFFER_SIZE,
-        iops,
-    );
+    results.push("i2o2", file_size, concurrency, BUFFER_SIZE, iops);
 
     drop(handle);
     scheduler_handle.join().unwrap()?;

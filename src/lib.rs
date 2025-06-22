@@ -18,7 +18,7 @@ mod ring;
 mod tests;
 mod wake;
 
-pub use self::builder::{I2o2Builder, CpuSet};
+pub use self::builder::{CpuSet, I2o2Builder};
 pub use self::handle::{I2o2Handle, RegisterError, SchedulerClosed, SubmitResult};
 pub use self::opcode::types;
 pub use self::reply::{ReplyReceiver, TryGetResultError};
@@ -96,8 +96,6 @@ where
 ///
 /// let (scheduler, handle) = i2o2::builder()
 ///     .with_io_polling(true)
-///     .with_sq_polling(true)
-///     .with_sq_polling_timeout(Duration::from_millis(100))
 ///     .try_create::<()>()?;
 ///
 /// // ... do work
@@ -253,7 +251,7 @@ impl<G> I2o2Scheduler<G> {
     fn drain_completions(&mut self) -> io::Result<()> {
         #[cfg(feature = "trace-hotpath")]
         tracing::trace!("draining completion events");
-        
+
         while self.ring.has_completions_ready() {
             for cqe in self.ring.iter_completions() {
                 let (flag, reply_idx, guard_idx) = flags::unpack(cqe.user_data);
@@ -262,7 +260,7 @@ impl<G> I2o2Scheduler<G> {
                 tracing::trace!(flag = ?flag, task_id = reply_idx, result = cqe.result, "completion");
 
                 match flag {
-                    flags::Flag::FillerOp | flags::Flag::EventFdWaker => {},
+                    flags::Flag::FillerOp => {},
                     flags::Flag::Guarded => {
                         self.state.acknowledge_reply(reply_idx, cqe.result);
                         self.state.drop_guard_if_exists(guard_idx);

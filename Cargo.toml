@@ -44,6 +44,9 @@ ulid = "1.2"
 fastrand = "2.3"
 glommio = "0.9.0"
 
+[profile.bench]
+debug = true
+
 # Examples
 [[example]]
 name = "sync_no_op"

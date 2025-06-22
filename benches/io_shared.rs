@@ -76,6 +76,7 @@ impl Default for BenchmarkRandomReadResults {
 }
 
 impl BenchmarkRandomReadResults {
+    #[allow(unused)]
     pub fn push(
         &mut self,
         name: &str,
@@ -115,6 +116,7 @@ fn format_duration(dur: Duration) -> String {
     }
 }
 
+#[allow(unused)]
 fn format_total(count: f32) -> String {
     const M: f32 = 1_000.0 * 1_000.0;
     const K: f32 = 1_000.0;
@@ -130,6 +132,7 @@ fn format_total(count: f32) -> String {
 
 pub struct FileManager {
     base_path: PathBuf,
+    #[allow(unused)]
     core_path: PathBuf,
     sequence_id: usize,
 }
@@ -147,6 +150,7 @@ impl FileManager {
         })
     }
 
+    #[allow(unused)]
     pub fn create_random_file(
         &mut self,
         target_size: usize,

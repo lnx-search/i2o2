@@ -18,10 +18,6 @@ async fn main() -> io::Result<()> {
 
     let configs = [
         ("default config", i2o2::builder()),
-        (
-            "SQ polling w/default timeout",
-            i2o2::builder().with_sq_polling(true),
-        ),
         ("COOP task run", i2o2::builder().with_coop_task_run(true)),
     ];
 

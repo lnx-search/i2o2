@@ -3,7 +3,6 @@ use std::process::abort;
 pub const MAX_SAFE_IDX: u32 = 0x3FFF_FFFF;
 const FLAGS_MASK: u64 = 0xF000_0000_0000_0000;
 pub const UNGUARDED: u64 = 0x0000_0000_0000_0000;
-pub const EVENT_FD_WAKER: u64 = 0x1000_0000_0000_0000;
 pub const GUARDED: u64 = 0x2000_0000_0000_0000;
 pub const GUARDED_RESOURCE_BUFFER: u64 = 0x3000_0000_0000_0000;
 pub const GUARDED_RESOURCE_FILE: u64 = 0x4000_0000_0000_0000;
@@ -13,8 +12,6 @@ pub const FILLER_OP: u64 = 0x5000_0000_0000_0000;
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 /// The possible flags that can be set.
 pub enum Flag {
-    /// The event is coming from the event FD waker.
-    EventFdWaker = EVENT_FD_WAKER,
     /// The event has a guard value.
     Guarded = GUARDED,
     /// The event has no special properties and has no guard value.
@@ -55,7 +52,6 @@ pub fn unpack(packed_value: u64) -> (Flag, u32, u32) {
     let guard_idx = (packed_value & GUARD_IDX_MASK) as u32;
     let reply_idx = ((packed_value & REPLY_IDX_MASK) >> 30) as u32;
     let flag = match packed_value & FLAGS_MASK {
-        EVENT_FD_WAKER => Flag::EventFdWaker,
         GUARDED => Flag::Guarded,
         UNGUARDED => Flag::Unguarded,
         GUARDED_RESOURCE_BUFFER => Flag::GuardedResourceBuffer,

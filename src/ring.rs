@@ -1,5 +1,5 @@
-use std::{io, mem, ptr};
 use std::io::ErrorKind;
+use std::{io, mem, ptr};
 
 use liburing_rs::*;
 
@@ -185,7 +185,7 @@ impl IoRing {
             io_uring_peek_cqe(&raw mut self.ring, &raw mut cqe) == 0
         }
     }
-    
+
     /// Advances the CQEs seen in the queue.
     pub(self) fn advance_seen_cqe(&mut self, cqe: *mut io_uring_cqe) {
         unsafe { io_uring_cqe_seen(&raw mut self.ring, cqe) }
