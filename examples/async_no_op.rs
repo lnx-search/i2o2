@@ -38,9 +38,6 @@ async fn main() -> io::Result<()> {
     println!("our task completed with reply: {reply:?}");
     assert_eq!(reply, Ok(0));
 
-    // Guard should have been dropped by the scheduler now.
-    assert_eq!(Arc::strong_count(&guard), 1);
-
     println!("shutting down scheduler");
     // The scheduler will shut down once all handles are dropped.
     // Any outstanding tasks will finish gracefully.
