@@ -20,7 +20,6 @@ libc = "0.2"
 slab = "0.4"
 tracing = "0.1"
 parking_lot = "0.12"
-flume = "0.11"
 crossbeam-queue = "0.3"
 axboe-liburing = "2.11.0"
 

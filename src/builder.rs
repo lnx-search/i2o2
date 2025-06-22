@@ -1,3 +1,4 @@
+use std::sync::mpsc;
 use std::{io, mem};
 
 use libc::{CPU_SET, sched_setaffinity};
@@ -240,7 +241,7 @@ impl I2o2Builder {
     where
         G: Send + 'static,
     {
-        let (tx, rx) = flume::bounded(1);
+        let (tx, rx) = mpsc::sync_channel(1);
 
         let task = move || {
             if let Some(set) = cpu_set {
