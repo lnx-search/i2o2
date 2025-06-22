@@ -323,7 +323,7 @@ impl I2o2Builder {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 /// The cpu set restricts what CPU cores the thread can run on.
 pub struct CpuSet(libc::cpu_set_t);
 
