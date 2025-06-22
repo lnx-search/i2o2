@@ -1,20 +1,17 @@
 use std::io;
 use std::io::ErrorKind;
 use std::sync::Arc;
-use std::thread::JoinHandle;
 use std::time::Duration;
 
 use fail::FailScenario;
-use io_uring::opcode;
 
-use crate::{I2o2Handle, I2o2Scheduler, SchedulerClosed, mode};
+use crate::opcode::RingOp;
+use crate::{I2o2Handle, I2o2Scheduler, SchedulerClosed, opcode};
 
 #[rstest::rstest]
 #[case::size64(crate::create_for_current_thread::<Arc<()>>().unwrap())]
-#[case::size128(crate::builder().try_create_size128::<Arc<()>>().unwrap())]
-fn test_scheduler_noop<M: mode::RingMode>(
-    #[case] pair: (I2o2Scheduler<Arc<()>, M>, I2o2Handle<Arc<()>, M>),
-) {
+#[case::size128(crate::builder().with_sqe_size128(true).try_create::<Arc<()>>().unwrap())]
+fn test_scheduler_noop(#[case] pair: (I2o2Scheduler<Arc<()>>, I2o2Handle<Arc<()>>)) {
     super::try_init_logging();
 
     let (scheduler, handle) = pair;
@@ -46,9 +43,9 @@ fn test_scheduler_noop<M: mode::RingMode>(
 
 #[rstest::rstest]
 #[case::size64(crate::create_for_current_thread::<Arc<()>>().unwrap())]
-#[case::size128(crate::builder().try_create_size128::<Arc<()>>().unwrap())]
-fn test_scheduler_noop_with_guard<M: mode::RingMode>(
-    #[case] pair: (I2o2Scheduler<Arc<()>, M>, I2o2Handle<Arc<()>, M>),
+#[case::size128(crate::builder().with_sqe_size128(true).try_create::<Arc<()>>().unwrap())]
+fn test_scheduler_noop_with_guard(
+    #[case] pair: (I2o2Scheduler<Arc<()>>, I2o2Handle<Arc<()>>),
 ) {
     super::try_init_logging();
 
@@ -83,83 +80,6 @@ fn test_scheduler_noop_with_guard<M: mode::RingMode>(
     assert_eq!(Arc::strong_count(&guard), 1);
 }
 
-#[rstest::rstest]
-#[case::size64(crate::create_and_spawn::<()>().unwrap())]
-#[case::size128(crate::builder().try_spawn_size128::<()>().unwrap())]
-fn test_submit_many_sync<M: mode::RingMode>(
-    #[case] pair: (JoinHandle<io::Result<()>>, I2o2Handle<(), M>),
-) {
-    super::try_init_logging();
-
-    let (scheduler, handle) = pair;
-
-    eprintln!("built op");
-
-    let replies = unsafe {
-        handle
-            .submit_many_entries(
-                std::iter::repeat_with(|| {
-                    let op = opcode::Nop::new();
-                    (op, None)
-                })
-                .take(5),
-            )
-            .expect("scheduler should be running")
-    };
-    eprintln!("completed submit");
-
-    for reply in replies {
-        let result = reply.wait().expect("operation should complete");
-        eprintln!("completed result: {result}");
-        if result != 0 {
-            panic!(
-                "operation errored: {:?}",
-                io::Error::from_raw_os_error(result)
-            );
-        }
-    }
-
-    drop(handle);
-    scheduler.join().unwrap().unwrap();
-}
-
-#[tokio::test]
-async fn test_submit_many_async() {
-    super::try_init_logging();
-
-    let (scheduler, handle) = crate::create_and_spawn::<()>().unwrap();
-
-    eprintln!("built op");
-
-    let replies = unsafe {
-        handle
-            .submit_many_entries_async(
-                std::iter::repeat_with(|| {
-                    let op = opcode::Nop::new();
-                    (op, None)
-                })
-                .take(5),
-            )
-            .await
-            .expect("scheduler should be running")
-    };
-    eprintln!("completed submit");
-
-    for reply in replies {
-        let result = reply.await.expect("operation should complete");
-        eprintln!("completed result: {result}");
-        if result != 0 {
-            panic!(
-                "operation errored: {:?}",
-                io::Error::from_raw_os_error(result)
-            );
-        }
-    }
-
-    drop(handle);
-    scheduler.join().unwrap().unwrap();
-}
-
 #[test]
 fn failpoint_scheduler_create_fail_try_spawn() {
     let scenario = FailScenario::setup();
@@ -188,4 +108,68 @@ fn failpoint_scheduler_run_fail_try_spawn() {
     let err = scheduler.join().unwrap().unwrap_err();
     assert_eq!(err.kind(), ErrorKind::Other);
     scenario.teardown();
+}
+
+#[test]
+fn test_io_prio() {
+    super::try_init_logging();
+
+    let (scheduler, handle) = crate::create_for_current_thread::<()>().unwrap();
+    let handle2 = handle.clone();
+
+    let mut op = opcode::Nop::new();
+    op.set_io_priority(0);
+    eprintln!("built op");
+
+    let reply = unsafe {
+        handle2
+            .submit(op, None)
+            .expect("scheduler should be running")
+    };
+    eprintln!("completed submit");
+    drop(handle);
+    drop(handle2);
+
+    scheduler.run().expect("run scheduler");
+
+    let result = reply.wait().expect("operation should complete");
+    eprintln!("completed result: {result}");
+    if result != 0 {
+        panic!(
+            "operation errored: {:?}",
+            io::Error::from_raw_os_error(-result)
+        );
+    }
+}
+
+#[test]
+fn test_will_block() {
+    super::try_init_logging();
+
+    let (scheduler, handle) = crate::create_for_current_thread::<()>().unwrap();
+    let handle2 = handle.clone();
+
+    let mut op = opcode::Nop::new();
+    op.will_block();
+    eprintln!("built op");
+
+    let reply = unsafe {
+        handle2
+            .submit(op, None)
+            .expect("scheduler should be running")
+    };
+    eprintln!("completed submit");
+    drop(handle);
+    drop(handle2);
+
+    scheduler.run().expect("run scheduler");
+
+    let result = reply.wait().expect("operation should complete");
+    eprintln!("completed result: {result}");
+    if result != 0 {
+        panic!(
+            "operation errored: {:?}",
+            io::Error::from_raw_os_error(-result)
+        );
+    }
 }

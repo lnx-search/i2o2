@@ -37,11 +37,8 @@ completing IO calls without blocking our main runtime.
 #### Do I need multiple schedulers to handle my load?
 
 Probably not, at least I haven't had a situation where that is the case. In the no-op benchmarks which effectively
-just tests the overhead of the scheduler and io_uring, we can reach upto 3 million ops per second with 16 concurrent 
+just tests the overhead of the scheduler and io_uring, we can reach upto 3 million ops per second with thousands concurrent 
 workers all pushing data to the scheduler.
-
-In theory, you can increase this number even higher by using the `submit_many*` API for sending multiple IO ops
-in a single channel message.
 
 ## Example
 

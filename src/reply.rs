@@ -119,10 +119,15 @@ impl Future for ReplyReceiver {
 
         let value = inner.result.load(Ordering::SeqCst);
         if value == FLAG_CANCELLED {
+            #[cfg(feature = "trace-hotpath")]
+            tracing::trace!("reply is cancelled");
+
             Poll::Ready(Err(Cancelled))
         } else if value == FLAG_PENDING {
             Poll::Pending
         } else {
+            #[cfg(feature = "trace-hotpath")]
+            tracing::trace!("reply is ready");
             Poll::Ready(Ok(value as i32))
         }
     }

@@ -1,14 +1,12 @@
-use std::collections::VecDeque;
-use std::fmt::{Display, Formatter};
-use std::io;
-use std::io::ErrorKind;
-use std::time::Duration;
+use std::sync::mpsc;
+use std::{io, mem};
 
-use io_uring::IoUring;
+use libc::{CPU_SET, sched_setaffinity};
+use liburing_rs::*;
 
 use crate::handle::I2o2Handle;
-use crate::wake::RingWaker;
-use crate::{I2o2Scheduler, TrackedState, mode};
+use crate::opcode::RingProbe;
+use crate::{I2o2Scheduler, TrackedState, ring, wake};
 
 type SchedulerThreadHandle = std::thread::JoinHandle<io::Result<()>>;
 
@@ -22,10 +20,7 @@ type SchedulerThreadHandle = std::thread::JoinHandle<io::Result<()>>;
 /// use std::time::Duration;
 ///
 /// let (scheduler, handle) = i2o2::I2o2Builder::default()
-///     .with_defer_task_run(false)
 ///     .with_io_polling(true)
-///     .with_sqe_polling(true)
-///     .with_sqe_polling_timeout(Duration::from_millis(100))
 ///     .try_create::<()>()?;
 ///
 /// // ... do work
@@ -35,10 +30,10 @@ type SchedulerThreadHandle = std::thread::JoinHandle<io::Result<()>>;
 /// ```
 pub struct I2o2Builder {
     queue_size: u32,
+    ring_depth: u32,
     io_poll: bool,
-    sqe_poll: Option<Duration>,
-    sqe_poll_cpu: Option<u32>,
-    defer_task_run: bool,
+    size128: bool,
+    coop_task_run: bool,
     num_registered_files: u32,
     num_registered_buffers: u32,
 }
@@ -53,26 +48,45 @@ impl I2o2Builder {
     pub(super) const fn const_default() -> Self {
         Self {
             queue_size: 128,
+            ring_depth: 128,
             io_poll: false,
-            sqe_poll: None,
-            sqe_poll_cpu: None,
-            defer_task_run: false,
+            size128: false,
+            coop_task_run: false,
             num_registered_buffers: 0,
             num_registered_files: 0,
         }
     }
 
-    /// Set the queue size of the ring and handler buffer.
+    /// Set the queue size of the message queue between clients and the scheduler.
     ///
-    /// The provided value should be a power of `2`.
+    /// This value will be rounded to the nearest power of two.
     ///
     /// By default, this is `128`.
     pub const fn with_queue_size(mut self, size: u32) -> Self {
-        assert!(
-            size != 0 && (size & (size - 1)) == 0,
-            "provided `size` value must be a power of 2"
-        );
         self.queue_size = size;
+        self
+    }
+
+    /// Set the ring depth.
+    ///
+    /// This is the SQ size of the ring itself.
+    ///
+    /// This value must be a power of two.
+    ///
+    /// By default, this is `128`.
+    pub const fn with_ring_depth(mut self, size: u32) -> Self {
+        self.ring_depth = size;
+        self
+    }
+
+    /// Set the size of the SQ entry to be 128 bytes instead of 64.
+    ///
+    /// This is only required for the [opcode::UringCmd80](crate::opcode::UringCmd80)
+    /// op, for NVME pass through.
+    ///
+    /// By default, this is `false`.
+    pub const fn with_sqe_size128(mut self, enabled: bool) -> Self {
+        self.size128 = enabled;
         self
     }
 
@@ -129,188 +143,112 @@ impl I2o2Builder {
         self
     }
 
-    /// Enables/disables submission queue polling by the kernel.
+    /// Enables/disables the coop task run io_uring flag.
     ///
-    /// Sets `IORING_SETUP_SQPOLL`
-    ///
-    /// <https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html>
-    ///
-    /// > When this flag is specified, a kernel thread is created to
-    /// > perform submission queue polling.  An io_uring instance
-    /// > configured in this way enables an application to issue I/O
-    /// > without ever context switching into the kernel.  By using
-    /// > the submission queue to fill in new submission queue
-    /// > entries and watching for completions on the completion
-    /// > queue, the application can submit and reap I/Os without
-    /// > doing a single system call.
-    ///
-    /// By default, the system will use a `10ms` idle timeout, you can configure
-    /// this value using [I2o2Builder::with_sqe_polling_timeout].
-    pub const fn with_sqe_polling(mut self, enable: bool) -> Self {
-        if enable {
-            self.sqe_poll = Some(Duration::from_millis(20));
-        } else {
-            self.sqe_poll = None;
-        }
-        self
-    }
-
-    /// Set the submission queue polling idle timeout.
+    /// Sets `IORING_SETUP_COOP_TASKRUN`
     ///
     /// <https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html>
     ///
-    /// This overwrites the default timeout value I2o2 sets of `10ms`.
+    /// > By default, io_uring will interrupt a task running in userspace when a completion event comes in.
+    /// > This is to ensure that completions run in a timely manner. For a lot of use cases,
+    /// > this is overkill and can cause reduced performance from both the inter-processor interrupt
+    /// > used to do this, the kernel/user transition, the needless interruption of the tasks userspace
+    /// > activities, and reduced batching if completions come in at a rapid rate. Most applications
+    /// > don't need the forceful interruption, as the events are processed at any kernel/user
+    /// > transition. The exception are setups where the application uses multiple threads
+    /// > operating on the same ring, where the application waiting on completions isn't
+    /// > the one that submitted them. For most other use cases, setting this flag will
+    /// > improve performance.
     ///
-    /// NOTE: `with_sqe_polling` must be enabled first before calling this method.
-    pub const fn with_sqe_polling_timeout(mut self, timeout: Duration) -> Self {
-        if self.sqe_poll.is_none() {
-            panic!(
-                "submission queue polling is not already enabled at the time of calling this method"
-            );
-        }
-        assert!(
-            timeout.as_secs_f32() <= 10.0,
-            "timeout has gone beyond sane levels"
-        );
-
-        self.sqe_poll = Some(timeout);
-        self
-    }
-
-    /// Set cpu core the polling thread should be pinned to.
-    ///
-    /// Sets `IORING_SETUP_SQ_AFF`
-    ///
-    /// <https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html>
-    ///
-    /// NOTE: `with_sqe_polling` must be enabled first before calling this method.
-    pub const fn with_sqe_polling_pin_cpu(mut self, cpu: u32) -> Self {
-        if self.sqe_poll.is_none() {
-            panic!(
-                "submission queue polling is not already enabled at the time of calling this method"
-            );
-        }
-        self.sqe_poll_cpu = Some(cpu);
-        self
-    }
-
-    /// Enables/disables submission queue polling by the kernel.
-    ///
-    /// Sets `IORING_SETUP_DEFER_TASKRUN`
-    ///
-    /// <https://www.man7.org/linux/man-pages/man2/io_uring_setup.2.html>
-    ///
-    /// > By default, io_uring will process all outstanding work at
-    /// > the end of any system call or thread interrupt. This can
-    /// > delay the application from making other progress.  Setting
-    /// > this flag will hint to io_uring that it should defer work
-    /// > until an io_uring_enter(2) call with the
-    /// > IORING_ENTER_GETEVENTS flag set.
-    ///
-    /// WARNING: You must have a kernel version **6.1+** in order
+    /// WARNING: You must have a kernel version **5.19+** in order
     /// for this API to not error on creation.
     ///
     /// By default, this is `disabled`.
-    pub const fn with_defer_task_run(mut self, enable: bool) -> Self {
-        self.defer_task_run = enable;
+    pub const fn with_coop_task_run(mut self, enable: bool) -> Self {
+        self.coop_task_run = enable;
         self
     }
 
     /// Attempt to create the scheduler using the current configuration.
-    ///
-    /// This uses the default [mode::EntrySize64] operating mode.
     pub fn try_create<G>(self) -> io::Result<(I2o2Scheduler<G>, I2o2Handle<G>)> {
-        self.try_create_inner()
-    }
-
-    /// Attempt to create the scheduler using the current configuration.
-    ///
-    /// This uses the larger [mode::EntrySize128] operating mode which supports NVME
-    /// pass through.
-    pub fn try_create_size128<G>(self) -> io::Result<(I2o2Scheduler<G>, I2o2Handle<G>)> {
         self.try_create_inner()
     }
 
     /// Attempt to create the scheduler and run it in a background thread using the
     /// current configuration.
-    ///
-    /// This uses the default [mode::EntrySize64] operating mode.
     pub fn try_spawn<G>(
         self,
     ) -> io::Result<(std::thread::JoinHandle<io::Result<()>>, I2o2Handle<G>)>
     where
         G: Send + 'static,
     {
-        self.try_spawn_inner()
+        self.try_spawn_inner(None)
     }
 
     /// Attempt to create the scheduler and run it in a background thread using the
-    /// current configuration.
-    ///
-    /// This uses the larger [mode::EntrySize128] operating mode which supports NVME
-    /// pass through.
-    pub fn try_spawn_size128<G>(
+    /// current configuration and pin the thread to a specific CPU.
+    pub fn try_spawn_and_pin<G>(
         self,
-    ) -> io::Result<(SchedulerThreadHandle, I2o2Handle<G, mode::EntrySize128>)>
+        cpu_set: CpuSet,
+    ) -> io::Result<(std::thread::JoinHandle<io::Result<()>>, I2o2Handle<G>)>
     where
         G: Send + 'static,
     {
-        self.try_spawn_inner()
+        self.try_spawn_inner(Some(cpu_set))
     }
 
-    fn try_create_inner<G, M>(
-        self,
-    ) -> io::Result<(I2o2Scheduler<G, M>, I2o2Handle<G, M>)>
-    where
-        M: mode::RingMode,
-    {
+    fn try_create_inner<G>(self) -> io::Result<(I2o2Scheduler<G>, I2o2Handle<G>)> {
         #[cfg(test)]
         fail::fail_point!("scheduler_create_fail", |_| {
             eprintln!("invoked???");
             Err(io::Error::other("test error triggered by failpoints"))
         });
 
-        let (tx, rx) = flume::bounded(self.queue_size as usize);
-        let waker = RingWaker::new()?;
+        let (io_queue_tx, io_queue_rx) = super::queue::new(self.queue_size as usize);
+        let (resource_queue_tx, resource_queue_rx) = super::queue::new(32);
 
-        let probe = load_kernel_uring_probe()?;
-        if !kernel_is_at_least(&probe, VersionInterest::V5_15) {
-            return Err(kernel_too_old(VersionInterest::V5_15));
-        }
+        let (waker, controller) = wake::new()?;
 
-        let ring = self.setup_io_ring::<M>(&probe)?;
-        tracing::debug!(features = ?ring.params(), "ring created with features");
+        let mut ring = self.setup_io_ring()?;
+        ring.register_eventfd(controller.fd())?;
+        tracing::debug!("ring created");
 
-        self.setup_registered_resources::<M>(&probe, &ring)?;
+        self.setup_registered_resources(&mut ring)?;
         tracing::debug!("successfully registered resources with ring");
 
-        let handle = I2o2Handle::new(tx, waker.task_waker());
+        let handle = I2o2Handle::new(io_queue_tx, resource_queue_tx, waker);
 
         let scheduler = I2o2Scheduler {
             ring,
+            ring_size128: self.size128,
             state: TrackedState::new(
                 self.num_registered_files,
                 self.num_registered_buffers,
             ),
-            self_waker: waker,
-            incoming: rx,
-            backlog: VecDeque::new(),
+            waker_controller: controller,
+            incoming_ops: io_queue_rx,
+            incoming_resources: resource_queue_rx,
             _anti_send_ptr: std::ptr::null_mut(),
         };
 
         Ok((scheduler, handle))
     }
 
-    fn try_spawn_inner<G, M>(
+    fn try_spawn_inner<G>(
         self,
-    ) -> io::Result<(SchedulerThreadHandle, I2o2Handle<G, M>)>
+        cpu_set: Option<CpuSet>,
+    ) -> io::Result<(SchedulerThreadHandle, I2o2Handle<G>)>
     where
         G: Send + 'static,
-        M: mode::RingMode,
     {
-        let (tx, rx) = flume::bounded(1);
+        let (tx, rx) = mpsc::sync_channel(1);
 
         let task = move || {
+            if let Some(set) = cpu_set {
+                let success = set.set_current_thread();
+                tracing::debug!(success, "set scheduler thread affinity");
+            }
+
             let (scheduler, handle) = self.try_create_inner()?;
 
             if tx.send(handle).is_err() {
@@ -336,74 +274,41 @@ impl I2o2Builder {
         }
     }
 
-    fn setup_io_ring<M>(
-        &self,
-        probe: &io_uring::Probe,
-    ) -> io::Result<IoUring<M::SQEntry, M::CQEntry>>
-    where
-        M: mode::RingMode,
-    {
-        let mut builder = IoUring::builder();
+    fn setup_io_ring(&self) -> io::Result<ring::IoRing> {
+        let probe = RingProbe::new()?;
 
-        if kernel_is_at_least(probe, VersionInterest::V6_0) {
-            tracing::debug!("kernel has single issuer feature enabled, using...");
-            builder.setup_single_issuer();
+        let mut params: io_uring_params = unsafe { mem::zeroed() };
+
+        if self.size128 {
+            params.flags |= IORING_SETUP_SQE128;
+            params.flags |= IORING_SETUP_CQE32;
         }
 
-        builder.dontfork();
+        if probe.is_kernel_v6_0_or_newer() {
+            params.flags |= IORING_SETUP_SINGLE_ISSUER;
+        }
 
         if self.io_poll {
-            builder.setup_iopoll();
+            params.flags |= IORING_SETUP_IOPOLL;
         }
 
-        if let Some(idle) = self.sqe_poll {
-            builder.setup_sqpoll(idle.as_millis() as u32);
-
-            if let Some(cpu) = self.sqe_poll_cpu {
-                builder.setup_sqpoll_cpu(cpu);
-            }
-        } else if kernel_is_at_least(probe, VersionInterest::V5_19) {
-            tracing::debug!("kernel has coop task run feature enabled, using...");
-            // This functionality effectively gets implicitly enabled by SQPOLL
-            // we should only enable this if SQPOLL is disabled.
-            builder.setup_coop_taskrun();
+        if self.coop_task_run {
+            params.flags |= IORING_SETUP_COOP_TASKRUN;
         }
 
-        if self.defer_task_run {
-            if kernel_is_at_least(probe, VersionInterest::V6_1) {
-                builder.setup_defer_taskrun();
-            } else {
-                return Err(unsupported_version(VersionInterest::V6_1));
-            }
-        }
+        params.features |= IORING_FEAT_NODROP;
+        params.features |= IORING_FEAT_FAST_POLL;
 
-        builder.build(self.queue_size)
+        ring::IoRing::new(self.ring_depth, params)
     }
 
-    fn setup_registered_resources<M>(
-        &self,
-        probe: &io_uring::Probe,
-        ring: &IoUring<M::SQEntry, M::CQEntry>,
-    ) -> io::Result<()>
-    where
-        M: mode::RingMode,
-    {
-        let submitter = ring.submitter();
-
+    fn setup_registered_resources(&self, ring: &mut ring::IoRing) -> io::Result<()> {
         if self.num_registered_files > 0 {
             tracing::debug!(
                 num_registered_files = self.num_registered_files,
                 "registering files with ring",
             );
-
-            // Setting up the registered files API.
-            if kernel_is_at_least(probe, VersionInterest::V5_19) {
-                submitter.register_files_sparse(self.num_registered_files)?;
-            } else {
-                let descriptors = vec![-1; self.num_registered_files as usize];
-                let flags = vec![0; self.num_registered_files as usize];
-                submitter.register_files_tags(&descriptors, &flags)?;
-            }
+            ring.register_files_sparse(self.num_registered_files)?;
         }
 
         if self.num_registered_buffers > 0 {
@@ -411,152 +316,36 @@ impl I2o2Builder {
                 num_registered_buffers = self.num_registered_buffers,
                 "registering buffers with ring",
             );
-
-            // Check if we have kernel 5.19+, IORING_OP_SOCKET was added in this version
-            // so we can check the version using the probe.
-            if kernel_is_at_least(probe, VersionInterest::V5_19) {
-                submitter.register_buffers_sparse(self.num_registered_buffers)?;
-            } else {
-                return Err(unsupported_version(VersionInterest::V5_19));
-            }
+            ring.register_buffers_sparse(self.num_registered_buffers)?;
         }
 
         Ok(())
     }
 }
 
-/// Create a default ring to load a set of probe options.
-fn load_kernel_uring_probe() -> io::Result<io_uring::Probe> {
-    let ring = IoUring::new(8)?;
-    let mut probe = io_uring::Probe::new();
-    let submitter = ring.submitter();
-    submitter.register_probe(&mut probe)?;
+#[derive(Debug, Clone)]
+/// The cpu set restricts what CPU cores the thread can run on.
+pub struct CpuSet(libc::cpu_set_t);
 
-    tracing::debug!("loaded ring probe");
-
-    Ok(probe)
-}
-
-#[cfg(not(test))]
-fn kernel_is_at_least(probe: &io_uring::Probe, interest: VersionInterest) -> bool {
-    probe.is_supported(interest as u8)
-}
-
-#[cfg(test)]
-fn kernel_is_at_least(probe: &io_uring::Probe, interest: VersionInterest) -> bool {
-    match interest {
-        VersionInterest::V5_15 => {
-            fail::fail_point!("read-dir", |_| false);
-            probe.is_supported(interest as u8)
-        },
-        VersionInterest::V5_19 => {
-            fail::fail_point!("kernel_v5_13", |_| false);
-            fail::fail_point!("kernel_v5_15", |_| false);
-            probe.is_supported(interest as u8)
-        },
-        VersionInterest::V6_0 => {
-            fail::fail_point!("kernel_v5_13", |_| false);
-            fail::fail_point!("kernel_v5_15", |_| false);
-            fail::fail_point!("kernel_v5_19", |_| false);
-            probe.is_supported(interest as u8)
-        },
-        VersionInterest::V6_1 => {
-            fail::fail_point!("kernel_v5_13", |_| false);
-            fail::fail_point!("kernel_v5_15", |_| false);
-            fail::fail_point!("kernel_v5_19", |_| false);
-            fail::fail_point!("kernel_v6_0", |_| false);
-            probe.is_supported(interest as u8)
-        },
-    }
-}
-
-#[repr(u8)]
-enum VersionInterest {
-    V5_15 = io_uring::opcode::OpenAt::CODE,
-    V5_19 = io_uring::opcode::Socket::CODE,
-    V6_0 = io_uring::opcode::SendZc::CODE,
-    V6_1 = io_uring::opcode::SendMsgZc::CODE,
-}
-
-impl Display for VersionInterest {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            VersionInterest::V5_15 => write!(f, "5.15"),
-            VersionInterest::V5_19 => write!(f, "5.19"),
-            VersionInterest::V6_0 => write!(f, "6.0"),
-            VersionInterest::V6_1 => write!(f, "6.1"),
-        }
-    }
-}
-
-fn unsupported_version(required: VersionInterest) -> io::Error {
-    io::Error::new(
-        ErrorKind::Unsupported,
-        format!(
-            "feature not available, kernel version {required}+ \
-        required to use this feature"
-        ),
-    )
-}
-
-fn kernel_too_old(required: VersionInterest) -> io::Error {
-    io::Error::new(
-        ErrorKind::Unsupported,
-        format!("I2o2 requires a kernel version of {required} or newer"),
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[rstest::rstest]
-    #[case(
-        VersionInterest::V5_15,
-        "feature not available, kernel version 5.15+ required to use this feature"
-    )]
-    #[case(
-        VersionInterest::V5_19,
-        "feature not available, kernel version 5.19+ required to use this feature"
-    )]
-    #[case(
-        VersionInterest::V6_0,
-        "feature not available, kernel version 6.0+ required to use this feature"
-    )]
-    #[case(
-        VersionInterest::V6_1,
-        "feature not available, kernel version 6.1+ required to use this feature"
-    )]
-    fn test_unsupported_version_error_display(
-        #[case] version: VersionInterest,
-        #[case] expected: &str,
-    ) {
-        let msg = unsupported_version(version).to_string();
-        assert_eq!(msg, expected)
+impl CpuSet {
+    /// Creates a blank [CpuSet] with no cores set.
+    pub fn blank() -> Self {
+        Self(unsafe { mem::zeroed::<libc::cpu_set_t>() })
     }
 
-    #[rstest::rstest]
-    #[case(
-        VersionInterest::V5_15,
-        "I2o2 requires a kernel version of 5.15 or newer"
-    )]
-    #[case(
-        VersionInterest::V5_19,
-        "I2o2 requires a kernel version of 5.19 or newer"
-    )]
-    #[case(
-        VersionInterest::V6_0,
-        "I2o2 requires a kernel version of 6.0 or newer"
-    )]
-    #[case(
-        VersionInterest::V6_1,
-        "I2o2 requires a kernel version of 6.1 or newer"
-    )]
-    fn test_kernel_too_old_error_display(
-        #[case] version: VersionInterest,
-        #[case] expected: &str,
-    ) {
-        let msg = kernel_too_old(version).to_string();
-        assert_eq!(msg, expected)
+    /// Set the target `cpu_id` in the CPU set.
+    pub fn set(&mut self, cpu_id: usize) {
+        unsafe { CPU_SET(cpu_id, &mut self.0) };
+    }
+
+    fn set_current_thread(&self) -> bool {
+        let res = unsafe {
+            sched_setaffinity(
+                0, // Defaults to current thread
+                size_of::<libc::cpu_set_t>(),
+                &self.0,
+            )
+        };
+        res == 0
     }
 }

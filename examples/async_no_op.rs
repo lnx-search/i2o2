@@ -31,15 +31,15 @@ async fn main() -> io::Result<()> {
     };
     println!("reply future created: {reply:?}");
 
-    // Our clone of `guard` should live until the operation completes.
-    assert_eq!(Arc::strong_count(&guard), 2);
-
     // We can synchronously or asynchronously wait for the reply, which will give us
     // back the result that the syscall equivalent of the operation would return.
     // I.e. `opcode::Write` would return the same value as `pwrite(2)`.
     let reply = reply.await;
     println!("our task completed with reply: {reply:?}");
     assert_eq!(reply, Ok(0));
+
+    // Guard should have been dropped by the scheduler now.
+    assert_eq!(Arc::strong_count(&guard), 1);
 
     println!("shutting down scheduler");
     // The scheduler will shut down once all handles are dropped.

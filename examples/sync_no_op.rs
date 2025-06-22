@@ -13,8 +13,7 @@ fn main() -> io::Result<()> {
     // Now, this API is still unsafe, because you are responsible for ensuring the op is safe
     // to perform and buffers, etc... remain valid.
 
-    let timeout = i2o2::types::Timespec::new().nsec(50_000);
-    let op = i2o2::opcode::Timeout::new(&timeout as *const _);
+    let op = i2o2::opcode::Nop::new();
 
     // However, some utils are provided like the  `guard` parameter,  which will only be
     // dropped once the operation is complete and no longer needed by the kernel.

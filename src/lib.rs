@@ -1,30 +1,27 @@
 #![doc = include_str!("../README.md")]
 
+use std::any::Any;
+use std::io;
+
+use liburing_rs::{io_uring_sqe, io_uring_sqe_set_data64};
+
+use crate::opcode::sealed::RegisterOp;
+
 mod builder;
+mod flags;
 mod handle;
-pub mod mode;
-mod ops;
+pub mod opcode;
+mod queue;
 mod reply;
+mod ring;
 #[cfg(test)]
 mod tests;
 mod wake;
 
-use std::any::Any;
-use std::collections::VecDeque;
-use std::io;
-use std::task::Poll;
-
-use flume::r#async::RecvFut;
-use futures_util::FutureExt;
-use io_uring::{CompletionQueue, IoUring, SubmissionQueue, Submitter};
-pub use io_uring::{opcode, types};
-use smallvec::SmallVec;
-
-pub use crate::builder::I2o2Builder;
-pub use crate::handle::{I2o2Handle, RegisterError, SchedulerClosed, SubmitResult};
-use crate::mode::{CQEntryOptions, SQEntryOptions};
-pub use crate::ops::{AnyOpcode, RingOp};
-use crate::wake::RingWaker;
+pub use self::builder::{CpuSet, I2o2Builder};
+pub use self::handle::{I2o2Handle, RegisterError, SchedulerClosed, SubmitResult};
+pub use self::opcode::types;
+pub use self::reply::{ReplyReceiver, TryGetResultError};
 
 #[cfg(not(target_os = "linux"))]
 compiler_error!(
@@ -32,102 +29,10 @@ compiler_error!(
 );
 
 /// A guard type that can be any object.
-pub type DynamicGuard = Box<dyn Any>;
+pub type DynamicGuard = Box<dyn Any + Send>;
 
 pub(crate) const MAGIC_ERRNO_NO_CAPACITY: i32 = -999;
-
-mod flags {
-    use std::process::abort;
-
-    pub const MAX_SAFE_IDX: u32 = 0x3FFF_FFFF;
-    const FLAGS_MASK: u64 = 0xF000_0000_0000_0000;
-    pub const UNGUARDED: u64 = 0x0000_0000_0000_0000;
-    pub const EVENT_FD_WAKER: u64 = 0x1000_0000_0000_0000;
-    pub const GUARDED: u64 = 0x2000_0000_0000_0000;
-    pub const GUARDED_RESOURCE_BUFFER: u64 = 0x3000_0000_0000_0000;
-    pub const GUARDED_RESOURCE_FILE: u64 = 0x4000_0000_0000_0000;
-
-    #[repr(u64)]
-    #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-    /// The possible flags that can be set.
-    pub enum Flag {
-        /// The event is coming from the event FD waker.
-        EventFdWaker = EVENT_FD_WAKER,
-        /// The event has a guard value.
-        Guarded = GUARDED,
-        /// The event has no special properties and has no guard value.
-        Unguarded = UNGUARDED,
-        /// The event is tied to a registered resource buffer which is now unregistered
-        /// _and_ no longer used by any operation in the ring.
-        GuardedResourceBuffer = GUARDED_RESOURCE_BUFFER,
-        /// The event is tied to a registered resource file which is now unregistered
-        /// _and_ no longer used by any operation in the ring.
-        GuardedResourceFile = GUARDED_RESOURCE_FILE,
-    }
-
-    /// Packs the 4 bit `flag` with the 30 bit `reply_idx` and `guard_idx`.
-    pub fn pack(flag: Flag, reply_idx: u32, guard_idx: u32) -> u64 {
-        // If a program has *somehow* managed to enqueue 1,073,741,823
-        // they are doing something *very* wrong, if the system is even still alive
-        // we don't care to support that sort of behaviour so will abort to prevent
-        // wraps or corrupting of the packed value.
-        if reply_idx > MAX_SAFE_IDX || guard_idx > MAX_SAFE_IDX {
-            abort_insane_program();
-        }
-
-        let reply_idx = (reply_idx as u64) << 30;
-        let guard_idx = guard_idx as u64;
-        let flag = flag as u64;
-        flag | reply_idx | guard_idx
-    }
-
-    /// Unpacks the 4 bit `flag` and 30 bit `reply_idx` and `guard_idx` from
-    /// the provided value.
-    pub fn unpack(packed_value: u64) -> (Flag, u32, u32) {
-        const REPLY_IDX_MASK: u64 = 0x0FFF_FFFF_C000_0000;
-        const GUARD_IDX_MASK: u64 = 0x0000_0000_3FFF_FFFF;
-
-        let guard_idx = (packed_value & GUARD_IDX_MASK) as u32;
-        let reply_idx = ((packed_value & REPLY_IDX_MASK) >> 30) as u32;
-        let flag = match packed_value & FLAGS_MASK {
-            EVENT_FD_WAKER => Flag::EventFdWaker,
-            GUARDED => Flag::Guarded,
-            UNGUARDED => Flag::Unguarded,
-            GUARDED_RESOURCE_BUFFER => Flag::GuardedResourceBuffer,
-            GUARDED_RESOURCE_FILE => Flag::GuardedResourceFile,
-            // This should **never** happen, if this occurs the system has
-            // already entered a UB state since we have to assume that any or all of
-            // our prior event reads and unpacking are invalid; which means we have
-            // wrongly freed guards we shouldn't have and all guarantees are now gone.
-            #[cfg(debug_assertions)]
-            _ => unreachable!(
-                "retrieved completion flag should never be unknown without being UB!"
-            ),
-            #[cfg(not(debug_assertions))]
-            _ => abort_system_fail(),
-        };
-
-        (flag, reply_idx, guard_idx)
-    }
-
-    #[inline(never)]
-    fn abort_insane_program() {
-        eprintln!(
-            "billions of operations have been enqueued and not completed, program should abort"
-        );
-        abort();
-    }
-
-    #[cfg(not(debug_assertions))]
-    #[inline(never)]
-    fn abort_system_fail() -> ! {
-        eprintln!(
-            "the system is aborting due to I2o2 witnessing a unknown flag in the IO ring completion \
-            events, either this is a bug or you have done something _very_ wrong."
-        );
-        abort()
-    }
-}
+pub(crate) const MAGIC_ERRNO_NOT_SIZE128: i32 = -1000;
 
 /// Create a new [I2o2Scheduler] and [I2o2Handle] pair backed by io_uring.
 ///
@@ -190,10 +95,7 @@ where
 /// use std::time::Duration;
 ///
 /// let (scheduler, handle) = i2o2::builder()
-///     .with_defer_task_run(false)
 ///     .with_io_polling(true)
-///     .with_sqe_polling(true)
-///     .with_sqe_polling_timeout(Duration::from_millis(100))
 ///     .try_create::<()>()?;
 ///
 /// // ... do work
@@ -210,30 +112,22 @@ pub const fn builder() -> I2o2Builder {
 ///
 /// Communication between the handles and the scheduler can be done both synchronously
 /// and asynchronously.
-pub struct I2o2Scheduler<G = DynamicGuard, M = mode::EntrySize64>
-where
-    M: mode::RingMode,
-{
-    ring: IoUring<M::SQEntry, M::CQEntry>,
+pub struct I2o2Scheduler<G = DynamicGuard> {
+    ring: ring::IoRing,
+    ring_size128: bool,
     state: TrackedState<G>,
     /// A waker handle for triggering a completion event on `self`
     /// intern causing events to be processed.
-    self_waker: RingWaker,
+    waker_controller: wake::RingWakerController,
     /// A stream of incoming IO events to process.
-    incoming: flume::Receiver<Message<G, M::SQEntry>>,
-    /// A backlog of IO events to process once the queue has available space.
-    ///
-    /// The entries in this backlog have already had user data assigned to them
-    /// and can be copied directly to the queue.
-    backlog: VecDeque<M::SQEntry>,
-    /// A null pointer used to prevent people from sending the scheduler across
+    incoming_ops: queue::SchedulerReceiver<Packaged<opcode::AnyOp, G>>,
+    /// A stream of incoming resource events to process.
+    incoming_resources: queue::SchedulerReceiver<ResourceMessage<G>>,
+    /// A null pointer used to prevent people from sending the scheduler across threads.
     _anti_send_ptr: *mut u8,
 }
 
-impl<G, M> I2o2Scheduler<G, M>
-where
-    M: mode::RingMode,
-{
+impl<G> I2o2Scheduler<G> {
     /// Run the scheduler in the current thread until it is shut down.
     ///
     /// This will wait for all remaining tasks to complete.
@@ -242,91 +136,171 @@ where
 
         #[cfg(test)]
         fail::fail_point!("scheduler_run_fail", |_| {
-            eprintln!("called??");
             Err(io::Error::other("test error triggered by failpoints"))
         });
 
-        let (submitter, sq, cq) = self.ring.split();
-        let mut runner: RingRunner<'_, G, M> = RingRunner {
-            submitter,
-            sq,
-            cq,
-            state: &mut self.state,
-            self_waker: &mut self.self_waker,
-            backlog: &mut self.backlog,
-            incoming: &self.incoming,
-            pending_future: None,
-            shutdown: false,
-        };
+        tracing::debug!("running scheduler event loop");
 
-        while !runner.shutdown {
-            runner.run()?;
-        }
+        self.run_event_loop()?;
 
-        if let Err(e) = runner.unregister_resources() {
-            tracing::warn!(error = ?e, "scheduler failed to gracefully unregister resources");
-        }
-
-        runner.wait_for_remaining()?;
+        self.wait_for_remaining()?;
         tracing::debug!("scheduler shutting down");
 
         Ok(())
     }
-}
 
-struct RingRunner<'ring, G, M: mode::RingMode> {
-    submitter: Submitter<'ring>,
-    sq: SubmissionQueue<'ring, M::SQEntry>,
-    cq: CompletionQueue<'ring, M::CQEntry>,
-    state: &'ring mut TrackedState<G>,
-    self_waker: &'ring mut RingWaker,
-    backlog: &'ring mut VecDeque<M::SQEntry>,
-    incoming: &'ring flume::Receiver<Message<G, M::SQEntry>>,
-    pending_future: Option<RecvFut<'ring, Message<G, M::SQEntry>>>,
-    shutdown: bool,
-}
+    fn run_event_loop(&mut self) -> io::Result<()> {
+        loop {
+            if self.incoming_ops.is_disconnected() {
+                break;
+            }
 
-impl<'ring, G, M> RingRunner<'ring, G, M>
-where
-    M: mode::RingMode,
-{
-    /// Run a single cycle of the event loop.
-    ///
-    /// This executes steps in the order of:
-    ///
-    /// 1) Try and empty the backlog of submission events if applicable.
-    /// 2) Ingest new events from `incoming` until the SQ is full or `incoming` is empty.
-    /// 3) Process outstanding completion events.  
-    /// 4) Re-register the EventFD listener if the system needs.
-    /// 5) Submit outstanding submission events.
-    /// 6) Wait for completion events if there is no outstanding work left.
-    ///
-    fn run(&mut self) -> io::Result<bool> {
-        self.sq.sync();
-        self.cq.sync();
+            for _ in 0..50 {
+                self.drain_incoming_io()?;
+                self.drain_completions()?;
+            }
 
-        self.drain_backlog();
-        self.ingest_from_incoming();
-        self.drain_completion_events();
-        self.maybe_register_waker();
+            self.drain_incoming_resources()?;
+            self.maybe_wait_for_events();
+        }
 
-        self.submit_and_maybe_wait()?;
-
-        Ok(self.shutdown)
+        Ok(())
     }
 
-    fn wait_for_remaining(&mut self) -> io::Result<()> {
-        self.sq.sync();
-        self.cq.sync();
+    /// Attempts to drain all incoming IO ops and submit them to the ring.
+    fn drain_incoming_io(&mut self) -> io::Result<()> {
+        let pop_n = self.incoming_ops.len();
 
+        #[cfg(feature = "trace-hotpath")]
+        tracing::trace!(pop_n = pop_n, "attempting to draining incoming IO ops");
+
+        let mut n_read = 0;
+        for _ in 0..pop_n {
+            let Some(sqe) = self.ring.get_available_sqe() else {
+                break;
+            };
+
+            let msg = match self.incoming_ops.pop() {
+                Some(msg) => msg,
+                None => {
+                    write_filler_op(sqe);
+                    break;
+                },
+            };
+
+            n_read += 1;
+
+            if msg.entry.requires_size128() && !self.ring_size128 {
+                #[cfg(feature = "trace-hotpath")]
+                tracing::trace!(
+                    "rejecting op because size128 is required but not active"
+                );
+                write_filler_op(sqe);
+                let _ = msg.reply.set_result(MAGIC_ERRNO_NOT_SIZE128);
+                continue;
+            }
+
+            self.state.register(sqe, msg);
+        }
+
+        let result = self.ring.submit();
+
+        if self.incoming_ops.is_empty() {
+            self.incoming_ops.wake_n(n_read);
+        }
+
+        result?;
+
+        Ok(())
+    }
+
+    /// Attempts to drain all incoming resource ops and tie them to the ring.
+    fn drain_incoming_resources(&mut self) -> io::Result<()> {
+        #[cfg(feature = "trace-hotpath")]
+        tracing::trace!(
+            pop_n = self.incoming_resources.len(),
+            "attempting to draining incoming resource ops"
+        );
+
+        let mut processed = 0;
+        while let Some(msg) = self.incoming_resources.pop() {
+            match msg {
+                ResourceMessage::RegisterResource(op) => {
+                    self.handle_resource_register_op(op);
+                },
+                ResourceMessage::UnregisterResource(op) => {
+                    self.handle_resource_unregister_op(op);
+                },
+            }
+            processed += 1;
+        }
+
+        if processed > 0 {
+            self.incoming_resources.wake_all();
+        }
+
+        Ok(())
+    }
+
+    /// Processes all completion events from the ring.
+    fn drain_completions(&mut self) -> io::Result<()> {
+        #[cfg(feature = "trace-hotpath")]
+        tracing::trace!("draining completion events");
+
+        while self.ring.has_completions_ready() {
+            for cqe in self.ring.iter_completions() {
+                let (flag, reply_idx, guard_idx) = flags::unpack(cqe.user_data);
+
+                #[cfg(feature = "trace-hotpath")]
+                tracing::trace!(flag = ?flag, task_id = reply_idx, result = cqe.result, "completion");
+
+                match flag {
+                    flags::Flag::FillerOp => {},
+                    flags::Flag::Guarded => {
+                        self.state.acknowledge_reply(reply_idx, cqe.result);
+                        self.state.drop_guard_if_exists(guard_idx);
+                    },
+                    flags::Flag::Unguarded => {
+                        self.state.acknowledge_reply(reply_idx, cqe.result);
+                    },
+                    flags::Flag::GuardedResourceBuffer => {
+                        self.state.drop_buffer_guard(guard_idx);
+                    },
+                    flags::Flag::GuardedResourceFile => {
+                        self.state.drop_file_guard(guard_idx);
+                    },
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Wait for events if there is no outstanding work to be done.
+    fn maybe_wait_for_events(&mut self) {
+        if !self.has_outstanding_work() {
+            self.waker_controller.ask_for_wake();
+
+            // Check again because of atomics, yada, yada...
+            if !self.has_outstanding_work() {
+                return;
+            }
+
+            #[cfg(feature = "trace-hotpath")]
+            tracing::trace!("scheduler waiting on eventfd events...");
+            self.waker_controller.wait_for_events();
+        }
+    }
+
+    /// Waits for remaining inflight operations to complete.
+    fn wait_for_remaining(&mut self) -> io::Result<()> {
         #[cfg(feature = "trace-hotpath")]
         tracing::debug!("scheduler is draining remaining events");
 
-        while !self.backlog.is_empty() || self.state.remaining_tasks() > 0 {
-            self.drain_backlog();
-            self.ingest_from_incoming();
-            self.drain_completion_events();
-            self.submit_and_maybe_wait()?;
+        while !self.incoming_ops.is_empty() || self.state.remaining_tasks() > 0 {
+            self.drain_incoming_io()?;
+            self.drain_completions()?;
+            self.maybe_wait_for_events();
         }
 
         #[cfg(feature = "trace-hotpath")]
@@ -335,187 +309,15 @@ where
         Ok(())
     }
 
-    /// Unregisters all resources from the ring.
-    fn unregister_resources(&mut self) -> io::Result<()> {
-        if !self.state.resource_buffer_guards.is_empty() {
-            self.submitter.unregister_buffers()?;
-        }
-
-        if !self.state.resource_file_guards.is_empty() {
-            self.submitter.unregister_files()?;
-        }
-
-        Ok(())
-    }
-
-    /// Attempt to push outstanding backlog entries onto the submission queue.
-    fn drain_backlog(&mut self) {
-        if self.backlog.is_empty() {
-            return;
-        }
-
-        #[cfg(feature = "trace-hotpath")]
-        tracing::trace!(
-            backlog_size = self.backlog.len(),
-            "attempting to draining backlog"
-        );
-
-        while !self.sq.is_full() {
-            let Some(entry) = self.backlog.pop_front() else {
-                break;
-            };
-
-            // SAFETY: Responsibility about ensuring entry validity is pushed to the caller
-            //         on the handle side.
-            if unsafe { self.sq.push(&entry).is_err() } {
-                self.backlog.push_front(entry);
-                break;
-            }
-        }
-        self.sq.sync();
-    }
-
-    /// Reads new entries from `incoming` until the submission queue is full.
-    ///
-    /// If multiple entries are included in a single message, the runner will
-    /// add the events unable to be pushed to the SQ to the backlog where
-    /// it will have priority when space is next available in the SQ.
-    fn ingest_from_incoming(&mut self) {
-        #[cfg(feature = "trace-hotpath")]
-        tracing::trace!(
-            incoming_len = self.incoming.len(),
-            sq_len = self.sq.len(),
-            sq_capacity = self.sq.capacity(),
-            "ingesting new entries from incoming"
-        );
-
-        'ingest: while !self.sq.is_full() {
-            if let Ok(message) = self.incoming.try_recv() {
-                self.handle_message(message);
-                continue;
-            }
-
-            // We must continue until we get either a disconnect or `pending` state
-            // so we can be sure the waker is registered.
-            loop {
-                let mut context = self.self_waker.context();
-                let future = self
-                    .pending_future
-                    .get_or_insert_with(|| self.incoming.recv_async());
-                match future.poll_unpin(&mut context) {
-                    Poll::Pending => break 'ingest,
-                    Poll::Ready(Err(_)) => {
-                        #[cfg(feature = "trace-hotpath")]
-                        tracing::debug!("scheduler handle has been disconnected");
-                        self.pending_future = None;
-                        self.shutdown = true;
-                        break 'ingest;
-                    },
-                    Poll::Ready(Ok(message)) => {
-                        self.pending_future = None;
-                        self.handle_message(message)
-                    },
-                }
-            }
-        }
-        self.sq.sync();
-    }
-
-    fn drain_completion_events(&mut self) {
-        for completion in &mut self.cq {
-            let result = completion.result();
-            let user_data = completion.user_data();
-
-            let (flag, reply_idx, guard_idx) = flags::unpack(user_data);
-
-            #[cfg(feature = "trace-hotpath")]
-            tracing::trace!(flag = ?flag, task_id = reply_idx, result = result, "completion");
-
-            match flag {
-                flags::Flag::EventFdWaker => self.self_waker.mark_unset(),
-                flags::Flag::Guarded => {
-                    self.state.acknowledge_reply(reply_idx, result);
-                    self.state.drop_guard_if_exists(guard_idx);
-                },
-                flags::Flag::Unguarded => {
-                    self.state.acknowledge_reply(reply_idx, result);
-                },
-                flags::Flag::GuardedResourceBuffer => {
-                    self.state.drop_buffer_guard(guard_idx);
-                },
-                flags::Flag::GuardedResourceFile => {
-                    self.state.drop_file_guard(guard_idx);
-                },
-            }
-        }
-        self.cq.sync();
-    }
-
-    /// Register the EventFD waker if it is not already registered with a `read(2)` event.
-    ///
-    /// This is used to wake the scheduler when new `incoming` operations are available
-    /// while waiting for completion events.
-    fn maybe_register_waker(&mut self) {
-        self.self_waker.maybe_submit_self(&mut self.sq);
-        self.sq.sync();
-    }
-
-    /// Submit all new submission events to the kernel and wait
-    /// for completion events to be ready if there is not anymore outstanding work.
-    fn submit_and_maybe_wait(&self) -> io::Result<()> {
-        if !self.has_outstanding_work() {
-            #[cfg(feature = "trace-hotpath")]
-            tracing::debug!("waiting for completion events");
-            self.submit_and_wait()
-        } else {
-            #[cfg(feature = "trace-hotpath")]
-            tracing::debug!("outstanding work ready, submitting without wait");
-            self.submit_no_wait()
-        }
-    }
-
-    fn submit_no_wait(&self) -> io::Result<()> {
-        match self.submitter.submit() {
-            Err(ref err) if err.raw_os_error() == Some(libc::EBUSY) => Ok(()),
-            Err(other) => Err(other),
-            Ok(_) => Ok(()),
-        }
-    }
-
-    fn submit_and_wait(&self) -> io::Result<()> {
-        match self.submitter.submit_and_wait(1) {
-            Err(ref err) if err.raw_os_error() == Some(libc::EBUSY) => Ok(()),
-            Err(other) => Err(other),
-            Ok(_) => {
-                #[cfg(feature = "trace-hotpath")]
-                tracing::debug!("scheduler was woken");
-                Ok(())
-            },
-        }
-    }
-
-    fn handle_message(&mut self, message: Message<G, M::SQEntry>) {
-        match message {
-            Message::OpMany(ops) => {
-                for op in ops {
-                    self.handle_io_op(op);
-                }
-            },
-            Message::OpOne(op) => self.handle_io_op(op),
-            Message::RegisterResource(op) => self.handle_resource_register_op(op),
-            Message::UnregisterResource(op) => self.handle_resource_unregister_op(op),
-        }
-    }
-
-    fn handle_io_op(&mut self, op: Packaged<M::SQEntry, G>) {
-        let entry = self.state.register(op);
-        self.push_entry(entry);
-    }
-
+    /// Registers a new resource with the ring providing there is capacity.
     fn handle_resource_register_op(&mut self, op: Packaged<Resource, G>) {
-        let Packaged { data, reply, guard } = op;
+        let Packaged {
+            entry,
+            reply,
+            guard,
+        } = op;
 
-        let result = if data.is_buffer() {
+        let result = if entry.is_buffer() {
             self.state.register_buffer_guard(guard)
         } else {
             self.state.register_file_guard(guard)
@@ -526,7 +328,7 @@ where
                 reply.set_result(MAGIC_ERRNO_NO_CAPACITY);
                 return;
             },
-            Some(offset) if data.is_buffer() => {
+            Some(offset) if entry.is_buffer() => {
                 let packed = flags::pack(flags::Flag::GuardedResourceBuffer, 0, offset);
                 (packed, offset)
             },
@@ -536,15 +338,9 @@ where
             },
         };
 
-        let result = match data {
-            Resource::Buffer(iovec) => unsafe {
-                self.submitter
-                    .register_buffers_update(offset, &[iovec], Some(&[tag]))
-            },
-            Resource::File(fd) => {
-                self.submitter
-                    .register_files_update_tag(offset, &[fd], &[tag])
-            },
+        let result = match entry {
+            Resource::Buffer(iovec) => self.ring.register_buffer(offset, iovec, tag),
+            Resource::File(fd) => self.ring.register_file(offset, fd, tag),
         };
 
         if result.is_ok() {
@@ -554,7 +350,7 @@ where
         }
 
         // We have to ensure we don't leak mem if there is an error.
-        if data.is_buffer() {
+        if entry.is_buffer() {
             self.state.drop_buffer_guard(offset);
         } else {
             self.state.drop_file_guard(offset);
@@ -564,11 +360,15 @@ where
         reply.set_result(err.raw_os_error().unwrap());
     }
 
+    /// Unregisters a resource tied to the ring.
+    ///
+    /// Cleanup of guards, etc... Will be handled on the completion event triggered
+    /// when the resource is no longer required by the ring.
     fn handle_resource_unregister_op(&mut self, op: Packaged<ResourceIndex, G>) {
-        let Packaged { data, reply, .. } = op;
+        let Packaged { entry, reply, .. } = op;
 
-        let result = match data {
-            ResourceIndex::File(id) => self.submitter.register_files_update(id, &[-1]),
+        let result = match entry {
+            ResourceIndex::File(id) => self.ring.unregister_file(id),
         };
 
         if let Err(err) = result {
@@ -578,20 +378,19 @@ where
         }
     }
 
-    fn push_entry(&mut self, entry: M::SQEntry) {
-        // SAFETY: Responsibility about ensuring entry validity is pushed to the caller
-        //         on the handle side.
-        if unsafe { self.sq.push(&entry).is_err() } {
-            self.backlog.push_back(entry);
-        }
-    }
-
     fn has_outstanding_work(&self) -> bool {
-        !self.incoming.is_empty()
-            || self.incoming.is_disconnected()
-            || !self.backlog.is_empty()
-            || !self.cq.is_empty()
+        !self.incoming_ops.is_empty()
+            || !self.incoming_resources.is_empty()
+            // incoming_ops & incoming_resources lifetimes are tied together, we only need to check 1 atomic.
+            || self.incoming_ops.is_disconnected()
     }
+}
+
+fn write_filler_op(sqe: &mut io_uring_sqe) {
+    let user_data = flags::pack(flags::Flag::FillerOp, 0, 0);
+    let op = opcode::Nop::new();
+    op.register_with_sqe(sqe);
+    unsafe { io_uring_sqe_set_data64(sqe, user_data) }
 }
 
 struct TrackedState<G> {
@@ -627,8 +426,12 @@ impl<G> TrackedState<G> {
         self.replies.len()
     }
 
-    fn register<E: SQEntryOptions>(&mut self, op: Packaged<E, G>) -> E {
-        let Packaged { data, reply, guard } = op;
+    fn register(&mut self, free_sqe: &mut io_uring_sqe, op: Packaged<opcode::AnyOp, G>) {
+        let Packaged {
+            entry,
+            reply,
+            guard,
+        } = op;
 
         let reply_idx = self.replies.insert(reply);
 
@@ -641,10 +444,13 @@ impl<G> TrackedState<G> {
         let guard_idx = guard.map(|g| self.register_guard(g)).unwrap_or(0);
 
         #[cfg(feature = "trace-hotpath")]
-        tracing::trace!(task_id = reply_idx, "registered entry");
+        tracing::trace!(task_id = reply_idx, flag = ?flag, "registered entry");
 
         let user_data = flags::pack(flag, reply_idx as u32, guard_idx);
-        data.user_data(user_data)
+
+        // Write the entry to the SQE in the ring.
+        entry.register_with_sqe(free_sqe);
+        unsafe { io_uring_sqe_set_data64(free_sqe, user_data) };
     }
 
     fn register_guard(&mut self, guard: G) -> u32 {
@@ -693,28 +499,22 @@ impl<G> TrackedState<G> {
     }
 }
 
-/// An operation to for the scheduler to process.
-enum Message<G, E> {
-    /// Submit many IO operations to the kernel.
-    ///
-    /// This can help avoid overhead with the channel communication.
-    OpMany(SmallVec<[Packaged<E, G>; 3]>),
-    /// Submit one IO operation to the kernel.
-    OpOne(Packaged<E, G>),
+enum ResourceMessage<G> {
     /// Register a new resource to the ring.
     RegisterResource(Packaged<Resource, G>),
     /// Unregister an existing resource on the ring.
     UnregisterResource(Packaged<ResourceIndex, G>),
 }
 
-struct Packaged<D, G = DynamicGuard> {
-    data: D,
+#[repr(align(64))]
+struct Packaged<E, G> {
+    entry: E,
     reply: reply::ReplyNotify,
     guard: Option<G>,
 }
 
 enum Resource {
-    Buffer(libc::iovec),
+    Buffer(liburing_rs::iovec),
     File(std::os::fd::RawFd),
 }
 
@@ -729,32 +529,4 @@ unsafe impl Send for Resource {}
 
 enum ResourceIndex {
     File(u32),
-}
-
-#[cfg(test)]
-mod tests_packing {
-    use super::*;
-
-    #[rstest::rstest]
-    #[case(flags::Flag::Unguarded, 0, 0)]
-    #[case(flags::Flag::Unguarded, 1, 1)]
-    #[case(flags::Flag::Unguarded, 4, 0)]
-    #[case(flags::Flag::Unguarded, 0, 5)]
-    #[case(flags::Flag::Unguarded, 9999, 12345)]
-    #[case(flags::Flag::Unguarded, 0x3FFF_FFFF, u32::MIN)]
-    #[case(flags::Flag::Unguarded, u32::MIN, 0x3FFF_FFFF)]
-    #[case(flags::Flag::Unguarded, u32::MIN, 0x3FFF_FFFF)]
-    #[case(flags::Flag::Unguarded, 0x3FFF_FFFF, 1234)]
-    #[case(flags::Flag::Unguarded, 1234, 0x3FFF_FFFF)]
-    fn test_pack_and_unpack_indexes(
-        #[case] flag: flags::Flag,
-        #[case] input_reply_idx: u32,
-        #[case] guard_idx: u32,
-    ) {
-        let packed = flags::pack(flag, input_reply_idx, guard_idx);
-        let (unpacked_flag, unpacked_reply, unpacked_guard) = flags::unpack(packed);
-        assert_eq!(unpacked_flag, flag);
-        assert_eq!(unpacked_reply, input_reply_idx);
-        assert_eq!(unpacked_guard, guard_idx);
-    }
 }

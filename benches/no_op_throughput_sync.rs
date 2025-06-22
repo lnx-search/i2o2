@@ -6,27 +6,16 @@ use std::time::{Duration, Instant};
 
 mod no_op_shared;
 
-const NUM_OPS_PER_WORKER: usize = 250_000;
+const NUM_OPS_PER_WORKER: usize = 100_000;
 
 fn main() -> io::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let concurrency_levels = [1, 8, 16, 32];
+    let concurrency_levels = [1usize, 8, 16, 32];
 
     let configs = [
         ("default config", i2o2::builder()),
-        ("defer task run", i2o2::builder().with_defer_task_run(true)),
-        (
-            "IO polling w/default timeout",
-            i2o2::builder().with_sqe_polling(true),
-        ),
-        (
-            "IO polling w/100ms timeout",
-            i2o2::builder()
-                .with_queue_size(128)
-                .with_sqe_polling(true)
-                .with_sqe_polling_timeout(Duration::from_millis(500)),
-        ),
+        ("COOP task run", i2o2::builder().with_coop_task_run(true)),
     ];
 
     let mut results = no_op_shared::BenchmarkResults::default();
@@ -35,8 +24,10 @@ fn main() -> io::Result<()> {
         eprintln!("running benchmark for config: {config:?}");
         for (run_id, num_workers) in concurrency_levels.iter().enumerate() {
             eprintln!("  {run_id} - run with {num_workers} workers");
-            let (elapsed, total_ops, ops_per_sec) =
-                bench_with_config(config.clone(), *num_workers)?;
+            let (elapsed, total_ops, ops_per_sec) = bench_with_config(
+                config.clone().with_queue_size(*num_workers as u32 * 8),
+                *num_workers,
+            )?;
             results.push(name, *num_workers, elapsed, total_ops, ops_per_sec);
         }
     }

@@ -1,11 +1,16 @@
 use std::io;
-use std::sync::Arc;
+use std::io::ErrorKind;
 
-use smallvec::SmallVec;
-
-use crate::ops::RingOp;
 use crate::reply::Cancelled;
-use crate::{DynamicGuard, Message, Packaged, Resource, ResourceIndex, mode, reply};
+use crate::{
+    DynamicGuard,
+    Packaged,
+    Resource,
+    ResourceIndex,
+    ResourceMessage,
+    opcode,
+    reply,
+};
 
 /// A submission result for the scheduler.
 pub type SubmitResult<T> = Result<T, SchedulerClosed>;
@@ -34,46 +39,39 @@ pub enum RegisterError {
 
 /// The [I2o2Handle] allows you to interact with the [I2o2Scheduler](crate::I2o2Scheduler) and
 /// submit IO events to it.
-pub struct I2o2Handle<G = DynamicGuard, M = mode::EntrySize64>
-where
-    M: mode::RingMode,
-{
-    inner: flume::Sender<Message<G, M::SQEntry>>,
-    /// A guard that ensures the runtime is woken when the handle is dropped.
-    wake_on_drop: Arc<WakeOnDrop>,
+pub struct I2o2Handle<G = DynamicGuard> {
+    ops_queue: super::queue::SchedulerSender<Packaged<opcode::AnyOp, G>>,
+    resource_queue: super::queue::SchedulerSender<ResourceMessage<G>>,
+    waker: super::wake::RingWaker,
 }
 
-impl<G, M> Clone for I2o2Handle<G, M>
-where
-    M: mode::RingMode,
-{
+impl<G> Clone for I2o2Handle<G> {
     fn clone(&self) -> Self {
         Self {
-            inner: self.inner.clone(),
-            wake_on_drop: self.wake_on_drop.clone(),
+            ops_queue: self.ops_queue.clone(),
+            resource_queue: self.resource_queue.clone(),
+            waker: self.waker.clone(),
         }
     }
 }
 
-impl<G, M> I2o2Handle<G, M>
-where
-    M: mode::RingMode,
-{
+impl<G> I2o2Handle<G> {
     pub(super) fn new(
-        tx: flume::Sender<Message<G, M::SQEntry>>,
-        waker: std::task::Waker,
+        ops_queue: super::queue::SchedulerSender<Packaged<opcode::AnyOp, G>>,
+        resource_queue: super::queue::SchedulerSender<ResourceMessage<G>>,
+        waker: super::wake::RingWaker,
     ) -> Self {
         Self {
-            inner: tx,
-            wake_on_drop: Arc::new(WakeOnDrop(waker)),
+            ops_queue,
+            resource_queue,
+            waker,
         }
     }
 }
 
-impl<G, M> I2o2Handle<G, M>
+impl<G> I2o2Handle<G>
 where
     G: Send + 'static,
-    M: mode::RingMode,
 {
     /// Submit an op to the scheduler.
     ///
@@ -115,76 +113,19 @@ where
     ///     Ok(())
     /// }
     /// ```
-    pub unsafe fn submit<O: RingOp<M>>(
+    pub unsafe fn submit<O: Into<opcode::AnyOp>>(
         &self,
         op: O,
         guard: Option<G>,
     ) -> SubmitResult<reply::ReplyReceiver> {
         let (reply, rx) = reply::new();
-        let message = Message::OpOne(Packaged {
-            data: op.into_entry(),
+        let message = Packaged {
+            entry: op.into(),
             reply,
             guard,
-        });
+        };
 
-        self.inner
-            .send(message)
-            .map_err(|_| SchedulerClosed)
-            .map(|_| rx)
-    }
-
-    /// Submit multiple ops to the scheduler.
-    ///
-    /// This may block if th scheduler queue is currently full.
-    ///
-    /// A `guard` value can be passed, which can be used to ensure data required by the entry
-    /// lives at _least_ as long as necessary for the scheduler. It is your responsibility to
-    /// ensure that the `guard` actually impacts the dependencies of the entry, but the scheduler
-    /// will guarantee that the `guard` lives as long as io_uring requires.
-    ///
-    /// # Safety
-    ///
-    /// It is the callers responsibility to ensure that the op contained within the entry is:
-    /// - Safe to send across thread boundaries.
-    /// - Valid throughout the entire execution of the syscall until complete.
-    /// - Obeys any additional safety constraints specified by the [i2o2::opcode](crate::opcode).
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use std::io;   
-    ///
-    /// fn main() -> io::Result<()> {
-    ///     let (thread_handle, scheduler_handle) = i2o2::create_and_spawn::<()>()?;
-    ///     
-    ///     let ops = std::iter::repeat_with(|| (i2o2::opcode::Nop::new(), None)).take(5);
-    ///     
-    ///     let replies = unsafe {
-    ///         scheduler_handle
-    ///             .submit_many_entries(ops)
-    ///             .expect("submit ops to scheduler")
-    ///     };    
-    ///     
-    ///     for reply in replies {
-    ///         let result = reply.wait();
-    ///         assert_eq!(result, Ok(0));
-    ///     }
-    ///
-    ///     drop(scheduler_handle);
-    ///     thread_handle.join().unwrap()?;
-    ///     
-    ///     Ok(())
-    /// }
-    /// ```
-    pub unsafe fn submit_many_entries<O: RingOp<M>>(
-        &self,
-        pairs: impl IntoIterator<Item = (O, Option<G>)>,
-    ) -> SubmitResult<impl IntoIterator<Item = reply::ReplyReceiver>> {
-        let (message, replies) = prepare_many_entries(pairs);
-
-        self.inner.send(message).map_err(|_| SchedulerClosed)?;
-
-        Ok(replies.into_iter())
+        self.send_io_sync_inner(message).map(|_| rx)
     }
 
     /// Submit an op to the scheduler asynchronously waiting if the queue is currently
@@ -200,7 +141,7 @@ where
     /// It is the callers responsibility to ensure that the op contained within the entry is:
     /// - Safe to send across thread boundaries.
     /// - Valid throughout the entire execution of the syscall until complete.
-    /// - Obeys any additional safety constraints specified by the [i2o2::opcode](crate::opcode).
+    /// - Obeys any additional safety constraints specified by the [i2o2::opcode](opcode).
     ///
     /// # Example
     ///
@@ -228,85 +169,19 @@ where
     ///     Ok(())
     /// }
     /// ```
-    pub unsafe fn submit_async<O: RingOp<M>>(
+    pub unsafe fn submit_async<O: Into<opcode::AnyOp>>(
         &self,
         op: O,
         guard: Option<G>,
     ) -> impl Future<Output = SubmitResult<reply::ReplyReceiver>> + '_ {
-        use futures_util::TryFutureExt;
-
         let (reply, rx) = reply::new();
-        let message = Message::OpOne(Packaged {
-            data: op.into_entry(),
+        let message = Packaged {
+            entry: op.into(),
             reply,
             guard,
-        });
+        };
 
-        async {
-            self.inner
-                .send_async(message)
-                .map_err(|_| SchedulerClosed)
-                .await
-                .map(|_| rx)
-        }
-    }
-
-    /// Submit multiple ops to the scheduler asynchronously waiting if the queue is currently
-    /// full.
-    ///
-    /// A `guard` value can be passed, which can be used to ensure data required by the entry
-    /// lives at _least_ as long as necessary for the scheduler. It is your responsibility to
-    /// ensure that the `guard` actually impacts the dependencies of the entry, but the scheduler
-    /// will guarantee that the `guard` lives as long as io_uring requires.
-    ///
-    /// # Safety
-    ///
-    /// It is the callers responsibility to ensure that the op contained within the entry is:
-    /// - Safe to send across thread boundaries.
-    /// - Valid throughout the entire execution of the syscall until complete.
-    /// - Obeys any additional safety constraints specified by the [i2o2::opcode](crate::opcode).
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use std::io;   
-    ///
-    /// #[tokio::main]
-    /// async fn main() -> io::Result<()> {
-    ///     let (thread_handle, scheduler_handle) = i2o2::create_and_spawn::<()>()?;
-    ///     let ops = std::iter::repeat_with(|| (i2o2::opcode::Nop::new(), None)).take(5);
-    ///     
-    ///     let replies = unsafe {
-    ///         scheduler_handle
-    ///             .submit_many_entries(ops)
-    ///             .expect("submit ops to scheduler")
-    ///     };    
-    ///  
-    ///     for reply in replies {
-    ///         let result = reply.wait();
-    ///         assert_eq!(result, Ok(0));
-    ///     }
-    ///
-    ///     drop(scheduler_handle);
-    ///     thread_handle.join().unwrap()?;
-    ///     
-    ///     Ok(())
-    /// }
-    /// ```
-    pub unsafe fn submit_many_entries_async<O: RingOp<M>>(
-        &self,
-        pairs: impl IntoIterator<Item = (O, Option<G>)>,
-    ) -> impl Future<Output = SubmitResult<impl IntoIterator<Item = reply::ReplyReceiver>>>
-    {
-        let (message, replies) = prepare_many_entries(pairs);
-
-        async {
-            self.inner
-                .send_async(message)
-                .await
-                .map_err(|_| SchedulerClosed)?;
-            Ok(replies.into_iter())
-        }
+        async { self.send_io_async_inner(message).await.map(|_| rx) }
     }
 
     /// Register a file with the ring returning a file index that is used
@@ -332,15 +207,14 @@ where
     ) -> Result<u32, RegisterError> {
         let (reply, rx) = reply::new();
 
-        let message = Message::RegisterResource(Packaged {
-            data: Resource::File(fd),
+        let message = ResourceMessage::RegisterResource(Packaged {
+            entry: Resource::File(fd),
             reply,
             guard,
         });
 
-        self.inner
-            .send(message)
-            .map_err(|_| RegisterError::SchedulerClosed(SchedulerClosed))?;
+        self.send_resource_sync_inner(message)
+            .map_err(RegisterError::SchedulerClosed)?;
         let result = rx.wait().map_err(RegisterError::Cancelled)?;
         handle_register_resource_result(result)
     }
@@ -354,15 +228,14 @@ where
     pub fn unregister_file(&self, file_index: u32) -> Result<(), RegisterError> {
         let (reply, rx) = reply::new();
 
-        let message = Message::UnregisterResource(Packaged {
-            data: ResourceIndex::File(file_index),
+        let message = ResourceMessage::UnregisterResource(Packaged {
+            entry: ResourceIndex::File(file_index),
             reply,
             guard: None,
         });
 
-        self.inner
-            .send(message)
-            .map_err(|_| RegisterError::SchedulerClosed(SchedulerClosed))?;
+        self.send_resource_sync_inner(message)
+            .map_err(RegisterError::SchedulerClosed)?;
         let result = rx.wait().map_err(RegisterError::Cancelled)?;
         handle_unregister_resource_result(result)
     }
@@ -390,16 +263,15 @@ where
     ) -> Result<u32, RegisterError> {
         let (reply, rx) = reply::new();
 
-        let message = Message::RegisterResource(Packaged {
-            data: Resource::File(fd),
+        let message = ResourceMessage::RegisterResource(Packaged {
+            entry: Resource::File(fd),
             reply,
             guard,
         });
 
-        self.inner
-            .send_async(message)
+        self.send_resource_async_inner(message)
             .await
-            .map_err(|_| RegisterError::SchedulerClosed(SchedulerClosed))?;
+            .map_err(RegisterError::SchedulerClosed)?;
         let result = rx.await.map_err(RegisterError::Cancelled)?;
         handle_register_resource_result(result)
     }
@@ -416,16 +288,15 @@ where
     ) -> Result<(), RegisterError> {
         let (reply, rx) = reply::new();
 
-        let message = Message::UnregisterResource(Packaged {
-            data: ResourceIndex::File(file_index),
+        let message = ResourceMessage::UnregisterResource(Packaged {
+            entry: ResourceIndex::File(file_index),
             reply,
             guard: None,
         });
 
-        self.inner
-            .send_async(message)
+        self.send_resource_async_inner(message)
             .await
-            .map_err(|_| RegisterError::SchedulerClosed(SchedulerClosed))?;
+            .map_err(RegisterError::SchedulerClosed)?;
         let result = rx.await.map_err(RegisterError::Cancelled)?;
         handle_unregister_resource_result(result)
     }
@@ -466,8 +337,8 @@ where
     ) -> Result<u32, RegisterError> {
         let (reply, rx) = reply::new();
 
-        let message = Message::RegisterResource(Packaged {
-            data: Resource::Buffer(libc::iovec {
+        let message = ResourceMessage::RegisterResource(Packaged {
+            entry: Resource::Buffer(liburing_rs::iovec {
                 iov_base: ptr as *mut _,
                 iov_len: len,
             }),
@@ -475,9 +346,8 @@ where
             guard,
         });
 
-        self.inner
-            .send(message)
-            .map_err(|_| RegisterError::SchedulerClosed(SchedulerClosed))?;
+        self.send_resource_sync_inner(message)
+            .map_err(RegisterError::SchedulerClosed)?;
         let result = rx.wait().map_err(RegisterError::Cancelled)?;
         handle_register_resource_result(result)
     }
@@ -518,8 +388,8 @@ where
     ) -> Result<u32, RegisterError> {
         let (reply, rx) = reply::new();
 
-        let message = Message::RegisterResource(Packaged {
-            data: Resource::Buffer(libc::iovec {
+        let message = ResourceMessage::RegisterResource(Packaged {
+            entry: Resource::Buffer(liburing_rs::iovec {
                 iov_base: ptr as *mut _,
                 iov_len: len,
             }),
@@ -527,44 +397,66 @@ where
             guard,
         });
 
-        self.inner
-            .send_async(message)
+        self.send_resource_async_inner(message)
             .await
-            .map_err(|_| RegisterError::SchedulerClosed(SchedulerClosed))?;
+            .map_err(RegisterError::SchedulerClosed)?;
         let result = rx.await.map_err(RegisterError::Cancelled)?;
         handle_register_resource_result(result)
     }
-}
 
-fn prepare_many_entries<M: mode::RingMode, O: RingOp<M>, G>(
-    pairs: impl IntoIterator<Item = (O, Option<G>)>,
-) -> (Message<G, M::SQEntry>, SmallVec<[reply::ReplyReceiver; 4]>) {
-    let mut replies = SmallVec::<[reply::ReplyReceiver; 4]>::new();
-    let iter = pairs.into_iter().map(|(op, guard)| {
-        let (reply, rx) = reply::new();
-        replies.push(rx);
+    fn send_io_sync_inner(
+        &self,
+        message: Packaged<opcode::AnyOp, G>,
+    ) -> Result<(), SchedulerClosed> {
+        self.ops_queue.send(message).map_err(|_| SchedulerClosed)?;
+        self.waker.maybe_wake();
+        Ok(())
+    }
 
-        Packaged {
-            data: op.into_entry(),
-            reply,
-            guard,
-        }
-    });
+    async fn send_io_async_inner(
+        &self,
+        message: Packaged<opcode::AnyOp, G>,
+    ) -> Result<(), SchedulerClosed> {
+        self.ops_queue
+            .send_async(message)
+            .await
+            .map_err(|_| SchedulerClosed)?;
+        self.waker.maybe_wake();
+        Ok(())
+    }
 
-    (Message::OpMany(SmallVec::from_iter(iter)), replies)
-}
+    fn send_resource_sync_inner(
+        &self,
+        message: ResourceMessage<G>,
+    ) -> Result<(), SchedulerClosed> {
+        self.resource_queue
+            .send(message)
+            .map_err(|_| SchedulerClosed)?;
+        self.waker.maybe_wake();
+        Ok(())
+    }
 
-struct WakeOnDrop(std::task::Waker);
-
-impl Drop for WakeOnDrop {
-    fn drop(&mut self) {
-        self.0.wake_by_ref();
+    async fn send_resource_async_inner(
+        &self,
+        message: ResourceMessage<G>,
+    ) -> Result<(), SchedulerClosed> {
+        self.resource_queue
+            .send_async(message)
+            .await
+            .map_err(|_| SchedulerClosed)?;
+        self.waker.maybe_wake();
+        Ok(())
     }
 }
 
 fn handle_register_resource_result(result: i32) -> Result<u32, RegisterError> {
     if result == crate::MAGIC_ERRNO_NO_CAPACITY {
         Err(RegisterError::OutOfCapacity)
+    } else if result == crate::MAGIC_ERRNO_NOT_SIZE128 {
+        Err(RegisterError::Io(io::Error::new(
+            ErrorKind::InvalidInput,
+            "128 byte SQE size must be enabled to use this op",
+        )))
     } else if result < 0 {
         Err(RegisterError::Io(io::Error::from_raw_os_error(-result)))
     } else {

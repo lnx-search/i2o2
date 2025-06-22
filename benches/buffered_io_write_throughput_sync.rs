@@ -8,26 +8,26 @@
 //! want that burning through my NVMEs!
 
 use std::collections::VecDeque;
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 use std::{cmp, io};
 
 use anyhow::{Context, Result, bail};
 
-use crate::io_shared::{BenchmarkResults, FileManager};
+use crate::io_shared::{BenchmarkWriteResults, FileManager};
 
 mod io_shared;
 
 static BASE_PATH: &str = "./benchmark-data";
-const BUFFER_SIZE: usize = 64 << 10;
+const BUFFER_SIZE: usize = 8 << 10;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let run_id = ulid::Ulid::new();
     let mut file_manger = FileManager::new(run_id, BASE_PATH.as_ref())?;
-    let mut results = BenchmarkResults::default();
+    let mut results = BenchmarkWriteResults::default();
 
     tracing::info!(run_id = %run_id, "starting benchmark");
     run_std_benches(&mut file_manger, &mut results)?;
@@ -42,7 +42,7 @@ fn main() -> Result<()> {
 
 fn run_std_benches(
     file_manger: &mut FileManager,
-    results: &mut BenchmarkResults,
+    results: &mut BenchmarkWriteResults,
 ) -> Result<()> {
     let mut buffer = vec![0; BUFFER_SIZE];
     fastrand::fill(&mut buffer);
@@ -57,34 +57,12 @@ fn run_std_benches(
     let elapsed = sequential_write_repeating(file.as_file_mut(), &buffer, 10 << 30)?;
     results.push("std::fs::File, 10GB", BUFFER_SIZE, elapsed, 10 << 30);
 
-    tracing::info!("running BufWriter file write 1GB");
-    let mut file = file_manger.new_file()?;
-    let mut writer = BufWriter::with_capacity(1 << 20, file.as_file_mut());
-    let elapsed = sequential_write_repeating(&mut writer, &buffer, 10 << 30)?;
-    results.push(
-        "std::io::BufWriter<File>, 1GB",
-        BUFFER_SIZE,
-        elapsed,
-        1 << 30,
-    );
-
-    tracing::info!("running BufWriter file write 10GB");
-    let mut file = file_manger.new_file()?;
-    let mut writer = BufWriter::with_capacity(1 << 20, file.as_file_mut());
-    let elapsed = sequential_write_repeating(&mut writer, &buffer, 10 << 30)?;
-    results.push(
-        "std::io::BufWriter<File>, 10GB",
-        BUFFER_SIZE,
-        elapsed,
-        10 << 30,
-    );
-
     Ok(())
 }
 
 fn run_ring_benches(
     file_manger: &mut FileManager,
-    results: &mut BenchmarkResults,
+    results: &mut BenchmarkWriteResults,
 ) -> Result<()> {
     let mut buffer = vec![0; BUFFER_SIZE];
     fastrand::fill(&mut buffer);
@@ -123,15 +101,13 @@ fn run_ring_benches(
     let file = file_manger.new_file()?;
     let elapsed = right_behind_write_repeating_ring(
         file.as_file(),
-        i2o2::builder()
-            .with_num_registered_files(1)
-            .with_num_registered_buffers(1),
+        i2o2::builder(),
         &buffer,
         1 << 30,
-        4,
+        8,
     )?;
     results.push(
-        "i2o2 buffered, write behind (4), 1GB",
+        "i2o2 buffered, write behind (8), 1GB",
         BUFFER_SIZE,
         elapsed,
         1 << 30,
@@ -141,15 +117,13 @@ fn run_ring_benches(
     let file = file_manger.new_file()?;
     let elapsed = right_behind_write_repeating_ring(
         file.as_file(),
-        i2o2::builder()
-            .with_num_registered_files(1)
-            .with_num_registered_buffers(1),
+        i2o2::builder(),
         &buffer,
         10 << 30,
-        4,
+        8,
     )?;
     results.push(
-        "i2o2 buffered, write behind (4), 10GB",
+        "i2o2 buffered, write behind (8), 10GB",
         BUFFER_SIZE,
         elapsed,
         10 << 30,
@@ -202,6 +176,8 @@ fn sequential_write_repeating_ring(
 ) -> Result<Duration> {
     let (scheduler_thread_handle, handle) = options.try_spawn::<()>()?;
 
+    file.set_len(target_file_size as u64)?;
+
     let now = Instant::now();
 
     let mut bytes_written = 0;
@@ -212,9 +188,9 @@ fn sequential_write_repeating_ring(
         let op = i2o2::opcode::Write::new(
             i2o2::types::Fd(file.as_raw_fd()),
             buffer.as_ptr(),
-            len as u32,
-        )
-        .offset(bytes_written as u64);
+            len,
+            bytes_written as u64,
+        );
 
         let reply = unsafe { handle.submit(op, None) }?;
         let result = reply.wait()?;
@@ -252,8 +228,7 @@ fn right_behind_write_repeating_ring(
     let (scheduler_thread_handle, handle) =
         options.try_spawn::<()>().context("create scheduler")?;
 
-    handle.register_file(file.as_raw_fd(), None)?;
-    unsafe { handle.register_buffer(buffer.as_ptr() as *mut u8, buffer.len(), None) }?;
+    file.set_len(target_file_size as u64)?;
 
     let mut pending_ops = VecDeque::with_capacity(write_behind);
 
@@ -267,9 +242,9 @@ fn right_behind_write_repeating_ring(
         let op = i2o2::opcode::Write::new(
             i2o2::types::Fd(file.as_raw_fd()),
             buffer.as_ptr(),
-            len as u32,
-        )
-        .offset(bytes_written as u64);
+            len,
+            bytes_written as u64,
+        );
 
         let reply = unsafe { handle.submit(op, None) }?;
 

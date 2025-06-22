@@ -2,9 +2,8 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 
-use io_uring::{opcode, types};
-
-use crate::{I2o2Handle, I2o2Scheduler};
+use crate::opcode::types;
+use crate::{I2o2Handle, I2o2Scheduler, opcode};
 
 #[test]
 fn test_sync_buffered_file_io_write_size64() {
@@ -26,7 +25,10 @@ fn test_sync_buffered_file_io_write_size64() {
 fn test_sync_buffered_file_io_write_size128() {
     super::try_init_logging();
 
-    let (scheduler, handle) = crate::builder().try_create_size128().unwrap();
+    let (scheduler, handle) = crate::builder()
+        .with_sqe_size128(true)
+        .try_create()
+        .unwrap();
 
     let tmp_file = tempfile::NamedTempFile::new().unwrap();
     let file = std::fs::File::options()
@@ -59,7 +61,10 @@ fn test_sync_direct_io_file_io_write_size64() {
 fn test_sync_direct_io_file_io_write_size128() {
     super::try_init_logging();
 
-    let (scheduler, handle) = crate::builder().try_create_size128().unwrap();
+    let (scheduler, handle) = crate::builder()
+        .with_sqe_size128(true)
+        .try_create()
+        .unwrap();
 
     let tmp_file = tempfile::NamedTempFile::new().unwrap();
     let file = std::fs::File::options()
@@ -94,7 +99,8 @@ async fn test_async_buffered_file_io_write_size64() {
 async fn test_async_buffered_file_io_write_size128() {
     super::try_init_logging();
 
-    let (scheduler, handle) = crate::builder().try_spawn_size128().unwrap();
+    let (scheduler, handle) =
+        crate::builder().with_sqe_size128(true).try_spawn().unwrap();
 
     let tmp_file = tempfile::NamedTempFile::new().unwrap();
     let file = std::fs::File::options()
@@ -131,7 +137,8 @@ async fn test_async_direct_io_file_io_write_size64() {
 async fn test_async_direct_io_file_io_write_size128() {
     super::try_init_logging();
 
-    let (scheduler, handle) = crate::builder().try_spawn_size128().unwrap();
+    let (scheduler, handle) =
+        crate::builder().with_sqe_size128(true).try_spawn().unwrap();
 
     let tmp_file = tempfile::NamedTempFile::new().unwrap();
     let file = std::fs::File::options()
@@ -146,18 +153,19 @@ async fn test_async_direct_io_file_io_write_size128() {
     scheduler.join().unwrap().unwrap();
 }
 
-fn write_file<M: crate::mode::RingMode>(
+fn write_file(
     file: &std::fs::File,
     buffer_size: usize,
-    scheduler: I2o2Scheduler<(), M>,
-    handle: I2o2Handle<(), M>,
+    scheduler: I2o2Scheduler<()>,
+    handle: I2o2Handle<()>,
 ) {
     let sample = vec![1; buffer_size];
 
     let op = opcode::Write::new(
         types::Fd(file.as_raw_fd()),
         sample.as_ptr(),
-        sample.len() as u32,
+        sample.len(),
+        0,
     );
     eprintln!("built op");
 
@@ -185,17 +193,18 @@ fn write_file<M: crate::mode::RingMode>(
     drop(sample);
 }
 
-async fn write_file_async<M: crate::mode::RingMode>(
+async fn write_file_async(
     file: &std::fs::File,
     buffer_size: usize,
-    handle: I2o2Handle<(), M>,
+    handle: I2o2Handle<()>,
 ) {
     let sample = vec![1; buffer_size];
 
     let op = opcode::Write::new(
         types::Fd(file.as_raw_fd()),
         sample.as_ptr(),
-        sample.len() as u32,
+        sample.len(),
+        0,
     );
     eprintln!("built op");
 
