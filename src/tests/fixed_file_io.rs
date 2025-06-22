@@ -22,9 +22,13 @@ fn test_sync_io_write_fixed_size64() {
         .open(tmp_file.path())
         .unwrap();
 
-    write_file(&file, 13, handle);
+    let mut buffer = vec![1; 13];
+    write_file(&file, &mut buffer, handle);
 
     scheduler.join().unwrap().unwrap();
+
+    drop(buffer);
+    drop(file);
 }
 
 #[test]
@@ -38,21 +42,22 @@ fn test_sync_io_read_fixed_size64() {
         .unwrap();
 
     let tmp_file = tempfile::NamedTempFile::new().unwrap();
-    let file = std::fs::File::options()
+    let mut file = std::fs::File::options()
         .write(true)
         .read(true)
         .open(tmp_file.path())
         .unwrap();
 
-    read_file(file, handle);
+    let mut buffer = vec![0; 13];
+    read_file(&mut file, &mut buffer, handle);
 
     scheduler.join().unwrap().unwrap();
+    drop(buffer);
+    drop(file);
 }
 
-fn read_file(mut file: std::fs::File, handle: I2o2Handle<()>) {
+fn read_file(file: &mut std::fs::File, sample: &mut [u8], handle: I2o2Handle<()>) {
     file.write_all(b"hello, world!").unwrap();
-
-    let mut sample = vec![1; 13];
 
     let file_id = handle.register_file(file.as_raw_fd(), None).unwrap();
     let buffer_id = unsafe {
@@ -90,13 +95,9 @@ fn read_file(mut file: std::fs::File, handle: I2o2Handle<()>) {
         eprintln!("read {result} bytes");
         assert_eq!(result, 13);
     }
-
-    drop(sample);
 }
 
-fn write_file(file: &std::fs::File, buffer_size: usize, handle: I2o2Handle<()>) {
-    let mut sample = vec![1; buffer_size];
-
+fn write_file(file: &std::fs::File, sample: &mut [u8], handle: I2o2Handle<()>) {
     let file_id = handle.register_file(file.as_raw_fd(), None).unwrap();
     let buffer_id = unsafe {
         handle
@@ -132,6 +133,4 @@ fn write_file(file: &std::fs::File, buffer_size: usize, handle: I2o2Handle<()>) 
     } else {
         eprintln!("wrote {result} bytes");
     }
-
-    drop(sample);
 }

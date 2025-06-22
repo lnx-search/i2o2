@@ -143,11 +143,6 @@ impl<G> I2o2Scheduler<G> {
 
         self.run_event_loop()?;
 
-        tracing::debug!("scheduler unregistering resources");
-        if let Err(e) = self.unregister_resources() {
-            tracing::warn!(error = ?e, "scheduler failed to gracefully unregister resources");
-        }
-
         self.wait_for_remaining()?;
         tracing::debug!("scheduler shutting down");
 
@@ -310,19 +305,6 @@ impl<G> I2o2Scheduler<G> {
 
         #[cfg(feature = "trace-hotpath")]
         tracing::debug!("scheduler has drained all events");
-
-        Ok(())
-    }
-
-    /// Unregisters any resources currently tied to the ring.
-    fn unregister_resources(&mut self) -> io::Result<()> {
-        if !self.state.resource_buffer_guards.is_empty() {
-            self.ring.unregister_buffers()?;
-        }
-
-        if !self.state.resource_file_guards.is_empty() {
-            self.ring.unregister_files()?;
-        }
 
         Ok(())
     }

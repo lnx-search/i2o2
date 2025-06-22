@@ -116,12 +116,6 @@ impl IoRing {
         check_err!(result)
     }
 
-    /// Unregister all files on the ring.
-    pub(super) fn unregister_files(&mut self) -> io::Result<()> {
-        let result = unsafe { io_uring_unregister_files(&raw mut self.ring) };
-        check_err!(result)
-    }
-
     /// Preallocate a sparse set of buffers.
     pub(super) fn register_buffers_sparse(
         &mut self,
@@ -150,12 +144,6 @@ impl IoRing {
                 1,
             )
         };
-        check_err!(result)
-    }
-
-    /// Unregister all buffers on the ring.
-    pub(super) fn unregister_buffers(&mut self) -> io::Result<()> {
-        let result = unsafe { io_uring_unregister_buffers(&raw mut self.ring) };
         check_err!(result)
     }
 
@@ -304,8 +292,6 @@ mod tests {
         ring.register_file(0, file.as_raw_fd(), 1)
             .expect("registering file should succeed");
 
-        ring.unregister_files().expect("unregister files");
-
         scenario.teardown();
     }
 
@@ -326,8 +312,6 @@ mod tests {
             1,
         )
         .expect("registering file should succeed");
-
-        ring.unregister_buffers().expect("unregister buffers");
 
         drop(buffer);
     }
