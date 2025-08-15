@@ -40,6 +40,16 @@ Probably not, at least I haven't had a situation where that is the case. In the 
 just tests the overhead of the scheduler and io_uring, we can reach upto 3 million ops per second with thousands concurrent 
 workers all pushing data to the scheduler.
 
+## Feature - Failpoint injection
+
+If you enable the `fail` feature flag, i2o2 provides fail points via https://github.com/tikv/fail-rs to 
+return custom/specific errors or status codes without having to trigger the actual error.
+
+Function are targeted via `i2o2::fail::<function>`, for example you can set `FAILPOINTS=i2o2::fail::register_file=return(-4)`
+to return the IO errno `4` aka `Interrupted`. 
+
+See the `examples/fail_points` file for more demonstration.
+
 ## Example
 
 ```rust

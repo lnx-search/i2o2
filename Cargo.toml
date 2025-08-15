@@ -12,6 +12,8 @@ license = "MIT"
 [features]
 # Enable tracing in the hotpath of the scheduler
 trace-hotpath = []
+# Enable failpoint injection, allowing you to simulate errors.
+fail = ["dep:fail"]
 
 [dependencies]
 thiserror = "2"
@@ -24,6 +26,9 @@ crossbeam-queue = "0.3"
 axboe-liburing = "2.11.0"
 
 tokio = { version = "1", features = ["sync"] }
+
+# Failpoints
+fail = { version = "0.5.1", features = ["failpoints"], optional = true }
 
 [dev-dependencies]
 rstest = "0.25"
@@ -54,6 +59,11 @@ test = true
 [[example]]
 name = "async_no_op"
 test = true
+
+[[example]]
+name = "fail_points"
+test = true
+required-features = ["fail"]
 
 # Benchmarking
 [[bench]]
