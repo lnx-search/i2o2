@@ -72,6 +72,9 @@ impl ReplyReceiver {
     ///
     /// Returns `None` if the result is not ready yet.
     pub fn try_get_result(&self) -> Result<i32, TryGetResultError> {
+        #[cfg(feature = "fail")]
+        fail::fail_point!("i2o2::fail::try_get_result", parse_fail_return);
+
         let inner = self.inner.as_ref();
 
         let value = inner.result.load(Ordering::SeqCst);
@@ -100,6 +103,15 @@ impl Future for ReplyReceiver {
     type Output = Result<i32, Cancelled>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        #[cfg(feature = "fail")]
+        fail::fail_point!("i2o2::fail::poll_reply_future", |code| {
+            match parse_fail_return(code) {
+                Ok(code) => Poll::Ready(Ok(code)),
+                Err(TryGetResultError::Cancelled) => Poll::Ready(Err(Cancelled)),
+                Err(TryGetResultError::Pending) => Poll::Pending,
+            }
+        });
+
         let inner = self.inner.as_ref();
 
         let value = inner.result.load(Ordering::SeqCst);
@@ -176,6 +188,18 @@ impl Drop for ReplyNotify {
 struct Inner {
     result: AtomicI64,
     waker: parking_lot::Mutex<Option<Waker>>,
+}
+
+#[cfg(feature = "fail")]
+fn parse_fail_return(value: Option<String>) -> Result<i32, TryGetResultError> {
+    let code_str = value.expect("i2o2 fail point triggered");
+    match code_str.as_str() {
+        "pending" => Err(TryGetResultError::Pending),
+        "cancelled" => Err(TryGetResultError::Cancelled),
+        _ => Ok(code_str
+            .parse::<i32>()
+            .expect("invalid fail point return value provided")),
+    }
 }
 
 #[cfg(test)]

@@ -205,6 +205,9 @@ where
         fd: std::os::fd::RawFd,
         guard: Option<G>,
     ) -> Result<u32, RegisterError> {
+        #[cfg(feature = "fail")]
+        fail::fail_point!("i2o2::fail::register_file", parse_fail_return_register);
+
         let (reply, rx) = reply::new();
 
         let message = ResourceMessage::RegisterResource(Packaged {
@@ -226,6 +229,9 @@ where
     ///
     /// This method can error when attempting to unregister a file that does not exist.
     pub fn unregister_file(&self, file_index: u32) -> Result<(), RegisterError> {
+        #[cfg(feature = "fail")]
+        fail::fail_point!("i2o2::fail::unregister_file", parse_fail_return_unregister);
+
         let (reply, rx) = reply::new();
 
         let message = ResourceMessage::UnregisterResource(Packaged {
@@ -261,6 +267,12 @@ where
         fd: std::os::fd::RawFd,
         guard: Option<G>,
     ) -> Result<u32, RegisterError> {
+        #[cfg(feature = "fail")]
+        fail::fail_point!(
+            "i2o2::fail::register_file_async",
+            parse_fail_return_register
+        );
+
         let (reply, rx) = reply::new();
 
         let message = ResourceMessage::RegisterResource(Packaged {
@@ -286,6 +298,12 @@ where
         &self,
         file_index: u32,
     ) -> Result<(), RegisterError> {
+        #[cfg(feature = "fail")]
+        fail::fail_point!(
+            "i2o2::fail::unregister_file_async",
+            parse_fail_return_unregister
+        );
+
         let (reply, rx) = reply::new();
 
         let message = ResourceMessage::UnregisterResource(Packaged {
@@ -335,6 +353,9 @@ where
         len: usize,
         guard: Option<G>,
     ) -> Result<u32, RegisterError> {
+        #[cfg(feature = "fail")]
+        fail::fail_point!("i2o2::fail::register_buffer", parse_fail_return_register);
+
         let (reply, rx) = reply::new();
 
         let message = ResourceMessage::RegisterResource(Packaged {
@@ -386,6 +407,12 @@ where
         len: usize,
         guard: Option<G>,
     ) -> Result<u32, RegisterError> {
+        #[cfg(feature = "fail")]
+        fail::fail_point!(
+            "i2o2::fail::register_buffer_async",
+            parse_fail_return_register
+        );
+
         let (reply, rx) = reply::new();
 
         let message = ResourceMessage::RegisterResource(Packaged {
@@ -469,5 +496,37 @@ fn handle_unregister_resource_result(result: i32) -> Result<(), RegisterError> {
         Err(RegisterError::Io(io::Error::from_raw_os_error(-result)))
     } else {
         Ok(())
+    }
+}
+
+#[cfg(feature = "fail")]
+fn parse_fail_return_register(value: Option<String>) -> Result<u32, RegisterError> {
+    let code_str = value.expect("i2o2 fail point triggered");
+    match code_str.as_str() {
+        "scheduler_closed" => Err(RegisterError::SchedulerClosed(SchedulerClosed)),
+        "cancelled" => Err(RegisterError::Cancelled(Cancelled)),
+        "out_of_capacity" => Err(RegisterError::OutOfCapacity),
+        _ => {
+            let code = code_str
+                .parse::<i32>()
+                .expect("invalid fail point return value provided");
+            if code < 0 {
+                Err(RegisterError::Io(io::Error::from_raw_os_error(-code)))
+            } else {
+                Ok(code as u32)
+            }
+        },
+    }
+}
+
+#[cfg(feature = "fail")]
+fn parse_fail_return_unregister(value: Option<String>) -> Result<(), RegisterError> {
+    let Some(code_str) = value else { return Ok(()) };
+    match code_str.as_str() {
+        "scheduler_closed" => Err(RegisterError::SchedulerClosed(SchedulerClosed)),
+        "cancelled" => Err(RegisterError::Cancelled(Cancelled)),
+        "out_of_capacity" => Err(RegisterError::OutOfCapacity),
+        "" => Ok(()),
+        _ => panic!("unexpected fail return value provided: {code_str:?}"),
     }
 }
