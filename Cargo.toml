@@ -1,6 +1,6 @@
 [package]
 name = "i2o2"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "A io_uring based IO executor for sync and async runtimes"
 readme = "README.md"
