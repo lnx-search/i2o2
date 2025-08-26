@@ -98,7 +98,6 @@ impl RingProbe {
     pub fn is_kernel_v5_19_or_newer(&self) -> bool {
         #[cfg(test)]
         {
-            eprintln!("{:?}", std::env::var("FAILPOINTS"));
             fail::fail_point!("kernel_v5_13", |_| false);
             fail::fail_point!("kernel_v5_15", |_| false);
             fail::fail_point!("kernel_v5_18", |_| false);
