@@ -34,6 +34,7 @@ pub struct I2o2Builder {
     io_poll: bool,
     size128: bool,
     coop_task_run: bool,
+    skip_unsupported_flags: bool,
     num_registered_files: u32,
     num_registered_buffers: u32,
 }
@@ -52,6 +53,7 @@ impl I2o2Builder {
             io_poll: false,
             size128: false,
             coop_task_run: false,
+            skip_unsupported_flags: false,
             num_registered_buffers: 0,
             num_registered_files: 0,
         }
@@ -166,6 +168,14 @@ impl I2o2Builder {
     /// By default, this is `disabled`.
     pub const fn with_coop_task_run(mut self, enable: bool) -> Self {
         self.coop_task_run = enable;
+        self
+    }
+
+    /// Skip a feature if it is unsupported by the current kernel.
+    ///
+    /// By default, this is `false`.
+    pub const fn skip_unsupported_features(mut self, skip: bool) -> Self {
+        self.skip_unsupported_flags = skip;
         self
     }
 
@@ -293,7 +303,11 @@ impl I2o2Builder {
         }
 
         if self.coop_task_run {
-            params.flags |= IORING_SETUP_COOP_TASKRUN;
+            if !self.skip_unsupported_flags
+                || (self.skip_unsupported_flags && probe.is_kernel_v5_19_or_newer())
+            {
+                params.flags |= IORING_SETUP_COOP_TASKRUN;
+            }
         }
 
         params.features |= IORING_FEAT_NODROP;

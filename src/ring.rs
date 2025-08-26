@@ -24,7 +24,7 @@ pub(super) struct IoRing {
 impl IoRing {
     #[cfg(test)]
     pub(super) fn for_test(queue_size: u32) -> io::Result<Self> {
-        Self::new(queue_size, unsafe { std::mem::zeroed() })
+        Self::new(queue_size, unsafe { mem::zeroed() })
     }
 
     /// Creates a new ring using the given queue size and flags.
@@ -219,7 +219,7 @@ impl<'ring> Iterator for CqeIterator<'ring> {
 
     fn next(&mut self) -> Option<Self::Item> {
         unsafe {
-            let mut cqe = std::ptr::null_mut::<io_uring_cqe>();
+            let mut cqe = ptr::null_mut::<io_uring_cqe>();
             let did_read = io_uring_cqe_iter_next(&raw mut self.iter, &raw mut cqe);
             if !did_read {
                 None

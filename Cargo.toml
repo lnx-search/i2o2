@@ -1,6 +1,6 @@
 [package]
 name = "i2o2"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "A io_uring based IO executor for sync and async runtimes"
 readme = "README.md"
@@ -23,7 +23,7 @@ slab = "0.4"
 tracing = "0.1"
 parking_lot = "0.12"
 crossbeam-queue = "0.3"
-axboe-liburing = "2.11.0"
+axboe-liburing = "2.12"
 
 tokio = { version = "1", features = ["sync"] }
 
@@ -31,7 +31,7 @@ tokio = { version = "1", features = ["sync"] }
 fail = { version = "0.5.1", features = ["failpoints"], optional = true }
 
 [dev-dependencies]
-rstest = "0.25"
+rstest = "0.26"
 tempfile = "3.20"
 tracing-subscriber = "0.3.19"
 memmap2 = "0.9.5"
