@@ -250,6 +250,8 @@ macro_rules! impl_op_boilerplate {
                 self.additional_flags |= IOSQE_ASYNC as u8;
             }
         }
+
+        unsafe impl Send for $op {}
     };
 }
 
