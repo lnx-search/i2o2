@@ -275,16 +275,10 @@ impl<G> I2o2Scheduler<G> {
         #[cfg(feature = "trace-hotpath")]
         tracing::trace!("no work, scheduler waiting on events...");
 
-        let mut cqe = std::ptr::null_mut();
-        self.ring.wait_for_completions(&raw mut cqe)?;
+        self.ring.wait_for_completions()?;
 
         #[cfg(feature = "trace-hotpath")]
         tracing::trace!("woken");
-
-        if !cqe.is_null() {
-            let cqe = unsafe { &*cqe };
-            self.state.handle_cqe(cqe.user_data, cqe.res);
-        }
 
         Ok(())
     }
