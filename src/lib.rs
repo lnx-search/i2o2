@@ -2,7 +2,7 @@
 
 use std::any::Any;
 use std::io;
-
+use std::sync::atomic::Ordering;
 use liburing_rs::{io_uring_sqe, io_uring_sqe_set_data64};
 
 use crate::opcode::sealed::RegisterOp;
@@ -281,7 +281,6 @@ impl<G> I2o2Scheduler<G> {
         if !self.has_outstanding_work() {
             self.waker.ask_for_wake();
 
-            // Check again because of atomics, yada, yada...
             if !self.has_outstanding_work() {
                 return Ok(());
             }

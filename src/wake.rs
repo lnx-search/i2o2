@@ -61,7 +61,6 @@ impl WakerInner {
     }
 
     fn maybe_wake(&self) -> bool {
-        std::sync::atomic::fence(Ordering::AcqRel);
         let wants_wake = self.wants_wake.swap(false, Ordering::AcqRel);
         #[cfg(feature = "trace-hotpath")]
         tracing::trace!(wants_wake = wants_wake, "waking ring");
