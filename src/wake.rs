@@ -57,15 +57,16 @@ impl WakerInner {
     fn ask_for_wake(&self) {
         #[cfg(feature = "trace-hotpath")]
         tracing::trace!("asking for wake");
-        self.wants_wake.store(true, Ordering::SeqCst);
+        self.wants_wake.store(true, Ordering::Release);
     }
 
     fn maybe_wake(&self) -> bool {
-        let wants_wake = self.wants_wake.swap(false, Ordering::SeqCst);
+        std::sync::atomic::fence(Ordering::AcqRel);
+        let wants_wake = self.wants_wake.swap(false, Ordering::AcqRel);
+        #[cfg(feature = "trace-hotpath")]
+        tracing::trace!(wants_wake = wants_wake, "waking ring");
         if wants_wake {
-            #[cfg(feature = "trace-hotpath")]
-            tracing::trace!("waking ring");
-            let user_data = flags::pack(Flag::FillerOp, 0, 0);
+            let user_data = flags::pack(Flag::Wake, 0, 0);
             self.ring_waker.wake(user_data)
         } else {
             false
