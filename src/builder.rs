@@ -298,6 +298,10 @@ impl I2o2Builder {
             params.flags |= IORING_SETUP_SINGLE_ISSUER;
         }
 
+        if probe.is_kernel_v6_1_or_newer() {
+            params.flags |= IORING_SETUP_DEFER_TASKRUN;
+        }
+
         if self.io_poll {
             params.flags |= IORING_SETUP_IOPOLL;
         }
