@@ -104,7 +104,7 @@ fn run_glommio_benches(
     Ok(())
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn run_i2o2_benches(
     file_manager: &mut FileManager,
     results: &mut BenchmarkRandomReadResults,
