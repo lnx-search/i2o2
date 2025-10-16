@@ -436,7 +436,7 @@ where
         message: Packaged<opcode::AnyOp, G>,
     ) -> Result<(), SchedulerClosed> {
         self.ops_queue.send(message).map_err(|_| SchedulerClosed)?;
-        self.waker.maybe_wake();
+        self.waker.signal_work_added();
         Ok(())
     }
 
@@ -448,7 +448,7 @@ where
             .send_async(message)
             .await
             .map_err(|_| SchedulerClosed)?;
-        self.waker.maybe_wake();
+        self.waker.signal_work_added();
         Ok(())
     }
 
@@ -459,7 +459,7 @@ where
         self.resource_queue
             .send(message)
             .map_err(|_| SchedulerClosed)?;
-        self.waker.maybe_wake();
+        self.waker.signal_work_added();
         Ok(())
     }
 
@@ -471,7 +471,7 @@ where
             .send_async(message)
             .await
             .map_err(|_| SchedulerClosed)?;
-        self.waker.maybe_wake();
+        self.waker.signal_work_added();
         Ok(())
     }
 }

@@ -237,6 +237,7 @@ impl I2o2Builder {
             waker,
             incoming_ops: io_queue_rx,
             incoming_resources: resource_queue_rx,
+            last_read_work_counter: 0,
             _anti_send_ptr: std::ptr::null_mut(),
         };
 
