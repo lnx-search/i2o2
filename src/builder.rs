@@ -10,6 +10,10 @@ use crate::{I2o2Scheduler, TrackedState, ring, wake};
 
 type SchedulerThreadHandle = std::thread::JoinHandle<io::Result<()>>;
 
+macro_rules! optional_flag {
+    ($flag:expr, $skip:expr, $condition:expr) => {{ $flag && (!$skip || ($skip && $condition())) }};
+}
+
 #[derive(Debug, Clone)]
 /// A set of configuration options for customising the [I2o2Scheduler] scheduler.
 ///
@@ -306,12 +310,10 @@ impl I2o2Builder {
             params.flags |= IORING_SETUP_IOPOLL;
         }
 
-        if self.coop_task_run {
-            if !self.skip_unsupported_flags
-                || (self.skip_unsupported_flags && probe.is_kernel_v5_19_or_newer())
-            {
-                params.flags |= IORING_SETUP_COOP_TASKRUN;
-            }
+        if optional_flag!(self.coop_task_run, self.skip_unsupported_flags, || probe
+            .is_kernel_v5_19_or_newer())
+        {
+            params.flags |= IORING_SETUP_COOP_TASKRUN;
         }
 
         params.features |= IORING_FEAT_NODROP;

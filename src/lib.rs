@@ -5,7 +5,6 @@ use std::{io, mem};
 
 use liburing_rs::{
     IOSQE_IO_DRAIN,
-    io_uring_prep_nop,
     io_uring_sqe,
     io_uring_sqe_set_data64,
     io_uring_sqe_set_flags,
@@ -206,7 +205,7 @@ impl<G> I2o2Scheduler<G> {
                     "rejecting op because size128 is required but not active"
                 );
                 write_filler_op(sqe);
-                let _ = msg.reply.set_result(MAGIC_ERRNO_NOT_SIZE128);
+                msg.reply.set_result(MAGIC_ERRNO_NOT_SIZE128);
                 continue;
             }
 
@@ -456,10 +455,6 @@ impl<G> TrackedState<G> {
 
     fn has_seen_drain_op(&self) -> bool {
         self.seen_drain_op
-    }
-
-    fn remaining_tasks(&self) -> usize {
-        self.replies.len()
     }
 
     fn handle_cqe(&mut self, user_data: u64, result: i32) {
