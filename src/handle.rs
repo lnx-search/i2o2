@@ -42,7 +42,7 @@ pub enum RegisterError {
 pub struct I2o2Handle<G = DynamicGuard> {
     ops_queue: super::queue::SchedulerSender<Packaged<opcode::AnyOp, G>>,
     resource_queue: super::queue::SchedulerSender<ResourceMessage<G>>,
-    waker: super::wake::RingWaker,
+    waker: super::wake::Waker,
 }
 
 impl<G> Clone for I2o2Handle<G> {
@@ -59,7 +59,7 @@ impl<G> I2o2Handle<G> {
     pub(super) fn new(
         ops_queue: super::queue::SchedulerSender<Packaged<opcode::AnyOp, G>>,
         resource_queue: super::queue::SchedulerSender<ResourceMessage<G>>,
-        waker: super::wake::RingWaker,
+        waker: super::wake::Waker,
     ) -> Self {
         Self {
             ops_queue,

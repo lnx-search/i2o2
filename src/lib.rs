@@ -118,7 +118,7 @@ pub struct I2o2Scheduler<G = DynamicGuard> {
     state: TrackedState<G>,
     /// A waker handle for triggering a completion event on `self`
     /// intern causing events to be processed.
-    waker_controller: wake::RingWakerController,
+    waker: wake::Waker,
     /// A stream of incoming IO events to process.
     incoming_ops: queue::SchedulerReceiver<Packaged<opcode::AnyOp, G>>,
     /// A stream of incoming resource events to process.
@@ -161,7 +161,7 @@ impl<G> I2o2Scheduler<G> {
             }
 
             self.drain_incoming_resources()?;
-            self.maybe_wait_for_events();
+            self.maybe_wait_for_events()?;
         }
 
         Ok(())
@@ -255,7 +255,7 @@ impl<G> I2o2Scheduler<G> {
                 tracing::trace!(flag = ?flag, task_id = reply_idx, result = cqe.result, "completion");
 
                 match flag {
-                    flags::Flag::FillerOp => {},
+                    flags::Flag::FillerOp | flags::Flag::Wake => {},
                     flags::Flag::Guarded => {
                         self.state.acknowledge_reply(reply_idx, cqe.result);
                         self.state.drop_guard_if_exists(guard_idx);
@@ -277,18 +277,20 @@ impl<G> I2o2Scheduler<G> {
     }
 
     /// Wait for events if there is no outstanding work to be done.
-    fn maybe_wait_for_events(&mut self) {
+    fn maybe_wait_for_events(&mut self) -> io::Result<()> {
         if !self.has_outstanding_work() {
-            self.waker_controller.ask_for_wake();
+            self.waker.ask_for_wake();
 
             // Check again because of atomics, yada, yada...
             if !self.has_outstanding_work() {
-                return;
+                return Ok(());
             }
 
             #[cfg(feature = "trace-hotpath")]
-            tracing::trace!("scheduler waiting on eventfd events...");
-            self.waker_controller.wait_for_events();
+            tracing::trace!("scheduler waiting on events...");
+            self.ring.submit_and_wait_one()
+        } else {
+            Ok(())
         }
     }
 
@@ -300,7 +302,7 @@ impl<G> I2o2Scheduler<G> {
         while !self.incoming_ops.is_empty() || self.state.remaining_tasks() > 0 {
             self.drain_incoming_io()?;
             self.drain_completions()?;
-            self.maybe_wait_for_events();
+            self.maybe_wait_for_events()?;
         }
 
         #[cfg(feature = "trace-hotpath")]

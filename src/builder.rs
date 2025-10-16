@@ -217,16 +217,15 @@ impl I2o2Builder {
         let (io_queue_tx, io_queue_rx) = super::queue::new(self.queue_size as usize);
         let (resource_queue_tx, resource_queue_rx) = super::queue::new(32);
 
-        let (waker, controller) = wake::new()?;
-
         let mut ring = self.setup_io_ring()?;
-        ring.register_eventfd(controller.fd())?;
         tracing::debug!("ring created");
+
+        let waker = wake::new(ring.create_waker());
 
         self.setup_registered_resources(&mut ring)?;
         tracing::debug!("successfully registered resources with ring");
 
-        let handle = I2o2Handle::new(io_queue_tx, resource_queue_tx, waker);
+        let handle = I2o2Handle::new(io_queue_tx, resource_queue_tx, waker.clone());
 
         let scheduler = I2o2Scheduler {
             ring,
@@ -235,7 +234,7 @@ impl I2o2Builder {
                 self.num_registered_files,
                 self.num_registered_buffers,
             ),
-            waker_controller: controller,
+            waker,
             incoming_ops: io_queue_rx,
             incoming_resources: resource_queue_rx,
             _anti_send_ptr: std::ptr::null_mut(),
