@@ -169,6 +169,8 @@ impl<G> I2o2Scheduler<G> {
                 self.drain_completions()?;
             }
 
+            self.drain_incoming_resources()?;
+
             self.maybe_wait_for_events()?;
         }
 
@@ -293,6 +295,9 @@ impl<G> I2o2Scheduler<G> {
     fn wait_for_remaining(&mut self) -> io::Result<()> {
         tracing::debug!("scheduler is draining remaining events");
 
+        self.incoming_ops.wake_all();
+        self.incoming_resources.wake_all();
+
         while !self.incoming_ops.is_empty() {
             self.drain_incoming_io()?;
             self.ring.wait_for_completions()?;
@@ -301,25 +306,15 @@ impl<G> I2o2Scheduler<G> {
 
         // Submits a SQE that will wait until all other pending SQEs complete.
         loop {
-            let sqe = match self.ring.get_available_sqe() {
-                Some(sqe) => sqe,
-                None => {
-                    self.ring.wait_for_completions()?;
-                    self.drain_completions()?;
-                    continue;
-                },
+            if let Some(sqe) = self.ring.get_available_sqe() {
+                write_drain_op(sqe);
+                self.ring.submit()?;
+                tracing::debug!("drain SQE submitted");
+                break;
             };
 
-            let user_data = flags::pack(flags::Flag::Drain, 0, 0);
-            unsafe {
-                io_uring_prep_nop(sqe);
-                io_uring_sqe_set_data64(sqe, user_data);
-                io_uring_sqe_set_flags(sqe, IOSQE_IO_DRAIN);
-            };
-
-            self.ring.submit()?;
-            tracing::debug!("drain SQE submitted");
-            break;
+            self.ring.wait_for_completions()?;
+            self.drain_completions()?;
         }
 
         while !self.state.has_seen_drain_op() {
@@ -416,6 +411,16 @@ fn write_filler_op(sqe: &mut io_uring_sqe) {
     let op = opcode::Nop::new();
     op.register_with_sqe(sqe);
     unsafe { io_uring_sqe_set_data64(sqe, user_data) }
+}
+
+fn write_drain_op(sqe: &mut io_uring_sqe) {
+    let user_data = flags::pack(flags::Flag::Drain, 0, 0);
+    let op = opcode::Nop::new();
+    op.register_with_sqe(sqe);
+    unsafe {
+        io_uring_sqe_set_data64(sqe, user_data);
+        io_uring_sqe_set_flags(sqe, IOSQE_IO_DRAIN);
+    };
 }
 
 struct TrackedState<G> {
