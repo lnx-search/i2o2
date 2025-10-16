@@ -30,7 +30,7 @@ static BASE_PATH: &str = "./benchmark-data/benchmark-xfs";
 const BUFFER_SIZE: usize = 8 << 10;
 const RUN_DURATION: Duration = Duration::from_secs(15);
 const THREADED_CONCURRENCY_LEVELS: [usize; 4] = [1, 64, 256, 512];
-const ASYNC_CONCURRENCY_LEVELS: [usize; 5] = [1, 64, 1024, 2048, 4096];
+const ASYNC_CONCURRENCY_LEVELS: [usize; 4] = [1, 64, 2048, 4096];
 
 const PIN_SCHEDULER_THREAD_TO_CORE: u32 = 5;
 const SIZE_100GB: usize = 100 << 30;
@@ -104,7 +104,7 @@ fn run_glommio_benches(
     Ok(())
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn run_i2o2_benches(
     file_manager: &mut FileManager,
     results: &mut BenchmarkRandomReadResults,

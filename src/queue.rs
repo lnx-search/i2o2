@@ -188,6 +188,15 @@ enum TrySendError<T> {
 mod tests {
 
     #[test]
+    fn test_queue_disconnect() {
+        let (tx, rx) = super::new::<()>(9);
+
+        assert!(!rx.is_disconnected());
+        drop(tx);
+        assert!(rx.is_disconnected());
+    }
+
+    #[test]
     fn test_queue_sync_handling() {
         let _ = tracing_subscriber::fmt::try_init();
 

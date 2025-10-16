@@ -1,5 +1,8 @@
 experimental = ["setup-scripts"]
 
+[profile.default]
+slow-timeout = { period = "10s", terminate-after = 2 }
+
 [[profile.default.scripts]]
 filter = "test(/failpoint_kernel_v5_13_/)"
 setup = "failpoint_kernel_v5_13"

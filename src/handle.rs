@@ -42,7 +42,7 @@ pub enum RegisterError {
 pub struct I2o2Handle<G = DynamicGuard> {
     ops_queue: super::queue::SchedulerSender<Packaged<opcode::AnyOp, G>>,
     resource_queue: super::queue::SchedulerSender<ResourceMessage<G>>,
-    waker: super::wake::RingWaker,
+    waker: super::wake::Waker,
 }
 
 impl<G> Clone for I2o2Handle<G> {
@@ -59,7 +59,7 @@ impl<G> I2o2Handle<G> {
     pub(super) fn new(
         ops_queue: super::queue::SchedulerSender<Packaged<opcode::AnyOp, G>>,
         resource_queue: super::queue::SchedulerSender<ResourceMessage<G>>,
-        waker: super::wake::RingWaker,
+        waker: super::wake::Waker,
     ) -> Self {
         Self {
             ops_queue,
@@ -436,7 +436,7 @@ where
         message: Packaged<opcode::AnyOp, G>,
     ) -> Result<(), SchedulerClosed> {
         self.ops_queue.send(message).map_err(|_| SchedulerClosed)?;
-        self.waker.maybe_wake();
+        self.waker.signal_work_added();
         Ok(())
     }
 
@@ -448,7 +448,7 @@ where
             .send_async(message)
             .await
             .map_err(|_| SchedulerClosed)?;
-        self.waker.maybe_wake();
+        self.waker.signal_work_added();
         Ok(())
     }
 
@@ -459,7 +459,7 @@ where
         self.resource_queue
             .send(message)
             .map_err(|_| SchedulerClosed)?;
-        self.waker.maybe_wake();
+        self.waker.signal_work_added();
         Ok(())
     }
 
@@ -471,7 +471,7 @@ where
             .send_async(message)
             .await
             .map_err(|_| SchedulerClosed)?;
-        self.waker.maybe_wake();
+        self.waker.signal_work_added();
         Ok(())
     }
 }

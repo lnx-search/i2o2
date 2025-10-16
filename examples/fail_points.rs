@@ -1,5 +1,4 @@
 use std::io;
-use std::sync::Arc;
 
 #[cfg_attr(test, test)]
 fn main() -> io::Result<()> {
@@ -36,6 +35,7 @@ fn main() -> io::Result<()> {
         .join()
         .expect("scheduler should never panic")?;
 
+    scenario.teardown();
     println!("scheduler shutdown complete!");
 
     Ok(())

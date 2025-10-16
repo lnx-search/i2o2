@@ -10,6 +10,10 @@ use crate::{I2o2Scheduler, TrackedState, ring, wake};
 
 type SchedulerThreadHandle = std::thread::JoinHandle<io::Result<()>>;
 
+macro_rules! optional_flag {
+    ($flag:expr, $skip:expr, $condition:expr) => {{ $flag && (!$skip || ($skip && $condition())) }};
+}
+
 #[derive(Debug, Clone)]
 /// A set of configuration options for customising the [I2o2Scheduler] scheduler.
 ///
@@ -217,16 +221,15 @@ impl I2o2Builder {
         let (io_queue_tx, io_queue_rx) = super::queue::new(self.queue_size as usize);
         let (resource_queue_tx, resource_queue_rx) = super::queue::new(32);
 
-        let (waker, controller) = wake::new()?;
-
         let mut ring = self.setup_io_ring()?;
-        ring.register_eventfd(controller.fd())?;
         tracing::debug!("ring created");
+
+        let waker = wake::new(ring.create_waker());
 
         self.setup_registered_resources(&mut ring)?;
         tracing::debug!("successfully registered resources with ring");
 
-        let handle = I2o2Handle::new(io_queue_tx, resource_queue_tx, waker);
+        let handle = I2o2Handle::new(io_queue_tx, resource_queue_tx, waker.clone());
 
         let scheduler = I2o2Scheduler {
             ring,
@@ -235,9 +238,10 @@ impl I2o2Builder {
                 self.num_registered_files,
                 self.num_registered_buffers,
             ),
-            waker_controller: controller,
+            waker,
             incoming_ops: io_queue_rx,
             incoming_resources: resource_queue_rx,
+            last_read_work_counter: 0,
             _anti_send_ptr: std::ptr::null_mut(),
         };
 
@@ -298,16 +302,18 @@ impl I2o2Builder {
             params.flags |= IORING_SETUP_SINGLE_ISSUER;
         }
 
+        if probe.is_kernel_v6_1_or_newer() {
+            params.flags |= IORING_SETUP_DEFER_TASKRUN;
+        }
+
         if self.io_poll {
             params.flags |= IORING_SETUP_IOPOLL;
         }
 
-        if self.coop_task_run {
-            if !self.skip_unsupported_flags
-                || (self.skip_unsupported_flags && probe.is_kernel_v5_19_or_newer())
-            {
-                params.flags |= IORING_SETUP_COOP_TASKRUN;
-            }
+        if optional_flag!(self.coop_task_run, self.skip_unsupported_flags, || probe
+            .is_kernel_v5_19_or_newer())
+        {
+            params.flags |= IORING_SETUP_COOP_TASKRUN;
         }
 
         params.features |= IORING_FEAT_NODROP;

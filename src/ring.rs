@@ -1,4 +1,6 @@
 use std::io::ErrorKind;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{io, mem, ptr};
 
 use liburing_rs::*;
@@ -18,7 +20,7 @@ macro_rules! check_err {
 pub(super) struct IoRing {
     ring: io_uring,
     probe: RingProbe,
-    closed: bool,
+    closed: Arc<AtomicBool>,
 }
 
 impl IoRing {
@@ -55,14 +57,16 @@ impl IoRing {
         Ok(Self {
             ring,
             probe,
-            closed: false,
+            closed: Arc::new(AtomicBool::new(false)),
         })
     }
 
-    /// Register an eventfd with the ring.
-    pub(super) fn register_eventfd(&mut self, fd: libc::c_int) -> io::Result<()> {
-        let result = unsafe { io_uring_register_eventfd(&raw mut self.ring, fd) };
-        check_err!(result)
+    /// Creates a new [RingWaker] for the ring.
+    pub(super) fn create_waker(&self) -> RingWaker {
+        RingWaker {
+            ring_fd: self.ring.ring_fd,
+            closed: self.closed.clone(),
+        }
     }
 
     /// Preallocate a sparse set of files.
@@ -186,6 +190,13 @@ impl IoRing {
         Ok(result as usize)
     }
 
+    /// Wait for at least 1 completion event to be ready.
+    pub(super) fn wait_for_completions(&mut self) -> io::Result<()> {
+        let mut cqe = ptr::null_mut();
+        let result = unsafe { io_uring_wait_cqe(&raw mut self.ring, &raw mut cqe) };
+        check_err!(result)
+    }
+
     #[cfg(test)]
     /// Submit any outstanding submissions to the kernel and wait for at least
     /// 1 completion event to be ready.
@@ -197,13 +208,14 @@ impl IoRing {
 
 impl Drop for IoRing {
     fn drop(&mut self) {
-        if !self.closed {
+        let is_closed = self.closed.load(Ordering::Acquire);
+        if !is_closed {
             let result = unsafe { io_uring_close_ring_fd(&raw mut self.ring) };
             if result < 0 {
                 let err = io::Error::from_raw_os_error(-result);
                 tracing::error!(error = %err, "cannot shutdown ring");
             } else {
-                self.closed = true;
+                self.closed.store(true, Ordering::Release);
             }
         }
     }
@@ -231,6 +243,36 @@ impl<'ring> Iterator for CqeIterator<'ring> {
                 self.ring.advance_seen_cqe(cqe);
                 Some(entry)
             }
+        }
+    }
+}
+
+/// The ring waker allows threads outside the main scheduler thread
+/// to wake up the scheduler by sending a message to the ring.
+pub(super) struct RingWaker {
+    ring_fd: libc::c_int,
+    closed: Arc<AtomicBool>,
+}
+
+impl RingWaker {
+    /// Signals whether the ring the waker belongs to is closed.
+    pub(super) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    /// Wake the ring.
+    ///
+    /// Returns `true` if the ring was successfully woken.
+    pub(super) fn wake(&self, user_data: u64) -> bool {
+        if !self.is_closed() {
+            let result = unsafe {
+                let mut sqe = mem::zeroed::<io_uring_sqe>();
+                io_uring_prep_msg_ring(&raw mut sqe, self.ring_fd, 0x01, user_data, 0);
+                io_uring_register_sync_msg(&raw mut sqe)
+            };
+            result >= 0
+        } else {
+            false
         }
     }
 }

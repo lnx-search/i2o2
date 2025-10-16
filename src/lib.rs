@@ -1,9 +1,14 @@
 #![doc = include_str!("../README.md")]
 
 use std::any::Any;
-use std::io;
+use std::{io, mem};
 
-use liburing_rs::{io_uring_sqe, io_uring_sqe_set_data64};
+use liburing_rs::{
+    IOSQE_IO_DRAIN,
+    io_uring_sqe,
+    io_uring_sqe_set_data64,
+    io_uring_sqe_set_flags,
+};
 
 use crate::opcode::sealed::RegisterOp;
 
@@ -118,11 +123,13 @@ pub struct I2o2Scheduler<G = DynamicGuard> {
     state: TrackedState<G>,
     /// A waker handle for triggering a completion event on `self`
     /// intern causing events to be processed.
-    waker_controller: wake::RingWakerController,
+    waker: wake::Waker,
     /// A stream of incoming IO events to process.
     incoming_ops: queue::SchedulerReceiver<Packaged<opcode::AnyOp, G>>,
     /// A stream of incoming resource events to process.
     incoming_resources: queue::SchedulerReceiver<ResourceMessage<G>>,
+    /// The value of the work counter that was last loaded.
+    last_read_work_counter: u64,
     /// A null pointer used to prevent people from sending the scheduler across threads.
     _anti_send_ptr: *mut u8,
 }
@@ -152,6 +159,7 @@ impl<G> I2o2Scheduler<G> {
     fn run_event_loop(&mut self) -> io::Result<()> {
         loop {
             if self.incoming_ops.is_disconnected() {
+                tracing::info!("scheduler disconnected");
                 break;
             }
 
@@ -161,7 +169,8 @@ impl<G> I2o2Scheduler<G> {
             }
 
             self.drain_incoming_resources()?;
-            self.maybe_wait_for_events();
+
+            self.maybe_wait_for_events()?;
         }
 
         Ok(())
@@ -196,7 +205,7 @@ impl<G> I2o2Scheduler<G> {
                     "rejecting op because size128 is required but not active"
                 );
                 write_filler_op(sqe);
-                let _ = msg.reply.set_result(MAGIC_ERRNO_NOT_SIZE128);
+                msg.reply.set_result(MAGIC_ERRNO_NOT_SIZE128);
                 continue;
             }
 
@@ -249,27 +258,7 @@ impl<G> I2o2Scheduler<G> {
 
         while self.ring.has_completions_ready() {
             for cqe in self.ring.iter_completions() {
-                let (flag, reply_idx, guard_idx) = flags::unpack(cqe.user_data);
-
-                #[cfg(feature = "trace-hotpath")]
-                tracing::trace!(flag = ?flag, task_id = reply_idx, result = cqe.result, "completion");
-
-                match flag {
-                    flags::Flag::FillerOp => {},
-                    flags::Flag::Guarded => {
-                        self.state.acknowledge_reply(reply_idx, cqe.result);
-                        self.state.drop_guard_if_exists(guard_idx);
-                    },
-                    flags::Flag::Unguarded => {
-                        self.state.acknowledge_reply(reply_idx, cqe.result);
-                    },
-                    flags::Flag::GuardedResourceBuffer => {
-                        self.state.drop_buffer_guard(guard_idx);
-                    },
-                    flags::Flag::GuardedResourceFile => {
-                        self.state.drop_file_guard(guard_idx);
-                    },
-                }
+                self.state.handle_cqe(cqe.user_data, cqe.result);
             }
         }
 
@@ -277,33 +266,61 @@ impl<G> I2o2Scheduler<G> {
     }
 
     /// Wait for events if there is no outstanding work to be done.
-    fn maybe_wait_for_events(&mut self) {
-        if !self.has_outstanding_work() {
-            self.waker_controller.ask_for_wake();
-
-            // Check again because of atomics, yada, yada...
-            if !self.has_outstanding_work() {
-                return;
-            }
-
-            #[cfg(feature = "trace-hotpath")]
-            tracing::trace!("scheduler waiting on eventfd events...");
-            self.waker_controller.wait_for_events();
+    fn maybe_wait_for_events(&mut self) -> io::Result<()> {
+        if self.has_outstanding_work() {
+            return Ok(());
         }
+
+        self.waker.ask_for_wake();
+
+        #[cfg(feature = "trace-hotpath")]
+        tracing::trace!("checking for work");
+        if self.has_outstanding_work() {
+            return Ok(());
+        }
+
+        #[cfg(feature = "trace-hotpath")]
+        tracing::trace!("no work, scheduler waiting on events...");
+
+        self.ring.wait_for_completions()?;
+
+        #[cfg(feature = "trace-hotpath")]
+        tracing::trace!("woken");
+
+        Ok(())
     }
 
     /// Waits for remaining inflight operations to complete.
     fn wait_for_remaining(&mut self) -> io::Result<()> {
-        #[cfg(feature = "trace-hotpath")]
         tracing::debug!("scheduler is draining remaining events");
 
-        while !self.incoming_ops.is_empty() || self.state.remaining_tasks() > 0 {
+        self.incoming_ops.wake_all();
+        self.incoming_resources.wake_all();
+
+        while !self.incoming_ops.is_empty() {
             self.drain_incoming_io()?;
+            self.ring.wait_for_completions()?;
             self.drain_completions()?;
-            self.maybe_wait_for_events();
         }
 
-        #[cfg(feature = "trace-hotpath")]
+        // Submits a SQE that will wait until all other pending SQEs complete.
+        loop {
+            if let Some(sqe) = self.ring.get_available_sqe() {
+                write_drain_op(sqe);
+                self.ring.submit()?;
+                tracing::debug!("drain SQE submitted");
+                break;
+            };
+
+            self.ring.wait_for_completions()?;
+            self.drain_completions()?;
+        }
+
+        while !self.state.has_seen_drain_op() {
+            self.ring.wait_for_completions()?;
+            self.drain_completions()?;
+        }
+
         tracing::debug!("scheduler has drained all events");
 
         Ok(())
@@ -378,10 +395,12 @@ impl<G> I2o2Scheduler<G> {
         }
     }
 
-    fn has_outstanding_work(&self) -> bool {
-        !self.incoming_ops.is_empty()
-            || !self.incoming_resources.is_empty()
-            // incoming_ops & incoming_resources lifetimes are tied together, we only need to check 1 atomic.
+    fn has_outstanding_work(&mut self) -> bool {
+        let work_counter = self.waker.current_work_counter();
+        let previous_count =
+            mem::replace(&mut self.last_read_work_counter, work_counter);
+        work_counter != previous_count
+            || self.ring.has_completions_ready()
             || self.incoming_ops.is_disconnected()
     }
 }
@@ -393,7 +412,18 @@ fn write_filler_op(sqe: &mut io_uring_sqe) {
     unsafe { io_uring_sqe_set_data64(sqe, user_data) }
 }
 
+fn write_drain_op(sqe: &mut io_uring_sqe) {
+    let user_data = flags::pack(flags::Flag::Drain, 0, 0);
+    let op = opcode::Nop::new();
+    op.register_with_sqe(sqe);
+    unsafe {
+        io_uring_sqe_set_data64(sqe, user_data);
+        io_uring_sqe_set_flags(sqe, IOSQE_IO_DRAIN);
+    };
+}
+
 struct TrackedState<G> {
+    seen_drain_op: bool,
     free_registered_files: u32,
     free_registered_buffers: u32,
     /// Guards for allocated registered files.
@@ -409,6 +439,7 @@ struct TrackedState<G> {
 impl<G> TrackedState<G> {
     fn new(free_registered_files: u32, free_registered_buffers: u32) -> Self {
         Self {
+            seen_drain_op: false,
             free_registered_files,
             free_registered_buffers,
             resource_file_guards: slab::Slab::with_capacity(
@@ -422,8 +453,35 @@ impl<G> TrackedState<G> {
         }
     }
 
-    fn remaining_tasks(&self) -> usize {
-        self.replies.len()
+    fn has_seen_drain_op(&self) -> bool {
+        self.seen_drain_op
+    }
+
+    fn handle_cqe(&mut self, user_data: u64, result: i32) {
+        let (flag, reply_idx, guard_idx) = flags::unpack(user_data);
+
+        #[cfg(feature = "trace-hotpath")]
+        tracing::trace!(flag = ?flag, task_id = reply_idx, result = result, "completion");
+
+        match flag {
+            flags::Flag::FillerOp | flags::Flag::Wake => {},
+            flags::Flag::Drain => {
+                self.seen_drain_op = true;
+            },
+            flags::Flag::Guarded => {
+                self.acknowledge_reply(reply_idx, result);
+                self.drop_guard_if_exists(guard_idx);
+            },
+            flags::Flag::Unguarded => {
+                self.acknowledge_reply(reply_idx, result);
+            },
+            flags::Flag::GuardedResourceBuffer => {
+                self.drop_buffer_guard(guard_idx);
+            },
+            flags::Flag::GuardedResourceFile => {
+                self.drop_file_guard(guard_idx);
+            },
+        }
     }
 
     fn register(&mut self, free_sqe: &mut io_uring_sqe, op: Packaged<opcode::AnyOp, G>) {

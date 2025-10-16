@@ -10,7 +10,7 @@ mod no_op_shared;
 
 const NUM_OPS_PER_WORKER: usize = 100_000;
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> io::Result<()> {
     tracing_subscriber::fmt::init();
 
@@ -63,7 +63,6 @@ async fn bench_with_config(
                 let result = reply.await;
                 assert_eq!(result, Ok(0));
             }
-
             Ok::<_, io::Error>(0)
         });
 
