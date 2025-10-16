@@ -191,7 +191,10 @@ impl IoRing {
     }
 
     /// Wait for at least 1 completion event to be ready.
-    pub(super) fn wait_for_completions(&mut self, cqe: *mut *mut io_uring_cqe) -> io::Result<()> {
+    pub(super) fn wait_for_completions(
+        &mut self,
+        cqe: *mut *mut io_uring_cqe,
+    ) -> io::Result<()> {
         let result = unsafe { io_uring_wait_cqe(&raw mut self.ring, cqe) };
         check_err!(result)
     }
