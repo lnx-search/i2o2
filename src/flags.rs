@@ -8,6 +8,7 @@ pub const GUARDED_RESOURCE_BUFFER: u64 = 0x3000_0000_0000_0000;
 pub const GUARDED_RESOURCE_FILE: u64 = 0x4000_0000_0000_0000;
 pub const FILLER_OP: u64 = 0x5000_0000_0000_0000;
 pub const WAKE: u64 = 0x6000_0000_0000_0000;
+pub const DRAIN: u64 = 0x7000_0000_0000_0000;
 
 #[repr(u64)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -28,6 +29,8 @@ pub enum Flag {
     FillerOp = FILLER_OP,
     /// The operation is a wake message and is effectively a no-op.
     Wake = WAKE,
+    /// The final operation in the ring.
+    Drain = DRAIN,
 }
 
 /// Packs the 4 bit `flag` with the 30 bit `reply_idx` and `guard_idx`.
@@ -61,6 +64,7 @@ pub fn unpack(packed_value: u64) -> (Flag, u32, u32) {
         GUARDED_RESOURCE_FILE => Flag::GuardedResourceFile,
         FILLER_OP => Flag::FillerOp,
         WAKE => Flag::Wake,
+        DRAIN => Flag::Drain,
         // This should **never** happen, if this occurs the system has
         // already entered a UB state since we have to assume that any or all of
         // our prior event reads and unpacking are invalid; which means we have

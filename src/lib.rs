@@ -3,7 +3,13 @@
 use std::any::Any;
 use std::{io, mem};
 
-use liburing_rs::{io_uring_sqe, io_uring_sqe_set_data64};
+use liburing_rs::{
+    IOSQE_IO_DRAIN,
+    io_uring_prep_nop,
+    io_uring_sqe,
+    io_uring_sqe_set_data64,
+    io_uring_sqe_set_flags,
+};
 
 use crate::opcode::sealed::RegisterOp;
 
@@ -154,6 +160,7 @@ impl<G> I2o2Scheduler<G> {
     fn run_event_loop(&mut self) -> io::Result<()> {
         loop {
             if self.incoming_ops.is_disconnected() {
+                tracing::info!("scheduler disconnected");
                 break;
             }
 
@@ -162,7 +169,6 @@ impl<G> I2o2Scheduler<G> {
                 self.drain_completions()?;
             }
 
-            self.drain_incoming_resources()?;
             self.maybe_wait_for_events()?;
         }
 
@@ -285,16 +291,42 @@ impl<G> I2o2Scheduler<G> {
 
     /// Waits for remaining inflight operations to complete.
     fn wait_for_remaining(&mut self) -> io::Result<()> {
-        #[cfg(feature = "trace-hotpath")]
         tracing::debug!("scheduler is draining remaining events");
 
-        while !self.incoming_ops.is_empty() || self.state.remaining_tasks() > 0 {
+        while !self.incoming_ops.is_empty() {
             self.drain_incoming_io()?;
+            self.ring.wait_for_completions()?;
             self.drain_completions()?;
-            self.maybe_wait_for_events()?;
         }
 
-        #[cfg(feature = "trace-hotpath")]
+        // Submits a SQE that will wait until all other pending SQEs complete.
+        loop {
+            let sqe = match self.ring.get_available_sqe() {
+                Some(sqe) => sqe,
+                None => {
+                    self.ring.wait_for_completions()?;
+                    self.drain_completions()?;
+                    continue;
+                },
+            };
+
+            let user_data = flags::pack(flags::Flag::Drain, 0, 0);
+            unsafe {
+                io_uring_prep_nop(sqe);
+                io_uring_sqe_set_data64(sqe, user_data);
+                io_uring_sqe_set_flags(sqe, IOSQE_IO_DRAIN);
+            };
+
+            self.ring.submit()?;
+            tracing::debug!("drain SQE submitted");
+            break;
+        }
+
+        while !self.state.has_seen_drain_op() {
+            self.ring.wait_for_completions()?;
+            self.drain_completions()?;
+        }
+
         tracing::debug!("scheduler has drained all events");
 
         Ok(())
@@ -387,6 +419,7 @@ fn write_filler_op(sqe: &mut io_uring_sqe) {
 }
 
 struct TrackedState<G> {
+    seen_drain_op: bool,
     free_registered_files: u32,
     free_registered_buffers: u32,
     /// Guards for allocated registered files.
@@ -402,6 +435,7 @@ struct TrackedState<G> {
 impl<G> TrackedState<G> {
     fn new(free_registered_files: u32, free_registered_buffers: u32) -> Self {
         Self {
+            seen_drain_op: false,
             free_registered_files,
             free_registered_buffers,
             resource_file_guards: slab::Slab::with_capacity(
@@ -413,6 +447,10 @@ impl<G> TrackedState<G> {
             guards: slab::Slab::default(),
             replies: slab::Slab::default(),
         }
+    }
+
+    fn has_seen_drain_op(&self) -> bool {
+        self.seen_drain_op
     }
 
     fn remaining_tasks(&self) -> usize {
@@ -427,6 +465,9 @@ impl<G> TrackedState<G> {
 
         match flag {
             flags::Flag::FillerOp | flags::Flag::Wake => {},
+            flags::Flag::Drain => {
+                self.seen_drain_op = true;
+            },
             flags::Flag::Guarded => {
                 self.acknowledge_reply(reply_idx, result);
                 self.drop_guard_if_exists(guard_idx);
