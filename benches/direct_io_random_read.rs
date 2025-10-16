@@ -47,11 +47,11 @@ fn main() -> Result<()> {
     run_i2o2_benches(&mut file_manger, &mut results)?;
     std::thread::sleep(Duration::from_secs(20));
 
-    // run_std_benches(&mut file_manger, &mut results)?;
-    // std::thread::sleep(Duration::from_secs(20));
-    //
-    // run_glommio_benches(&mut file_manger, &mut results)?;
-    // std::thread::sleep(Duration::from_secs(20));
+    run_std_benches(&mut file_manger, &mut results)?;
+    std::thread::sleep(Duration::from_secs(20));
+
+    run_glommio_benches(&mut file_manger, &mut results)?;
+    std::thread::sleep(Duration::from_secs(20));
 
     tracing::info!("done!");
 
