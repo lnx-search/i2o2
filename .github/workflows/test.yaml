@@ -25,6 +25,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.number }}
+          RUST_LOG: debug
         run: |
           cargo llvm-cov nextest --all-features --workspace
           
